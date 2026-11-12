@@ -6,6 +6,16 @@ import { executeProceduralModel } from '../three/sandbox/executeProceduralModel.
 import { createCapabilityControlDocument } from '../three/sandbox/capabilityControl.js'
 import { resolveProceduralModelParts } from '../three/sandbox/modelCapabilityManifest.js'
 import { analyzeModelCollisionCompleteness } from '../three/sandbox/modelCollisionAnalyzer.js'
+import { createSceneAssetGeneratorRegistry } from '../three/world/campus/sceneAssetGeneratorRegistry.js'
+import { createProceduralAssetClient } from './sandbox/proceduralAssetClient.js'
+import {
+  buildProceduralAssetPayload,
+  canArchiveSandboxModel,
+  createBuiltinSandboxModel,
+  getSelectedModelState,
+  groupBuiltinAssetsByCategory,
+  listBuiltinAssets,
+} from './sandbox/assetLibraryUi.js'
 import ProceduralModelEditor from './ProceduralModelEditor.vue'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api/v1'
@@ -14,6 +24,7 @@ const viewport = ref(null)
 const proceduralModelEditorRef = ref(null)
 const selectedName = ref('')
 const selectedEditable = ref(false)
+const selectedCanArchive = ref(false)
 const precisionModeActive = ref(false)
 const objects = ref([])
 const command = ref('')
@@ -73,14 +84,35 @@ let selected = null
 let disposed = false
 const objectsById = new Map()
 
+// 资产库：服务端持久化的「我的模型」+ 前端程序化生成的内置素材
+const assetClient = createProceduralAssetClient({ baseUrl: API_BASE, devUserId: DEV_USER_ID })
+let builtinAssetRegistry = null
+const builtinAssetGroups = groupBuiltinAssetsByCategory(listBuiltinAssets())
+const myAssets = ref([])
+const assetLibraryBusy = ref(false)
+const renamingAssetId = ref(null)
+const renamingAssetName = ref('')
+const confirmDeleteAssetId = ref(null)
+
+function getBuiltinAssetRegistry() {
+  if (!builtinAssetRegistry) builtinAssetRegistry = createSceneAssetGeneratorRegistry(THREE)
+  return builtinAssetRegistry
+}
+
 function syncObjects() {
   objects.value = engine?.getSandboxModels?.() || []
   selectedName.value = selected?.name || ''
+  const selectionState = getSelectedModelState(selected)
+  selectedEditable.value = selectionState.editable
+  selectedCanArchive.value = selectionState.canArchive
 }
 function handleModelSelected(payload) {
   selected = payload?.id ? engine?.getSandboxModel?.(payload.id) || null : null
   selectedName.value = selected?.name || ''
-  selectedEditable.value = Boolean(selected?.userData?.proceduralModelSource)
+  // 视口单击与列表点选只走本回调、不触发 syncObjects，两个选择态布尔必须在这里同源刷新
+  const selectionState = getSelectedModelState(selected)
+  selectedEditable.value = selectionState.editable
+  selectedCanArchive.value = selectionState.canArchive
   precisionModeActive.value = false
 }
 function registerModel(root, name, position = null) {
@@ -271,7 +303,6 @@ function deleteSelected() {
   if (!removed) return
   objectsById.delete(id)
   selected = null
-  selectedEditable.value = false
   precisionModeActive.value = false
   syncObjects()
   message.value = '已删除模型组'
@@ -1027,6 +1058,150 @@ function expandWorld(direction) {
   return true
 }
 
+async function loadMyAssets() {
+  assetLibraryBusy.value = true
+  try {
+    myAssets.value = await assetClient.listAssets()
+  } catch (error) {
+    // 服务端离线不阻断沙盒主流程：面板显示空库存 + 不可用提示
+    myAssets.value = []
+    message.value = '资产库暂不可用：' + (error?.message || '未知错误')
+  } finally {
+    assetLibraryBusy.value = false
+  }
+}
+
+function ensurePlacementAvailable(actionLabel) {
+  if (placement.value.active) {
+    message.value = '当前已有模型正在选址，请先确认落地或取消后再' + actionLabel
+    return false
+  }
+  return true
+}
+
+function placeBuiltinAsset(item) {
+  if (!ensurePlacementAvailable('取出素材')) return
+  try {
+    const model = createBuiltinSandboxModel(THREE, getBuiltinAssetRegistry(), item)
+    const report = analyzeModelCollisionCompleteness(model)
+    if (report.status !== 'complete') {
+      message.value = '内置素材碰撞声明不完整，已阻止放置，请补全适配规则后再试。'
+      return
+    }
+    const started = engine?.beginSandboxModelPlacement?.(model)
+    if (!started) {
+      message.value = '无法启动模型选址，请确认当前处于室外沙盒且模型未被挂载。'
+      return
+    }
+    message.value = `已取出内置素材「${item.label}」，点击地面锁定候选位置后确认落地。`
+  } catch (error) {
+    message.value = '内置素材取出失败：' + (error?.message || '未知错误')
+  }
+}
+
+async function placeLibraryAsset(item) {
+  if (!ensurePlacementAvailable('取出模型') || assetLibraryBusy.value) return
+  assetLibraryBusy.value = true
+  try {
+    const record = await assetClient.getAsset(item.assetId)
+    const model = await executeProceduralModel(record.sourceCode, { timeoutMs: 60000 })
+    // 库存重建实例补回身份字段，保证再编辑/再入库链路与现场生成的 AI 模型一致
+    model.userData.proceduralModelSource = record.sourceCode
+    model.userData.assetName = record.name
+    model.userData.proceduralModelConfig = {
+      ...(model.userData.proceduralModelConfig || {}),
+      objectType: record.objectType,
+    }
+    const report = analyzeModelCollisionCompleteness(model)
+    if (report.status !== 'complete') {
+      message.value = '存档模型的碰撞声明不完整，已阻止放置，请在模型编辑器中补全后再试。'
+      return
+    }
+    const started = engine?.beginSandboxModelPlacement?.(model)
+    if (!started) {
+      message.value = '无法启动模型选址，请确认当前处于室外沙盒且模型未被挂载。'
+      return
+    }
+    message.value = `已取出存档模型「${record.name}」，点击地面锁定候选位置后确认落地。`
+  } catch (error) {
+    message.value = '存档模型取出失败：' + (error?.message || '未知错误')
+  } finally {
+    assetLibraryBusy.value = false
+  }
+}
+
+async function archiveSelectedModel() {
+  if (!selected || assetLibraryBusy.value) return
+  if (!canArchiveSandboxModel(selected)) {
+    message.value = '内置素材或旧版本地模型没有可入库的源码，无法存入资产库。'
+    return
+  }
+  assetLibraryBusy.value = true
+  try {
+    const payload = buildProceduralAssetPayload(selected, selected.name || '未命名模型')
+    await assetClient.saveAsset(payload)
+    message.value = '已存入资产库'
+    await loadMyAssets()
+  } catch (error) {
+    message.value = '资产入库失败：' + (error?.message || '未知错误')
+  } finally {
+    assetLibraryBusy.value = false
+  }
+}
+
+function startRenameAsset(item) {
+  renamingAssetId.value = item.assetId
+  renamingAssetName.value = item.name || ''
+  confirmDeleteAssetId.value = null
+}
+
+function cancelRenameAsset() {
+  renamingAssetId.value = null
+  renamingAssetName.value = ''
+}
+
+async function confirmRenameAsset(item) {
+  const name = renamingAssetName.value.trim()
+  if (!name) {
+    message.value = '模型名称不能为空'
+    return
+  }
+  assetLibraryBusy.value = true
+  try {
+    await assetClient.renameAsset(item.assetId, name)
+    renamingAssetId.value = null
+    renamingAssetName.value = ''
+    await loadMyAssets()
+  } catch (error) {
+    message.value = '资产重命名失败：' + (error?.message || '未知错误')
+  } finally {
+    assetLibraryBusy.value = false
+  }
+}
+
+function requestDeleteAsset(item) {
+  confirmDeleteAssetId.value = item.assetId
+  renamingAssetId.value = null
+}
+
+function cancelDeleteAsset() {
+  confirmDeleteAssetId.value = null
+}
+
+async function confirmDeleteAsset(item) {
+  assetLibraryBusy.value = true
+  try {
+    await assetClient.removeAsset(item.assetId)
+    confirmDeleteAssetId.value = null
+    message.value = '库存记录已删除，场景内已放置的模型不受影响'
+    await loadMyAssets()
+  } catch (error) {
+    message.value = '资产删除失败：' + (error?.message || '未知错误')
+  } finally {
+    assetLibraryBusy.value = false
+  }
+}
+
 function setManagementMode(mode) {
   const nextMode = mode === 'chunks' ? 'chunks' : mode === 'model' ? 'model' : 'sandbox'
   if (managementMode.value === 'chunks' && nextMode !== 'chunks') {
@@ -1318,6 +1493,8 @@ onMounted(async () => {
       updateEnvironment()
       syncObjects()
     }
+    // 资产库加载失败只提示不阻断，loadMyAssets 内部已兜底
+    loadMyAssets()
   } catch (error) {
     message.value = '沙盒初始化失败：' + (error?.message || '未知错误')
   }
@@ -1428,6 +1605,11 @@ onBeforeUnmount(() => {
               <button @click="beginMoveSelected">重新选址</button>
               <button @click="setMode('translate')">精细调整</button>
               <button :disabled="!selectedEditable" @click="openModelEditor()">编辑模型</button>
+              <button
+                :disabled="!selectedCanArchive || assetLibraryBusy"
+                :title="selectedCanArchive ? '把这个 AI 模型存入服务端资产库' : '内置素材或旧版本地模型没有可入库的源码'"
+                @click="archiveSelectedModel"
+              >{{ assetLibraryBusy ? '处理中…' : '存入资产库' }}</button>
             </div>
             <div class="world-mvp__tools world-mvp__secondary-actions">
               <button @click="duplicateSelected">复制</button>
@@ -1462,6 +1644,56 @@ onBeforeUnmount(() => {
             <span></span><button :disabled="placement.active" @click="expandWorld('south')">向南扩建</button><span></span>
           </div>
           <button class="world-mvp__open-chunk-manager" @click="toggleChunkManagement">在沙盒场景中管理地块 <span>{{ worldState?.chunks?.length || 0 }} 个地块 · 场景物体保持可见</span></button>
+        </section>
+        <section v-if="managementMode === 'model'">
+          <h2>内置素材</h2>
+          <p class="world-mvp__message">即点即试：点击素材进入场景选址，确认落地后才会加入沙盒。</p>
+          <details v-for="group in builtinAssetGroups" :key="group.category" open>
+            <summary>{{ group.label }}（{{ group.items.length }}）</summary>
+            <div class="world-mvp__model-grid">
+              <button
+                v-for="item in group.items"
+                :key="group.category + ':' + item.objectType"
+                :disabled="placement.active || assetLibraryBusy"
+                @click="placeBuiltinAsset(item)"
+              >{{ item.label }}</button>
+            </div>
+          </details>
+        </section>
+        <section v-if="managementMode === 'model'">
+          <h2>我的模型</h2>
+          <p v-if="assetLibraryBusy" class="world-mvp__message">资产库加载中…</p>
+          <p v-else-if="!myAssets.length" class="world-mvp__message">还没有存档模型，选中场景里的 AI 模型即可存入。</p>
+          <div v-else class="world-mvp__list">
+            <div v-for="item in myAssets" :key="item.assetId">
+              <div v-if="renamingAssetId === item.assetId" class="world-mvp__command">
+                <input
+                  v-model="renamingAssetName"
+                  placeholder="模型名称"
+                  @keydown.enter="confirmRenameAsset(item)"
+                  @keydown.esc="cancelRenameAsset"
+                >
+                <button :disabled="assetLibraryBusy" @click="confirmRenameAsset(item)">确认</button>
+                <button :disabled="assetLibraryBusy" @click="cancelRenameAsset">取消</button>
+              </div>
+              <div v-else class="world-mvp__tools">
+                <button :disabled="placement.active || assetLibraryBusy" @click="placeLibraryAsset(item)">
+                  {{ item.name }}（{{ item.objectType }}）
+                </button>
+                <button :disabled="assetLibraryBusy" @click="startRenameAsset(item)">重命名</button>
+                <button
+                  v-if="confirmDeleteAssetId !== item.assetId"
+                  :disabled="assetLibraryBusy"
+                  @click="requestDeleteAsset(item)"
+                >删除</button>
+                <template v-else>
+                  <button class="danger" :disabled="assetLibraryBusy" @click="confirmDeleteAsset(item)">确认删除</button>
+                  <button :disabled="assetLibraryBusy" @click="cancelDeleteAsset">取消</button>
+                </template>
+              </div>
+            </div>
+          </div>
+          <p class="world-mvp__message">删除库存记录不会影响场景里已经放置的模型。</p>
         </section>
         <section v-if="managementMode === 'model'">
           <h2>AI 建模</h2>
