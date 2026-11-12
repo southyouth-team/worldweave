@@ -6,13 +6,14 @@ import { RecognitionService } from './recognition.service';
 import { ImageGenerationController } from './image-generation.controller';
 import { ImageGenerationService } from './image-generation.service';
 import { VisualAssetsController } from './visual-assets.controller';
+import { ProceduralAssetsController } from './procedural-assets.controller';
 import { BuildingDesignController } from './building-design.controller';
 import { BuildingTemplatesController } from './building-templates.controller';
 import { BuildingDesignService } from './building-design.service';
 import { BuildingTemplatesService } from './building-templates.service';
 
 @Module({
-  controllers: [AssetsController, ImageGenerationController, VisualAssetsController, BuildingDesignController, BuildingTemplatesController],
+  controllers: [AssetsController, ImageGenerationController, VisualAssetsController, ProceduralAssetsController, BuildingDesignController, BuildingTemplatesController],
   providers: [AssetsService, RecognitionService, ImageGenerationService, BuildingDesignService, BuildingTemplatesService, DevIdentityGuard],
 })
 export class AssetsModule {}

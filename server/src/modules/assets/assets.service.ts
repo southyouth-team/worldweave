@@ -16,6 +16,9 @@ export interface UploadedAsset {
   buffer: Buffer;
 }
 
+const MAX_PROCEDURAL_SOURCE_LENGTH = 120000;
+const MAX_PROCEDURAL_ASSET_BYTES = 2 * 1024 * 1024;
+
 const IMAGE_TYPES: Record<string, { mime: string; extension: string; signature: (buffer: Buffer) => boolean }> = {
   png: { mime: 'image/png', extension: '.png', signature: (b) => b.length >= 8 && b.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])) },
   jpeg: { mime: 'image/jpeg', extension: '.jpg', signature: (b) => b.length >= 3 && b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff },
@@ -299,6 +302,182 @@ export class AssetsService {
       if (error instanceof NotFoundException) throw error;
       throw new NotFoundException('结构化资产文件不存在或内容损坏');
     }
+  }
+
+  async saveProceduralAsset(userId: string, input: Record<string, unknown>) {
+    if (!userId) throw new BadRequestException('缺少资产保存用户身份');
+    const sourceCode = input?.sourceCode;
+    if (typeof sourceCode !== 'string' || !sourceCode.trim()) {
+      throw new BadRequestException('程序化模型源码不能为空');
+    }
+    if (sourceCode.length > MAX_PROCEDURAL_SOURCE_LENGTH) {
+      throw new BadRequestException('程序化模型源码不能超过 120 KB');
+    }
+    const rawName = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : '未命名程序化模型';
+    const name = rawName.slice(0, 160);
+    const category = typeof input.category === 'string' && input.category.trim()
+      ? input.category.trim().slice(0, 80) : 'sandbox-model';
+    const objectType = typeof input.objectType === 'string' && input.objectType.trim()
+      ? input.objectType.trim().slice(0, 120) : '独立 3D 模型';
+    const manifest = input.manifest;
+    if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)
+      || typeof (manifest as Record<string, unknown>).version === 'undefined') {
+      throw new BadRequestException('程序化模型能力清单必须是带 version 字段的对象');
+    }
+    const normalizeArray = (value: unknown) => (Array.isArray(value) ? value : []);
+    const assetId = randomUUID();
+    const now = new Date().toISOString();
+    const payload = {
+      schemaVersion: 1,
+      assetId,
+      name,
+      category,
+      objectType,
+      sourceCode,
+      manifest,
+      parameters: normalizeArray(input.parameters),
+      parts: normalizeArray(input.parts),
+      environmentBindings: normalizeArray(input.environmentBindings),
+      createdAt: now,
+      updatedAt: now,
+    };
+    const serialized = JSON.stringify(payload);
+    if (Buffer.byteLength(serialized, 'utf8') > MAX_PROCEDURAL_ASSET_BYTES) {
+      throw new BadRequestException('程序化模型资产数据不能超过 2 MB');
+    }
+
+    const directory = resolve(this.storageDir, 'campus-visual-assets', 'procedural');
+    await mkdir(directory, { recursive: true });
+    const absolutePath = resolve(directory, assetId + '.json');
+    const temporaryPath = absolutePath + '.tmp';
+    await writeFile(temporaryPath, serialized, { encoding: 'utf8', flag: 'wx' });
+    const { rename } = await import('node:fs/promises');
+    await rename(temporaryPath, absolutePath);
+    const record = {
+      assetId,
+      name,
+      category,
+      objectType,
+      format: 'procedural-module' as const,
+      filePath: 'procedural/' + assetId + '.json',
+      checksumSha256: createHash('sha256').update(serialized).digest('hex'),
+      sizeBytes: Buffer.byteLength(serialized, 'utf8'),
+      createdBy: userId,
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      await this.enqueueVisualManifestUpdate(async () => {
+        const visualManifest = await this.readVisualManifest();
+        visualManifest.proceduralAssets = Array.isArray(visualManifest.proceduralAssets)
+          ? visualManifest.proceduralAssets : [];
+        visualManifest.proceduralAssets.push(record);
+        await this.writeVisualManifest(visualManifest);
+      });
+    } catch (error) {
+      await rm(absolutePath, { force: true });
+      throw error;
+    }
+    return { ...record };
+  }
+
+  async listProceduralAssets(userId: string) {
+    if (!userId) throw new BadRequestException('缺少资产读取用户身份');
+    const visualManifest = await this.readVisualManifest();
+    const records = Array.isArray(visualManifest.proceduralAssets) ? visualManifest.proceduralAssets : [];
+    return records
+      .filter((record: any) => record.createdBy === userId)
+      .map((record: any) => ({
+        assetId: record.assetId,
+        name: record.name,
+        category: record.category,
+        objectType: record.objectType,
+        format: record.format,
+        filePath: record.filePath,
+        checksumSha256: record.checksumSha256,
+        sizeBytes: record.sizeBytes,
+        createdBy: record.createdBy,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+      }));
+  }
+
+  async getProceduralAsset(userId: string, assetId: string) {
+    if (!userId) throw new BadRequestException('缺少资产读取用户身份');
+    if (!/^[a-f0-9-]{36}$/i.test(assetId)) throw new NotFoundException('程序化模型资产不存在');
+    const visualManifest = await this.readVisualManifest();
+    const record = (visualManifest.proceduralAssets || []).find((item: any) => item.assetId === assetId);
+    if (!record) throw new NotFoundException('程序化模型资产不存在');
+    if (record.createdBy !== userId) throw new ForbiddenException('无权读取该程序化模型资产');
+    const root = resolve(this.storageDir, 'campus-visual-assets');
+    const absolutePath = resolve(root, record.filePath);
+    const relativePath = relative(root, absolutePath);
+    if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+      throw new NotFoundException('程序化模型资产路径无效');
+    }
+    try {
+      const content = await readFile(absolutePath, 'utf8');
+      if (createHash('sha256').update(content).digest('hex') !== record.checksumSha256) {
+        throw new NotFoundException('程序化模型资产校验失败');
+      }
+      const payload = JSON.parse(content);
+      return {
+        ...record,
+        sourceCode: payload.sourceCode,
+        manifest: payload.manifest,
+        parameters: Array.isArray(payload.parameters) ? payload.parameters : [],
+        parts: Array.isArray(payload.parts) ? payload.parts : [],
+        environmentBindings: Array.isArray(payload.environmentBindings) ? payload.environmentBindings : [],
+      };
+    } catch (error) {
+      if (error instanceof NotFoundException) throw error;
+      throw new NotFoundException('程序化模型资产文件不存在或内容损坏');
+    }
+  }
+
+  async renameProceduralAsset(userId: string, assetId: string, newName: unknown) {
+    if (!userId) throw new BadRequestException('缺少资产保存用户身份');
+    if (!/^[a-f0-9-]{36}$/i.test(assetId)) throw new NotFoundException('程序化模型资产不存在');
+    const name = typeof newName === 'string' ? newName.trim().slice(0, 160) : '';
+    if (!name) throw new BadRequestException('资产名称不能为空');
+
+    return this.enqueueVisualManifestUpdate(async () => {
+      const visualManifest = await this.readVisualManifest();
+      visualManifest.proceduralAssets = Array.isArray(visualManifest.proceduralAssets)
+        ? visualManifest.proceduralAssets : [];
+      const record = visualManifest.proceduralAssets.find((item: any) => item.assetId === assetId);
+      if (!record) throw new NotFoundException('程序化模型资产不存在');
+      if (record.createdBy !== userId) throw new ForbiddenException('无权修改该程序化模型资产');
+      record.name = name;
+      record.updatedAt = new Date().toISOString();
+      await this.writeVisualManifest(visualManifest);
+      return { ...record };
+    });
+  }
+
+  async deleteProceduralAsset(userId: string, assetId: string) {
+    if (!userId) throw new BadRequestException('缺少资产保存用户身份');
+    if (!/^[a-f0-9-]{36}$/i.test(assetId)) return { assetId, deleted: false };
+    const visualManifest = await this.readVisualManifest();
+    const records = Array.isArray(visualManifest.proceduralAssets) ? visualManifest.proceduralAssets : [];
+    const record = records.find((item: any) => item.assetId === assetId);
+    if (!record) return { assetId, deleted: false };
+    if (record.createdBy !== userId) throw new ForbiddenException('无权删除该程序化模型资产');
+
+    const root = resolve(this.storageDir, 'campus-visual-assets');
+    const absolutePath = resolve(root, record.filePath);
+    const relativePath = relative(root, absolutePath);
+    if (!relativePath || relativePath.startsWith('..') || isAbsolute(relativePath)) {
+      throw new NotFoundException('程序化模型资产路径无效');
+    }
+    await this.enqueueVisualManifestUpdate(async () => {
+      const current = await this.readVisualManifest();
+      current.proceduralAssets = (Array.isArray(current.proceduralAssets) ? current.proceduralAssets : [])
+        .filter((item: any) => item.assetId !== assetId);
+      await this.writeVisualManifest(current);
+    });
+    await rm(absolutePath, { force: true });
+    return { assetId, deleted: true };
   }
 
   async getVisualAssetManifest() {
