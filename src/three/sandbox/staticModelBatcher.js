@@ -14,11 +14,12 @@
  *   - 合批 mesh 记录源部件 ID 与面范围（staticBatchPartIds/staticBatchSourceRanges），
  *     resolveStaticBatchPartId 可把 raycast 命中的 faceIndex 还原为 componentId，
  *     部件点选契约（onSandboxPartSelected）不因合批而失效
- *   - 材质对象共享、不释放；被消费的旧 geometry 立即释放
+ *   - 材质对象共享、不释放；被消费的独占旧 geometry 立即释放，缓存几何由缓存持有
  *   - 属性不兼容导致 mergeGeometries 失败时整组回退，绝不丢几何
  */
 import * as THREE from 'three'
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js'
+import { disposeOwnedGeometry } from '../world/proceduralGeometry.js'
 
 export const STATIC_BATCH_ROOT_NAME = '_staticBatchRoot'
 const STATIC_BATCH_MARK = 'staticBatched'
@@ -293,7 +294,7 @@ export function batchStaticModel(root) {
 
       for (const mesh of meshes) {
         mesh.parent?.remove(mesh)
-        mesh.geometry?.dispose?.()
+        disposeOwnedGeometry(mesh.geometry)
         consumedMeshCount += 1
       }
       mergedMeshCount += 1

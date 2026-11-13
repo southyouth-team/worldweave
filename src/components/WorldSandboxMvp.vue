@@ -12,8 +12,10 @@ import {
   buildProceduralAssetPayload,
   canArchiveSandboxModel,
   createBuiltinSandboxModel,
+  createRoadEditPersistence,
   getSelectedModelState,
   groupBuiltinAssetsByCategory,
+  isStretchableRoadModel,
   listBuiltinAssets,
 } from './sandbox/assetLibraryUi.js'
 import ProceduralModelEditor from './ProceduralModelEditor.vue'
@@ -25,6 +27,7 @@ const proceduralModelEditorRef = ref(null)
 const selectedName = ref('')
 const selectedEditable = ref(false)
 const selectedCanArchive = ref(false)
+const selectedIsRoad = ref(false)
 const precisionModeActive = ref(false)
 const objects = ref([])
 const command = ref('')
@@ -105,6 +108,7 @@ function syncObjects() {
   const selectionState = getSelectedModelState(selected)
   selectedEditable.value = selectionState.editable
   selectedCanArchive.value = selectionState.canArchive
+  selectedIsRoad.value = isStretchableRoadModel(selected)
 }
 function handleModelSelected(payload) {
   selected = payload?.id ? engine?.getSandboxModel?.(payload.id) || null : null
@@ -113,6 +117,7 @@ function handleModelSelected(payload) {
   const selectionState = getSelectedModelState(selected)
   selectedEditable.value = selectionState.editable
   selectedCanArchive.value = selectionState.canArchive
+  selectedIsRoad.value = isStretchableRoadModel(selected)
   precisionModeActive.value = false
 }
 function registerModel(root, name, position = null) {
@@ -252,9 +257,10 @@ function selectModel(item) {
   if (id) engine?.selectSandboxModel(id)
 }
 function setMode(mode) {
+  const accepted = engine?.setSandboxTransformMode?.(mode)
+  if (engine && accepted === false) return
   transformMode.value = mode
   precisionModeActive.value = mode !== 'browse'
-  engine?.setSandboxTransformMode(mode)
 }
 function beginMoveSelected() {
   if (!selected) return
@@ -303,6 +309,7 @@ function deleteSelected() {
   if (!removed) return
   objectsById.delete(id)
   selected = null
+  selectedIsRoad.value = false
   precisionModeActive.value = false
   syncObjects()
   message.value = '已删除模型组'
@@ -1314,6 +1321,24 @@ function saveSandbox() {
   }
 }
 
+const persistRoadEdit = createRoadEditPersistence({ save: saveSandbox, sync: syncObjects })
+
+function handleSandboxRoadEditChange(payload) {
+  if (payload?.phase === 'blocked') {
+    message.value = `道路调整未生效：${payload.reason || '当前位置存在冲突'}`
+    return
+  }
+  if (payload?.phase === 'cancelled') {
+    message.value = '已取消道路拉伸，道路保持原长度和朝向。'
+    return
+  }
+  if (payload?.phase !== 'committed') return
+  const saved = persistRoadEdit(payload)
+  message.value = saved
+    ? '道路端点已调整并保存。'
+    : '道路端点已调整，但存档失败，请检查存储空间后重试。'
+}
+
 async function restoreSandbox() {
   let snapshot
   try {
@@ -1468,6 +1493,7 @@ onMounted(async () => {
         else if (message.value.startsWith('靠近 ')) message.value = '使用 WASD 或方向键移动人物，靠近模型按 E 交互。'
       },
       onSandboxModelInteract: handleSandboxModelInteract,
+      onSandboxRoadEditChange: handleSandboxRoadEditChange,
       onPlayerWaterStateChange: state => { playerWaterState.value = state ? { ...state } : null },
     }, {
       // MVP 使用独立空白沙盒：只创建地面与世界边界，不加载任何写死的校园内容。
@@ -1590,12 +1616,18 @@ onBeforeUnmount(() => {
           <h2>{{ precisionModeActive ? '精细调整' : '模型管理' }}</h2>
           <div class="world-mvp__list"><button v-for="item in objects" :key="item.id" :class="{ active: selectedName === item.name }" @click="selectModel(item)">{{ item.name }}</button></div>
           <strong class="world-mvp__operation-name">{{ selectedName }}</strong>
-          <template v-if="precisionModeActive">
+          <template v-if="precisionModeActive && transformMode === 'road-endpoints'">
+            <p class="world-mvp__message">拖动道路任一端点调整长度和朝向；拖动中按 Esc 取消本次拖拽，未拖动时按 Esc 退出端点模式。</p>
+            <div class="world-mvp__tools world-mvp__transform-actions">
+              <button @click="setMode('browse')">完成</button>
+            </div>
+          </template>
+          <template v-else-if="precisionModeActive">
             <p class="world-mvp__message">当前仅操作这个模型。拖动坐标轴调整对象，镜头输入已锁定。</p>
             <div class="world-mvp__tools world-mvp__transform-actions">
               <button :class="{ active: transformMode === 'translate' }" @click="setMode('translate')">位置</button>
               <button :class="{ active: transformMode === 'rotate' }" @click="setMode('rotate')">旋转</button>
-              <button :class="{ active: transformMode === 'scale' }" @click="setMode('scale')">缩放</button>
+              <button v-if="!selectedIsRoad" :class="{ active: transformMode === 'scale' }" @click="setMode('scale')">缩放</button>
               <button @click="setMode('browse')">完成调整</button>
             </div>
           </template>
@@ -1604,6 +1636,7 @@ onBeforeUnmount(() => {
             <div class="world-mvp__tools world-mvp__primary-actions">
               <button @click="beginMoveSelected">重新选址</button>
               <button @click="setMode('translate')">精细调整</button>
+              <button :disabled="!selectedIsRoad" @click="setMode('road-endpoints')">道路端点</button>
               <button :disabled="!selectedEditable" @click="openModelEditor()">编辑模型</button>
               <button
                 :disabled="!selectedCanArchive || assetLibraryBusy"
@@ -1656,7 +1689,10 @@ onBeforeUnmount(() => {
                 :key="group.category + ':' + item.objectType"
                 :disabled="placement.active || assetLibraryBusy"
                 @click="placeBuiltinAsset(item)"
-              >{{ item.label }}</button>
+              >
+                {{ item.label }}
+                <small v-if="item.note" class="world-mvp__model-note">{{ item.note }}</small>
+              </button>
             </div>
           </details>
         </section>
@@ -1860,6 +1896,7 @@ onBeforeUnmount(() => {
 .world-mvp__world-note { display:block; margin-top:8px; line-height:1.5; }
 .world-mvp__panel h2 { margin:0 0 12px; font-size:12px; }
 .world-mvp__model-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; }
+.world-mvp__model-note { display:block; margin-top:4px; color:#9eafad; font-size:9px; line-height:1.45; }
 .world-mvp .world-mvp__demo-button { width:100%; margin-top:7px; border-color:rgba(165,201,177,.45); color:#c6e4ce; }
 .world-mvp__selected-context { margin-top:10px; padding:10px; border:1px solid rgba(165,201,177,.32); border-radius:8px; background:rgba(165,201,177,.055); }
 .world-mvp__selected-heading span,.world-mvp__selected-heading strong { display:block; }

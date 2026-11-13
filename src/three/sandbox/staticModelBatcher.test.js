@@ -7,6 +7,8 @@ import {
   resolveStaticBatchPartId,
   STATIC_BATCH_ROOT_NAME,
 } from './staticModelBatcher.js'
+import { createSceneAssetGeneratorRegistry } from '../world/campus/sceneAssetGeneratorRegistry.js'
+import { createBuiltinSandboxModel } from './builtinAssetAdapter.js'
 
 function makeMesh(name, material, { position = null, castShadow = true, receiveShadow = true, geometry = null } = {}) {
   const mesh = new THREE.Mesh(geometry || new THREE.BoxGeometry(1, 1, 1), material)
@@ -527,5 +529,23 @@ describe('batchStaticModel', () => {
 
     expect(result.consumedMeshCount).toBe(2)
     expect(rawMesh.parent).toBe(root)
+  })
+
+  it('does not dispose cached geometry still referenced by another model', () => {
+    const registry = createSceneAssetGeneratorRegistry(THREE)
+    const createTree = () => createBuiltinSandboxModel(THREE, registry, {
+      category: 'vegetation', objectType: 'tree',
+    })
+    const first = createTree()
+    const survivor = createTree()
+    const sharedGeometries = new Set()
+    survivor.traverse(object => {
+      if (object.name === 'vegetation-crown-branch') sharedGeometries.add(object.geometry)
+    })
+    expect(sharedGeometries.size).toBeGreaterThan(0)
+    const spies = [...sharedGeometries].map(geometry => vi.spyOn(geometry, 'dispose'))
+
+    batchStaticModel(first)
+    expect(spies.every(spy => spy.mock.calls.length === 0)).toBe(true)
   })
 })

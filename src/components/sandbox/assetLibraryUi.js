@@ -5,8 +5,14 @@ import {
   createBuiltinSandboxModel,
   listBuiltinAssets,
 } from '../../three/sandbox/builtinAssetAdapter.js'
+import { isStretchableRoadModel } from '../../three/sandbox/roadEndpointMath.js'
 
-export { BUILTIN_CATEGORY_LABELS, createBuiltinSandboxModel, listBuiltinAssets }
+export {
+  BUILTIN_CATEGORY_LABELS,
+  createBuiltinSandboxModel,
+  isStretchableRoadModel,
+  listBuiltinAssets,
+}
 
 export function canArchiveSandboxModel(model) {
   const source = model?.userData?.proceduralModelSource
@@ -20,6 +26,14 @@ export function getSelectedModelState(model) {
   return {
     editable: Boolean(source),
     canArchive: canArchiveSandboxModel(model),
+  }
+}
+
+export function createRoadEditPersistence({ save, sync } = {}) {
+  return function persistRoadEdit(payload) {
+    if (payload?.phase !== 'committed') return null
+    sync?.()
+    return Boolean(save?.())
   }
 }
 

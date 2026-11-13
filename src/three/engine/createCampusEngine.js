@@ -40,6 +40,10 @@ import { roadNetworkToMultiPolygon } from '../../editor/campusEditorDocument.js'
 import { fromCampusFeatureCollection, toCampusFeatureCollection } from '../../editor/campusFeatureCollection.js'
 import { mapEditorPointToCalibratedWorld } from '../../editor/campusMapCalibration.js'
 import { createCampusMaterials, createPixelBuilding, validateBuildingFootprint } from '../world/campus/campusAssetLibrary.js'
+import { disposeOwnedGeometry } from '../world/proceduralGeometry.js'
+import { createBuiltinSandboxModel } from '../sandbox/builtinAssetAdapter.js'
+import { isStretchableRoadModel } from '../sandbox/roadEndpointMath.js'
+import { createSandboxRoadEditor } from './sandboxRoadEditor.js'
 
 function getObjectLocalBounds(THREE, root) {
   root.updateWorldMatrix(true, true)
@@ -155,6 +159,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   let sandboxSelectedModel = null
   let sandboxSelectionHelper = null
   let sandboxTransform = null
+  let sandboxRoadEditor = null
   let placementState = null
   // AI 沙盒模型采用分层选址；与旧 generatedAssets 的 placementState 完全隔离。
   let sandboxPlacementState = null
@@ -982,6 +987,43 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return null
   }
 
+  function getSandboxRoadEditor() {
+    if (sandboxRoadEditor || !scene || !renderer || !cameraRig) return sandboxRoadEditor
+    sandboxRoadEditor = createSandboxRoadEditor(THREE, {
+      scene,
+      domElement: renderer.domElement,
+      camera: cameraRig.camera,
+      getGroundPoint: getSandboxGroundPoint,
+      getPlacementConflict: (bounds, state) => getSandboxPlacementConflict(bounds, state),
+      getWorldBounds: getSandboxPlacementWorldBounds,
+      commitRoadEdit: commitSandboxRoadEdit,
+      onChange: payload => callbacks.onSandboxRoadEditChange?.(payload),
+      requestFrame,
+    })
+    return sandboxRoadEditor
+  }
+
+  function commitSandboxRoadEdit(current, solution) {
+    const id = String(current.userData.sandboxModelId)
+    const ref = current.userData.builtinAssetRef
+    const replacement = createBuiltinSandboxModel(THREE, null, {
+      category: ref.category,
+      objectType: ref.objectType,
+      parameters: { length: solution.length },
+    })
+    const accepted = replaceSandboxModel(id, replacement, {
+      transform: {
+        position: solution.position,
+        rotation: solution.rotation,
+        scale: solution.scale,
+      },
+    })
+    if (!accepted) return { ok: false, reason: '道路提交失败' }
+    // replaceSandboxModel 会经选择流程恢复轨道控制；端点模式仍处于激活状态时需重新锁定。
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return { ok: true, replacement: sandboxModels.get(id) }
+  }
+
   function updateSandboxPlacementPreview(point) {
     const state = sandboxPlacementState
     if (!state || !point) return false
@@ -1121,6 +1163,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     }
     if (!existing) selectSandboxModel(null)
     else sandboxTransform?.detach()
+    applySandboxEnvironmentBindings(model)
     if (!existing) scene.add(model)
     model.visible = true
     applySandboxPlacementGhost(sandboxPlacementState)
@@ -1412,9 +1455,28 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       isSandboxModel: true,
     }
     replacement.name = metadata.name || current.name || replacement.name
-    replacement.position.copy(current.position)
-    replacement.rotation.copy(current.rotation)
-    replacement.scale.copy(current.scale)
+    const transform = metadata.transform
+    if (transform) {
+      if (transform.position) {
+        replacement.position.set(transform.position.x, transform.position.y, transform.position.z)
+      } else {
+        replacement.position.copy(current.position)
+      }
+      if (transform.rotation) {
+        replacement.rotation.set(transform.rotation.x, transform.rotation.y, transform.rotation.z)
+      } else {
+        replacement.rotation.copy(current.rotation)
+      }
+      if (transform.scale) {
+        replacement.scale.set(transform.scale.x, transform.scale.y, transform.scale.z)
+      } else {
+        replacement.scale.copy(current.scale)
+      }
+    } else {
+      replacement.position.copy(current.position)
+      replacement.rotation.copy(current.rotation)
+      replacement.scale.copy(current.scale)
+    }
     replacement.traverse(object => { if (object.isMesh) { object.castShadow = true; object.receiveShadow = true } })
     const parent = current.parent || scene
     parent.add(replacement)
@@ -1455,6 +1517,9 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   function selectSandboxModel(id) {
     if (sandboxPlacementState && id) return false
     const model = id ? sandboxModels.get(String(id)) : null
+    if (sandboxRoadEditor?.isAttached() && sandboxRoadEditor.getModelId() !== String(id)) {
+      sandboxRoadEditor.detach()
+    }
     sandboxSelectedModel = model || null
     clearSandboxSelectionHelper()
     if (sandboxSelectedModel) {
@@ -1478,17 +1543,47 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return Boolean(sandboxSelectedModel)
   }
 
+  // three r180 TransformControls 的轴向可见性是布尔属性（showX/showY/showZ），
+  // 旧版 showX()/hideX() 方法已移除；init 前 sandboxTransform 可能仍为 null。
+  function setSandboxTransformAxes(x, y, z) {
+    if (!sandboxTransform) return
+    sandboxTransform.showX = x
+    sandboxTransform.showY = y
+    sandboxTransform.showZ = z
+  }
+
   function setSandboxTransformMode(mode) {
+    if (mode === 'road-endpoints') {
+      if (!isStretchableRoadModel(sandboxSelectedModel)) return false
+      sandboxTransform?.detach()
+      const editor = getSandboxRoadEditor()
+      if (!editor?.attach(sandboxSelectedModel)) return false
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      requestFrame()
+      return true
+    }
+
+    sandboxRoadEditor?.detach()
     if (mode === 'browse') {
       sandboxTransform?.detach()
+      setSandboxTransformAxes(true, true, true)
       cameraRig?.setOrbitInteractionEnabled?.(true)
       requestFrame()
       return true
     }
     if (!['translate', 'rotate', 'scale'].includes(mode)) return false
+    const selectedIsRoad = isStretchableRoadModel(sandboxSelectedModel)
+    if (selectedIsRoad && mode === 'scale') return false
     if (sandboxSelectedModel) sandboxTransform?.attach(sandboxSelectedModel)
     cameraRig?.setOrbitInteractionEnabled?.(!sandboxSelectedModel)
     sandboxTransform?.setMode(mode)
+    if (selectedIsRoad && mode === 'translate') {
+      setSandboxTransformAxes(true, false, true)
+    } else if (selectedIsRoad && mode === 'rotate') {
+      setSandboxTransformAxes(false, true, false)
+    } else {
+      setSandboxTransformAxes(true, true, true)
+    }
     requestFrame()
     return true
   }
@@ -1719,6 +1814,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     ).wind.direction
     environmentConfig = { time, timeOfDay, weather, wind, windDirection, artificialLightingEnabled }
     for (const model of sandboxModels.values()) applySandboxEnvironmentBindings(model)
+    if (sandboxPlacementState?.model) applySandboxEnvironmentBindings(sandboxPlacementState.model)
     if (!scene) return { ...environmentConfig }
 
     const night = solar.isNight
@@ -2190,7 +2286,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
 
   function disposeObjectGroup(group) {
     group?.traverse((object) => {
-      object.geometry?.dispose?.()
+      disposeOwnedGeometry(object.geometry)
       if (Array.isArray(object.material)) object.material.forEach(disposeMaterial)
       else disposeMaterial(object.material)
     })
@@ -2926,6 +3022,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     callbacks.onObjectSelected?.(null)
   }
   function onKeyDown(event) {
+    if (event.key === 'Escape' && sandboxRoadEditor?.handleEscape()) return
     if (placementState && event.key === 'Escape') { cancelGeneratedAssetPlacement(); return }
     if (placementState && ['q', 'Q', 'e', 'E'].includes(event.key)) {
       rotateGeneratedAsset(placementState.instance.userData.generatedAssetId, event.key.toLowerCase() === 'q' ? -Math.PI / 12 : Math.PI / 12)
@@ -4082,6 +4179,8 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     disposeGpuTimerDiagnostics()
     resizeObserver?.disconnect()
     window.removeEventListener('keydown', onKeyDown)
+    sandboxRoadEditor?.dispose()
+    sandboxRoadEditor = null
     renderer?.domElement?.removeEventListener('pointerdown', onScenePointerDown)
     renderer?.domElement?.removeEventListener('pointerup', onScenePointerUp)
     renderer?.domElement?.removeEventListener('pointerup', requestFrame)

@@ -2,9 +2,14 @@
  * 内置素材适配层：把场景资产生成器注册表的产物转成带完整碰撞声明的沙盒模型。
  *
  * 只做适配与标注，不修改生成器注册表（sceneAssetGeneratorRegistry.js 只读消费）。
+ * campus（校园地标）类别走独立生成器模块 ncgxyLandmarkGenerators.js，绕开注册表。
  * 每个 Mesh 都会获得稳定 componentId 与显式 collisionPolicy；required 部件
  * 同步生成 box 碰撞声明，产物可直接通过 analyzeModelCollisionCompleteness 门禁。
  */
+
+import { createEastGate, createSportsField, createZhiyuanBuilding } from '../world/campus/ncgxyLandmarkGenerators.js'
+import { refineBuiltinAssetVisuals } from './builtinAssetRealism.js'
+import { ROAD_DEFINITIONS, createProceduralRoadModel } from './proceduralRoadGenerator.js'
 
 export const BUILTIN_CATEGORY_LABELS = Object.freeze({
   vegetation: '植被',
@@ -12,6 +17,8 @@ export const BUILTIN_CATEGORY_LABELS = Object.freeze({
   facility: '设施',
   decoration: '装饰',
   sports: '运动',
+  campus: '校园地标',
+  road: '常规道路',
 })
 
 export const BUILTIN_ASSET_CATALOG = Object.freeze([
@@ -28,7 +35,23 @@ export const BUILTIN_ASSET_CATALOG = Object.freeze([
   { category: 'decoration', objectType: 'rock', label: '景观石' },
   { category: 'decoration', objectType: 'flowerbed', label: '花坛' },
   { category: 'sports', objectType: 'basketball-hoop', label: '篮球架' },
+  { category: 'campus', objectType: 'east-gate', label: '南工东大门', note: '古典三重檐门楼，中央拱门可穿行' },
+  { category: 'campus', objectType: 'sports-field', label: '天工体育场（操场）', note: '真实 400m 操场，占地约 186×100 米，需先扩地再放置' },
+  { category: 'campus', objectType: 'zhiyuan-building', label: '致远楼（教学楼）', note: '一楼可进入，含 3 间教室，灯光受人工灯光总开关控制' },
+  ...ROAD_DEFINITIONS.map(definition => ({
+    category: 'road',
+    objectType: definition.objectType,
+    label: definition.label,
+    note: `默认 ${definition.defaultLength}×${definition.width}m，可拖端点在 2–120m 间改变长度`,
+  })),
 ])
+
+// campus 类别独立生成器分派表（绕开只读注册表）；Task 2/3 在此追加新地标
+const CAMPUS_GENERATORS = Object.freeze({
+  'east-gate': createEastGate,
+  'sports-field': createSportsField,
+  'zhiyuan-building': createZhiyuanBuilding,
+})
 
 export const BUILTIN_ASSET_LABELS = Object.freeze(
   Object.fromEntries(
@@ -56,6 +79,14 @@ export const BUILTIN_ASSET_DIMENSIONS = Object.freeze({
   'decoration:flowerbed': { width: 2.1, height: 0.9, depth: 1.1 },
   // 篮筐真实高度 3.05m：生成器 rim.y = height * 0.62，故 height 取 4.9
   'sports:basketball-hoop': { width: 2.9, height: 4.9, depth: 1.8 },
+  // 校园地标：估算尺寸（spec §4），自研生成器等比构建，无注册表收缩系数
+  'campus:east-gate': { width: 36, height: 13, depth: 8 },
+  'campus:sports-field': { width: 186, height: 12, depth: 100 },
+  'campus:zhiyuan-building': { width: 80, height: 21, depth: 16 },
+  ...Object.fromEntries(ROAD_DEFINITIONS.map(definition => [
+    `road:${definition.objectType}`,
+    { width: definition.defaultLength, height: 0.1, depth: definition.width },
+  ])),
 })
 
 // 碰撞规则表（规格 §4.3 的单一来源）：required 前缀的部件生成 box 声明，
@@ -74,6 +105,16 @@ const COLLISION_RULES = Object.freeze({
   'decoration:rock': { required: ['rock-body'], none: [] },
   'decoration:flowerbed': { required: ['border'], none: ['soil', 'flowerbed-flower'] },
   'sports:basketball-hoop': { required: ['support'], none: ['backboard', 'rim'] },
+  'campus:east-gate': { required: ['pier'], none: ['roof', 'plaque', 'lintel'] },
+  'campus:sports-field': {
+    required: ['goalpost', 'stand-step', 'flagpole'],
+    none: ['track', 'lane-line', 'pitch', 'pitch-line', 'stand-roof', 'stand-seat', 'goal-net', 'flag'],
+  },
+  'campus:zhiyuan-building': {
+    required: ['wing', 'colonnade', 'wall', 'partition', 'solid', 'upper', 'desk', 'chair', 'podium'],
+    none: ['glass-canopy', 'blackboard', 'window-glass', 'lamptube', 'floor', 'route', 'canopy'],
+  },
+  ...Object.fromEntries(ROAD_DEFINITIONS.map(definition => [`road:${definition.objectType}`, { noneAll: true }])),
 })
 
 // 生成器中部分 Mesh 没有 name（灌木树冠、花卉花朵、景观石、花坛花朵），
@@ -94,6 +135,7 @@ export function listBuiltinAssets() {
     category: entry.category,
     objectType: entry.objectType,
     label: entry.label,
+    note: entry.note,
   }))
 }
 
@@ -192,7 +234,88 @@ function attachLampEnvironmentLighting(THREE, root, { category, objectType, sema
   ]
 }
 
-export function createBuiltinSandboxModel(THREE, registry, { category, objectType } = {}) {
+// 致远楼的地板支撑与通行路线引用真实部件/空锚点的固定 componentId。
+// 坐标是锚点局部空间，由 testModelTraversalRoutes 转为世界坐标。
+function buildZhiyuanSpatialExtras(taggedPartsByName) {
+  const floor = taggedPartsByName.get('zhiyuan-floor')
+  const mainRoute = taggedPartsByName.get('zhiyuan-route-main')
+  const classroomRoute = taggedPartsByName.get('zhiyuan-route-classroom')
+  if (!floor || !mainRoute || !classroomRoute) {
+    throw new Error('内置致远楼缺少地板或通行路由锚点，无法声明空间能力')
+  }
+  return {
+    surfaces: [{
+      id: 'zhiyuan-floor-surface',
+      targetPartId: floor.userData.componentId,
+      shape: 'mesh',
+      supportsStanding: true,
+      walkable: true,
+    }],
+    traversability: {
+      passages: [
+        {
+          id: 'zhiyuan-main-entry',
+          targetPartId: mainRoute.userData.componentId,
+          startPoint: { x: 0, y: 0.1, z: 10.5 },
+          endPoint: { x: 0, y: 0.1, z: 2.2 },
+        },
+        {
+          id: 'zhiyuan-classroom-entry',
+          targetPartId: classroomRoute.userData.componentId,
+          startPoint: { x: -4.5, y: 0.1, z: 2.2 },
+          endPoint: { x: -4.5, y: 0.1, z: -2.5 },
+        },
+      ],
+    },
+  }
+}
+
+// 致远楼的三盏教室灯与六根发光灯管统一接人工灯光总开关。
+// PointLight 由生成器定位，componentId 仍由适配层按既有序号规则分配。
+function attachZhiyuanEnvironmentLighting(THREE, root, { category, objectType, semanticSeq }) {
+  const lights = []
+  const lamptubes = []
+  root.traverse(object => {
+    if (object.isPointLight && object.name === 'zhiyuan-light') lights.push(object)
+    if (object.isMesh && object.name === 'zhiyuan-lamptube') lamptubes.push(object)
+  })
+  if (lights.length !== 3 || lamptubes.length !== 6
+    || lamptubes.some(tube => !tube.userData.componentId)) {
+    throw new Error('内置致远楼教室灯具数量或标注不完整，无法接线人工灯光环境控制')
+  }
+
+  const bindings = []
+  for (const light of lights) {
+    const semantic = 'zhiyuan-light'
+    const seq = semanticSeq.get(semantic) ?? 0
+    semanticSeq.set(semantic, seq + 1)
+    const componentId = `${category}-${objectType}-${semantic}-${seq}`
+    light.userData.componentId = componentId
+    light.userData.collisionPolicy = 'none'
+    light.castShadow = false
+    bindings.push({
+      variable: 'lighting.artificial.enabled',
+      targetPartId: componentId,
+      property: 'intensity',
+      enabledValue: 1.6,
+      disabledValue: 0,
+      defaultValue: true,
+    })
+  }
+  for (const tube of lamptubes) {
+    bindings.push({
+      variable: 'lighting.artificial.enabled',
+      targetPartId: tube.userData.componentId,
+      property: 'visible',
+      enabledValue: true,
+      disabledValue: false,
+      defaultValue: true,
+    })
+  }
+  root.userData.proceduralModelEnvironmentBindings = bindings
+}
+
+export function createBuiltinSandboxModel(THREE, registry, { category, objectType, parameters = {} } = {}) {
   const assetKey = `${category}:${objectType}`
   const catalogEntry = BUILTIN_ASSET_CATALOG.find(
     entry => entry.category === category && entry.objectType === objectType,
@@ -205,7 +328,21 @@ export function createBuiltinSandboxModel(THREE, registry, { category, objectTyp
   if (!dimensions) {
     throw new Error(`内置素材适配层缺少真实尺寸配置：${assetKey}`)
   }
-  const root = registry.generate({ category, objectType, visualStyle: 'stylized', dimensions })
+  let root
+  if (category === 'campus') {
+    // campus 类别走独立生成器模块（注册表只读，且其 dimensionsOf 默认不适合地标）
+    root = CAMPUS_GENERATORS[objectType](THREE, dimensions)
+  } else if (category === 'road') {
+    root = createProceduralRoadModel(THREE, {
+      objectType,
+      length: parameters.length ?? dimensions.width,
+      width: dimensions.depth,
+    })
+  } else {
+    root = registry.generate({ category, objectType, visualStyle: 'stylized', dimensions })
+  }
+  // 视觉细化必须先于标注，保证所有新增 Mesh 都进入同一碰撞分类门禁。
+  refineBuiltinAssetVisuals(THREE, root, { category, objectType })
   const colliders = []
   const semanticSeq = new Map()
 
@@ -234,6 +371,20 @@ export function createBuiltinSandboxModel(THREE, registry, { category, objectTyp
   if (assetKey === 'facility:lamp') {
     attachLampEnvironmentLighting(THREE, root, { category, objectType, semanticSeq })
   }
+  if (assetKey === 'campus:zhiyuan-building') {
+    attachZhiyuanEnvironmentLighting(THREE, root, { category, objectType, semanticSeq })
+  }
+
+  const spatial = { colliders }
+  if (assetKey === 'campus:zhiyuan-building') {
+    const taggedPartsByName = new Map()
+    root.traverse(object => {
+      if (object.userData.componentId && !taggedPartsByName.has(object.name)) {
+        taggedPartsByName.set(object.name, object)
+      }
+    })
+    Object.assign(spatial, buildZhiyuanSpatialExtras(taggedPartsByName))
+  }
 
   root.userData.assetName = catalogEntry.label
   root.userData.proceduralModelSource = null
@@ -241,9 +392,7 @@ export function createBuiltinSandboxModel(THREE, registry, { category, objectTyp
   root.userData.proceduralModelCapabilityManifest = {
     version: 1,
     parameters: [],
-    capabilities: {
-      spatial: { colliders },
-    },
+    capabilities: { spatial },
   }
   return root
 }
