@@ -26,52 +26,77 @@ describe('createSkyRuntime 工厂结构与生命周期', () => {
     expect(findByName(runtime.group, 'sky-stars')).toBeTruthy()
   })
 
-  it('日月为带辉光的 ShaderMaterial：太阳加性混合、月亮普通透明混合，均不写深度且不受雾影响', () => {
+  it('太阳与月亮都是实体球，不再是面向相机的平面贴片', () => {
     const runtime = createSkyRuntime(THREE)
-    const sun = findByName(runtime.group, 'sky-sun')
+    const sunCore = findByName(runtime.group, 'sky-sun-core')
     const moon = findByName(runtime.group, 'sky-moon')
-    expect(sun.material.isShaderMaterial).toBe(true)
+    expect(sunCore.geometry.type).toBe('SphereGeometry')
+    expect(moon.geometry.type).toBe('SphereGeometry')
+    // 太阳外层有两层递增范围的加性光晕球
+    const halo = findByName(runtime.group, 'sky-sun-halo')
+    const glow = findByName(runtime.group, 'sky-sun-glow')
+    expect(halo.geometry.type).toBe('SphereGeometry')
+    expect(glow.geometry.type).toBe('SphereGeometry')
+    expect(halo.material.blending).toBe(THREE.AdditiveBlending)
+    expect(glow.material.blending).toBe(THREE.AdditiveBlending)
+    expect(glow.geometry.parameters.radius).toBeGreaterThan(halo.geometry.parameters.radius)
+    // 球体无朝向依赖：任意外观角度都是立体
+    expect(sunCore.material.isShaderMaterial).toBe(true)
     expect(moon.material.isShaderMaterial).toBe(true)
-    expect(sun.material.blending).toBe(THREE.AdditiveBlending)
-    expect(moon.material.blending).toBe(THREE.NormalBlending)
-    expect(sun.material.transparent).toBe(true)
-    expect(sun.material.depthWrite).toBe(false)
+    expect(sunCore.material.depthWrite).toBe(false)
     expect(moon.material.depthWrite).toBe(false)
-    expect(sun.material.fog).toBe(false)
+    expect(sunCore.material.fog).toBe(false)
     expect(moon.material.fog).toBe(false)
-    expect(sun.material.uniforms.uOpacity).toBeTruthy()
-    expect(moon.material.uniforms.uOpacity).toBeTruthy()
   })
 
-  it('update 后太阳位置沿方向放到轨道半径、透明度写入 uOpacity 且不投影', () => {
+  it('update 后太阳落在轨道半径上，且显示仰角被压缩到俯瞰可见范围', () => {
     const runtime = createSkyRuntime(THREE)
     const state = getSkyVisualState(getVirtualSunState(12))
     runtime.update(state)
     const sun = findByName(runtime.group, 'sky-sun')
-    const expected = new THREE.Vector3(...state.sun.direction).multiplyScalar(CELESTIAL_ORBIT_RADIUS)
-    expect(sun.position.distanceTo(expected)).toBeLessThan(1e-4)
-    expect(sun.material.uniforms.uOpacity.value).toBeCloseTo(state.sun.opacity, 6)
-    expect(sun.castShadow).toBe(false)
+    // 位置在轨道球面上
+    expect(sun.position.length()).toBeCloseTo(CELESTIAL_ORBIT_RADIUS, 3)
+    // 正午原始方向仰角约 90°，压缩后应显著更低（俯瞰画面才看得到）
+    expect(state.sun.direction[1]).toBeGreaterThan(0.9)
+    expect(sun.position.y / CELESTIAL_ORBIT_RADIUS).toBeLessThan(0.5)
+    expect(sun.position.y / CELESTIAL_ORBIT_RADIUS).toBeGreaterThan(0)
+    // 透明度写入核心材质与光晕
+    const core = findByName(runtime.group, 'sky-sun-core')
+    expect(core.material.uniforms.uOpacity.value).toBeCloseTo(state.sun.opacity, 6)
+    // 光晕为加性 shader 球，透明度经 uOpacity 传入（uPeak 决定各层最大强度）
+    expect(findByName(runtime.group, 'sky-sun-halo').material.uniforms.uOpacity.value)
+      .toBeCloseTo(state.sun.opacity, 6)
+    expect(findByName(runtime.group, 'sky-sun-halo').material.uniforms.uPeak.value).toBeCloseTo(0.34, 6)
+    expect(findByName(runtime.group, 'sky-sun-glow').material.uniforms.uOpacity.value)
+      .toBeCloseTo(state.sun.opacity, 6)
+    expect(findByName(runtime.group, 'sky-sun-glow').material.uniforms.uPeak.value).toBeCloseTo(0.11, 6)
   })
 
-  it('group 任意位移后，日月广告牌正面恒朝局部球心（不指向世界原点）', () => {
+  it('夜晚：太阳隐藏、月亮球显示并有月海着色', () => {
+    const runtime = createSkyRuntime(THREE)
+    const night = getSkyVisualState(getVirtualSunState(23))
+    runtime.update(night)
+    const sun = findByName(runtime.group, 'sky-sun')
+    const moon = findByName(runtime.group, 'sky-moon')
+    expect(night.sun.opacity).toBe(0)
+    expect(sun.visible).toBe(false)
+    expect(moon.visible).toBe(true)
+    expect(moon.material.uniforms.uOpacity.value).toBeGreaterThan(0)
+    expect(moon.position.length()).toBeCloseTo(CELESTIAL_ORBIT_RADIUS, 3)
+    // 月亮球面着色必须含月海与球体明暗（不再是平面圆盘 shader）
+    expect(moon.material.fragmentShader).toContain('maria')
+    expect(moon.material.fragmentShader).toContain('limb')
+  })
+
+  it('group 位移不影响天体本地轨道位置（球体不依赖朝向）', () => {
     const runtime = createSkyRuntime(THREE)
     runtime.group.position.set(600, 350, 600)
     const state = getSkyVisualState(getVirtualSunState(12))
     runtime.update(state)
-    for (const name of ['sky-sun', 'sky-moon']) {
-      const body = findByName(runtime.group, name)
-      const frontAxis = new THREE.Vector3(0, 0, 1).applyQuaternion(body.quaternion)
-      const expected = body.position.clone().normalize().negate()
-      expect(frontAxis.dot(expected)).toBeCloseTo(1, 6)
-    }
-  })
-
-  it('月亮 shader 按最终 alpha 丢弃片元，discard 不得先于辉光计算', () => {
-    const runtime = createSkyRuntime(THREE)
-    const fragment = findByName(runtime.group, 'sky-moon').material.fragmentShader
-    expect(fragment).toContain('if (alpha <= 0.001) discard')
-    expect(fragment).not.toContain('if (disk <= 0.001) discard')
+    const sun = findByName(runtime.group, 'sky-sun')
+    expect(sun.position.length()).toBeCloseTo(CELESTIAL_ORBIT_RADIUS, 3)
+    // 球体没有广告牌朝向需求，quaternion 保持单位四元数
+    expect(sun.quaternion.equals(new THREE.Quaternion())).toBe(true)
   })
 
   it('followCamera 三轴复制相机位置；setIndoor 切换 visible', () => {

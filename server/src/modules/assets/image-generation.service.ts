@@ -25,6 +25,18 @@ const PROCEDURAL_ANIMATION_CONTRACT: readonly string[] = [
 ];
 
 /**
+ * Editable text contract: generated models must not draw glyphs themselves
+ * (canvas textures are lost across the Worker/ObjectLoader boundary and CJK
+ * fonts differ per environment). They declare textSpec on a part instead and
+ * the host renders the text with a CJK-capable font, so it stays editable.
+ */
+const PROCEDURAL_TEXT_CONTRACT: readonly string[] = [
+  'Editable text contract: for any visible lettering, signage or plaque (including Chinese text), do not draw glyphs with geometry, canvas textures or texture images yourself. Create the supporting part Group with a stable componentId and collisionPolicy, and set userData.textSpec on that part: { text: string, width: number, height: number, color: string, backgroundColor?: string, fontFamily?: string, fontSize?: number, align?: "left"|"center"|"right", verticalAlign?: "top"|"middle"|"bottom", position?: {x,y,z}, rotation?: {x,y,z} }. width and height are in model units and must match the plaque/sign size; position is local to the part and the text plane faces +Z by default. The host renders the text into a high-resolution texture using a CJK-capable font stack, so Chinese characters must be passed as plain text in textSpec.text and never approximated with shapes.',
+  'Do not create a Mesh named "host-text-plate"; the host adds and manages that plane from textSpec.',
+]
+
+
+/**
  * Shared asset-boundary contract used by both creation and editing prompts.
  * The sandbox host owns the full environment (sky, sun, time-of-day lighting,
  * weather, fog, ground, cameras); a generated model may contain only the asset
@@ -264,6 +276,109 @@ function validateOperationParameterBindings(operations: any[], parameterSchema: 
     expandedCount += subtree.length * (parameter.max - 1);
     if (expandedCount > 300) throw new ServiceUnavailableException('AI operations 最大展开组件数超过 300：' + operation.id);
   }
+}
+
+/**
+ * Fail-closed source check before the generated module ever reaches the browser:
+ * - rejects imports (the contract requires a self-contained module);
+ * - requires the createModel(THREE) factory and a returned Group;
+ * - parses the remaining body with Function (compile only, never executed) so
+ *   HTML/Markdown or other invalid JS is caught here instead of as
+ *   "Unexpected token '<'" in the client Worker.
+ */
+function describeProceduralSourceProblem(source: string): string | null {
+  if (/^\s*import\s/m.test(source) || /\bimport\s+[^;\n]*\s+from\s*['"]/.test(source)) {
+    return '源码包含 import 语句，契约要求自包含、无外部依赖';
+  }
+  if (!/export\s+function\s+createModel\s*\(\s*THREE(?:\s*,[^)]*)?\)/.test(source)
+    || !/return\s+[A-Za-z_$][\w$]*\s*;?/.test(source)) {
+    return '缺少 createModel(THREE) 工厂或 Group 返回语句';
+  }
+  const parseable = source.replace(/\bexport\s+(?=(?:async\s+)?(?:function|class|const|let|var)\b)/g, '');
+  try {
+    // Compile-only syntax check: the body is never invoked.
+    // eslint-disable-next-line no-new-func
+    new Function(parseable);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return 'JavaScript 语法错误：' + message.slice(0, 160);
+  }
+  return null;
+}
+
+/**
+ * Structure-planning contract (spec-first generation): the model must produce a
+ * machine-checkable JSON plan before any code is written. The plan is validated
+ * server-side and then injected into the code-generation prompt as a hard
+ * contract, so footprint/dimensions/parts do not drift freely.
+ */
+const PROCEDURAL_DRAFT_SPEC_CONTRACT: readonly string[] = [
+  'You are a structural planner for procedural Three.js reconstruction. Analyze the user request and optional reference image, then return ONLY one JSON object. Do not return code, Markdown or explanations.',
+  'JSON schema: {"subject": string, "kind": "building"|"object"|"character"|"mixed", "dimensions": {"width": number, "height": number, "depth": number}, "footprint": {"type": "rect", "width": number, "depth": number} or {"type": "polygon", "points": [{"x": number, "z": number}, ...]}, "levels": integer (optional), "parts": [{"id": string, "role": string}, ...], "materials": [{"name": string, "color": string (optional)}, ...], "features": [string, ...]}.',
+  'All dimensions are in meters. The model stands on y=0 and is centered near the X/Z origin.',
+  'If the user request contains a footprint polygon, use footprint.type="polygon" with exactly those vertices (local X/Z meters) and keep the plan inside it. Otherwise use footprint.type="rect" with the intended width and depth.',
+  'parts must list identity-defining structural components such as walls, window bands, roof, parapet, entrance canopy, steps and signs, 3-48 entries with stable lowercase ids; each part becomes a component group in the generated code.',
+  'materials must list the visible material regions, 1-16 entries.',
+  'features must list identity-defining details that must appear in the final model, 3-48 entries.',
+  'Return JSON only.',
+]
+
+const DRAFT_SPEC_KINDS = new Set(['building', 'object', 'character', 'mixed'])
+
+function isFiniteMeter(value: unknown, min: number, max: number): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= min && value <= max;
+}
+
+/** Strict validation of the structure plan; returns null when valid. */
+function describeProceduralDraftSpecProblem(specInput: unknown): string | null {
+  if (!specInput || typeof specInput !== 'object' || Array.isArray(specInput)) return '规划结果必须是 JSON 对象';
+  const spec: any = specInput;
+  if (typeof spec.subject !== 'string' || !spec.subject.trim() || spec.subject.length > 160) return 'subject 缺失或过长';
+  if (!DRAFT_SPEC_KINDS.has(spec.kind)) return 'kind 必须是 building/object/character/mixed';
+  const dimensions = spec.dimensions;
+  if (!dimensions || typeof dimensions !== 'object') return '缺少 dimensions';
+  for (const key of ['width', 'height', 'depth']) {
+    if (!isFiniteMeter(dimensions[key], 0.1, 300)) return 'dimensions.' + key + ' 必须是 0.1–300 米之间的数值';
+  }
+  const footprint = spec.footprint;
+  if (!footprint || typeof footprint !== 'object') return '缺少 footprint';
+  if (footprint.type === 'rect') {
+    if (!isFiniteMeter(footprint.width, 0.1, 300) || !isFiniteMeter(footprint.depth, 0.1, 300)) {
+      return 'footprint.width/depth 必须是 0.1–300 米之间的数值';
+    }
+  } else if (footprint.type === 'polygon') {
+    const points = footprint.points;
+    if (!Array.isArray(points) || points.length < 3 || points.length > 64) return 'footprint.points 需要 3–64 个顶点';
+    if (!points.every((point: any) => isFiniteMeter(point?.x, -300, 300) && isFiniteMeter(point?.z, -300, 300))) {
+      return 'footprint.points 坐标无效';
+    }
+  } else {
+    return 'footprint.type 必须是 rect 或 polygon';
+  }
+  if (spec.levels !== undefined && (!Number.isInteger(spec.levels) || spec.levels < 1 || spec.levels > 120)) {
+    return 'levels 必须是 1–120 的整数';
+  }
+  const parts = spec.parts;
+  if (!Array.isArray(parts) || parts.length < 3 || parts.length > 48) return 'parts 需要 3–48 个部件';
+  const partIds = new Set<string>();
+  for (const part of parts) {
+    const id = typeof part?.id === 'string' ? part.id.trim() : '';
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) return 'parts.id 必须是字母/数字/下划线组成的稳定 ID';
+    if (partIds.has(id)) return 'parts.id 不能重复：' + id;
+    partIds.add(id);
+    if (typeof part?.role !== 'string' || !part.role.trim() || part.role.length > 120) return 'parts.role 缺失或过长';
+  }
+  const materials = spec.materials;
+  if (!Array.isArray(materials) || materials.length < 1 || materials.length > 16) return 'materials 需要 1–16 个材质';
+  for (const material of materials) {
+    if (typeof material?.name !== 'string' || !material.name.trim() || material.name.length > 80) return 'materials.name 缺失或过长';
+  }
+  const features = spec.features;
+  if (!Array.isArray(features) || features.length < 3 || features.length > 48) return 'features 需要 3–48 条关键特征';
+  if (!features.every((feature: any) => typeof feature === 'string' && feature.trim() && feature.length <= 200)) {
+    return 'features 文本无效或过长';
+  }
+  return null;
 }
 
 @Injectable()
@@ -814,6 +929,126 @@ export class ImageGenerationService {
 
 
   /**
+   * Ask the model for a machine-checkable structure plan (spec-first generation).
+   * Invalid plans are retried with the concrete validation error, then fail closed.
+   */
+  private async requestProceduralDraftSpec(input: {
+    prompt: string;
+    objectType: string;
+    visualStyle: string;
+    imageDataUrl: string;
+    apiKey: string;
+    model: string;
+    baseUrl: string;
+    timeoutMs: number;
+    onProgress?: (event: Record<string, unknown>) => void;
+  }): Promise<any> {
+    const messages: any[] = [
+      { role: 'system', content: PROCEDURAL_DRAFT_SPEC_CONTRACT.join(String.fromCharCode(10)) },
+      {
+        role: 'user',
+        content: input.imageDataUrl
+          ? [
+              {
+                type: 'text',
+                text: 'Plan the structure from this reference image.'
+                  + String.fromCharCode(10) + 'Object type: ' + input.objectType
+                  + String.fromCharCode(10) + 'Visual style: ' + input.visualStyle
+                  + String.fromCharCode(10) + 'User request: ' + (input.prompt || 'Reconstruct the visible object in the reference image.'),
+              },
+              { type: 'image_url', image_url: { url: input.imageDataUrl, detail: 'high' } },
+            ]
+          : [
+              'Plan the structure.',
+              'Object type: ' + input.objectType,
+              'Visual style: ' + input.visualStyle,
+              'User request: ' + (input.prompt || 'Reconstruct the requested object.'),
+            ].join(String.fromCharCode(10)),
+      },
+    ];
+    const maxAttempts = 2;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      input.onProgress?.({
+        stage: 'plan',
+        label: attempt === 1 ? '规划模型结构' : '修正模型结构规划',
+        detail: '第 ' + attempt + '/' + maxAttempts + ' 次结构规划',
+      });
+      let response: Response;
+      try {
+        response = await fetch(input.baseUrl + '/chat/completions', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + input.apiKey, 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(input.timeoutMs),
+          body: JSON.stringify({
+            model: input.model,
+            temperature: 0.2,
+            response_format: { type: 'json_object' },
+            messages,
+          }),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.warn('程序化模型结构规划请求失败（' + attempt + '/' + maxAttempts + '）：' + message);
+        if (attempt < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
+        }
+        throw new ServiceUnavailableException('模型结构规划请求失败');
+      }
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 500);
+        this.logger.warn('程序化模型结构规划 HTTP ' + response.status + '（' + attempt + '/' + maxAttempts + '）：' + detail);
+        const retryable = response.status === 408 || response.status === 425
+          || response.status === 429 || response.status >= 500;
+        if (retryable && attempt < maxAttempts) {
+          await new Promise(resolve => setTimeout(resolve, 800));
+          continue;
+        }
+        throw new ServiceUnavailableException('模型结构规划失败（HTTP ' + response.status + '）');
+      }
+      let payload: any;
+      try {
+        payload = await response.json();
+      } catch {
+        payload = null;
+      }
+      const content = payload?.choices?.[0]?.message?.content;
+      const raw = typeof content === 'string'
+        ? content
+        : Array.isArray(content)
+          ? content.filter((part: any) => part && typeof part.text === 'string').map((part: any) => part.text).join(String.fromCharCode(10))
+          : '';
+      let spec: any = null;
+      try {
+        spec = JSON.parse(raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, ''));
+      } catch {
+        spec = null;
+      }
+      const problem = spec ? describeProceduralDraftSpecProblem(spec) : '规划结果不是有效 JSON';
+      if (!problem) {
+        input.onProgress?.({
+          stage: 'plan',
+          label: '模型结构规划完成',
+          detail: '部件 ' + spec.parts.length + ' 个，尺寸 '
+            + spec.dimensions.width + '×' + spec.dimensions.height + '×' + spec.dimensions.depth + ' m',
+          status: 'done',
+        });
+        return spec;
+      }
+      this.logger.warn('程序化模型结构规划不合法（' + attempt + '/' + maxAttempts + '）：' + problem);
+      if (attempt < maxAttempts) {
+        messages.push({
+          role: 'user',
+          content: '上一次规划不合法：' + problem + '。请只返回符合 schema 的 JSON 对象。',
+        });
+        continue;
+      }
+      throw new ServiceUnavailableException('模型结构规划不合法：' + problem);
+    }
+    throw new ServiceUnavailableException('模型结构规划失败');
+  }
+
+  /**
    * Procedural Three.js generation MVP.
    * The model returns a factory source string; this service never evaluates generated code.
    * Execution and rendering must happen in the isolated preview runtime, not in NestJS.
@@ -824,6 +1059,7 @@ export class ImageGenerationService {
     visualStyleInput: unknown,
     imageDataUrlInput?: unknown,
     onProgress?: (event: Record<string, unknown>) => void,
+    options: { specFirst?: boolean; stage?: string } = {},
   ): Promise<any> {
     const prompt = typeof promptInput === 'string' ? promptInput.trim().slice(0, 40000) : '';
     const imageDataUrl = typeof imageDataUrlInput === 'string' ? imageDataUrlInput : '';
@@ -847,6 +1083,13 @@ export class ImageGenerationService {
     const configuredTimeout = Number(this.config.get<string>('VISION_REQUEST_TIMEOUT_MS') || 600000);
     const timeoutMs = Number.isFinite(configuredTimeout)
       ? Math.min(900000, Math.max(30000, Math.floor(configuredTimeout))) : 600000;
+    // Spec-first：先产出并严格校验结构规划，再把规划作为硬约束交给代码生成。
+    let draftSpec: any = null;
+    if (options.specFirst === true) {
+      draftSpec = await this.requestProceduralDraftSpec({
+        prompt, objectType, visualStyle, imageDataUrl, apiKey, model, baseUrl, timeoutMs, onProgress,
+      });
+    }
     const messages: any[] = [
       {
         role: 'system',
@@ -864,6 +1107,7 @@ export class ImageGenerationService {
           'For water that needs depth-aware player immersion, also declare capabilities.spatial.waterVolumes as data-only sensors: [{ id, targetPartId, surfacePartId, shape:"box", center:{x,z}, size:{x,z}, bottomY, depth, enabled:true }]. targetPartId must resolve to a stable componentId on the water-volume frame Group. surfacePartId must resolve to a distinct visible horizontal water-surface Group that is a direct child of targetPartId; give it a stable componentId and author its local Y at bottomY + depth. center, size, bottomY and depth are local to targetPartId. depth is the vertical distance from the fixed bottomY to the water surface; surface height is bottomY + depth. The host runtime applies parameter depth deltas to surfacePartId so the visible plane moves with the sampled water surface. Optionally bind a model parameter to capabilityId:"spatial.waterVolume.<id>.depth" with property:"depth"; the runtime resolves the parameter value before sampling and synchronizes the surface part. These volumes are sensors only: they never create solid colliders, standing surfaces, buoyancy or passability rules. Do not use them as a substitute for shoreline collision geometry.',
           ...PROCEDURAL_ANIMATION_CONTRACT,
           ...PROCEDURAL_MODEL_BOUNDARY_CONTRACT,
+          ...PROCEDURAL_TEXT_CONTRACT,
           'Never claim that a collider works merely because it appears in modelCapabilityManifest. Only claim runtime support for the exact shape and registration path listed above. Keep collision geometry separate from render detail wherever practical; the host Runtime owns physics registration and validation.',
           'Never claim that a collider works merely because it appears in modelCapabilityManifest. Only claim runtime support for the exact shape and registration path listed above. Keep collision geometry separate from render detail wherever practical; the host Runtime owns physics registration and validation.',
           'environmentBindings declares how this model responds to sandbox environment values. Each entry uses { id, targetPartId, variable, property, defaultValue, enabledValue, disabledValue }. targetPartId must match a stable userData.componentId on an actual target Object3D. Use variable "lighting.artificial.enabled" for controllable artificial light sources; bind actual THREE.Light objects with property "visible" or "intensity", and emissive bulb meshes with property "emissiveIntensity". Export an empty array when the model has no environment-responsive parts. Do not invent bindings for components that do not exist.',
@@ -894,6 +1138,17 @@ export class ImageGenerationService {
           : 'Generate the complete editable procedural model. Return only the JavaScript module exporting createModel(THREE, params = {}), modelCapabilityManifest and compatibility metadata exports.',
       },
     ];
+    if (draftSpec) {
+      messages.splice(1, 0, {
+        role: 'system',
+        content: 'Validated structure spec (machine-checked JSON; follow it exactly. Every part, material and feature must exist in the generated code; dimensions and footprint are hard constraints; part ids should become stable componentIds where practical): ' + JSON.stringify(draftSpec),
+      });
+    }
+    if (options.stage === 'blockout') {
+      messages[0].content += String.fromCharCode(10)
+        + 'Blockout stage: build only closed solid massing volumes defined by the validated spec (correct sizes and positions, simple neutral material). Every volume must have real depth in both horizontal directions (no zero-thickness planes, single-sided facades or thin background boards); a building must read as an enclosed multi-part solid from front, side and top views. '
+        + 'Do not add facade details, trims, window sub-geometry, signage or surface texture yet; keep the factory contract and capability manifest valid but minimal.';
+    }
 
     const startedAt = Date.now();
     const maxAttempts = 3;
@@ -1021,9 +1276,26 @@ export class ImageGenerationService {
       if (generatedCode.length > 120000) {
         throw new ServiceUnavailableException('程序化模型源码超过 120 KB');
       }
-      if (!/export\s+function\s+createModel\s*\(\s*THREE(?:\s*,[^)]*)?\)/.test(generatedCode)
-        || !/return\s+[A-Za-z_$][\w$]*\s*;?/.test(generatedCode)) {
-        throw new ServiceUnavailableException('程序化模型源码缺少 createModel(THREE) 工厂或 Group 返回语句');
+      const sourceProblem = describeProceduralSourceProblem(generatedCode);
+      if (sourceProblem) {
+        this.logger.warn('程序化模型源码不合法（' + attempt + '/' + maxAttempts + '）：' + sourceProblem);
+        if (attempt < maxAttempts) {
+          messages.push({
+            role: 'user',
+            content: [
+              '上一次返回的源码不合法：' + sourceProblem + '。',
+              '请重新返回完整源码：只输出纯 JavaScript ES module，不要 Markdown 代码块、不要 HTML、不要解释文字、不要 import 语句；必须导出 createModel(THREE, params = {}) 并返回 THREE.Group。',
+            ].join(String.fromCharCode(10)),
+          });
+          onProgress?.({
+            stage: 'retry',
+            label: '生成源码不合法，正在重试',
+            detail: '第 ' + (attempt + 1) + '/' + maxAttempts + ' 次尝试：' + sourceProblem.slice(0, 120),
+          });
+          await new Promise(resolve => setTimeout(resolve, 500));
+          continue;
+        }
+        throw new ServiceUnavailableException('程序化模型源码不合法：' + sourceProblem);
       }
       break;
     }
@@ -1037,6 +1309,7 @@ export class ImageGenerationService {
       visualStyle,
       generationMethod: 'img2threejs-procedural',
       generatedCode,
+      draftSpec,
       generatedAt: new Date().toISOString(),
       generationMetrics: { attempts: attemptsUsed, durationMs: Date.now() - startedAt },
     };
@@ -1054,12 +1327,14 @@ export class ImageGenerationService {
     visualStyleInput: unknown,
     imageDataUrlInput: unknown,
     emit: (event: Record<string, unknown>) => void,
+    generationStageInput?: unknown,
   ): Promise<void> {
+    const generationStage = typeof generationStageInput === 'string' ? generationStageInput.trim() : '';
     emit({
       type: 'stage',
       stage: 'generation',
       label: '正在生成完整模型',
-      detail: 'AI 正在一次性构建完整 Three.js 模型；不进行组件拆分或逐部件请求',
+      detail: 'AI 正在一次性构建完整 Three.js 模型；先规划并校验结构，再生成代码',
     });
     const result = await this.generateProceduralObjectFromPrompt(
       promptInput,
@@ -1067,12 +1342,14 @@ export class ImageGenerationService {
       visualStyleInput,
       imageDataUrlInput,
       event => emit({ type: 'stage', ...event }),
+      { specFirst: true, stage: generationStage },
     );
     emit({
       type: 'stage',
       stage: 'generation-complete',
       label: '完整模型源码已生成',
-      detail: 'AI 请求耗时 ' + result.generationMetrics.durationMs + ' ms，尝试 ' + result.generationMetrics.attempts + ' 次',
+      detail: 'AI 请求耗时 ' + result.generationMetrics.durationMs + ' ms，尝试 ' + result.generationMetrics.attempts + ' 次'
+        + (result.draftSpec ? '，结构规划 ' + result.draftSpec.parts.length + ' 个部件' : ''),
       status: 'done',
     });
     emit({ type: 'single', result });
@@ -1082,7 +1359,8 @@ export class ImageGenerationService {
 
   async inspectProceduralModelVisualQuality(
     promptInput: unknown, objectTypeInput: unknown, referenceImageInput: unknown,
-    screenshotsInput: unknown, geometryDiagnosticsInput: unknown,
+    screenshotsInput: unknown, geometryDiagnosticsInput: unknown, footprintInput?: unknown,
+    baselineScreenshotsInput?: unknown,
   ): Promise<any> {
     const prompt = typeof promptInput === 'string' ? promptInput.trim().slice(0, 40000) : '';
     const objectType = typeof objectTypeInput === 'string' ? objectTypeInput.slice(0, 100) : '独立 3D 模型';
@@ -1096,6 +1374,11 @@ export class ImageGenerationService {
     if (!screenshots.every(item => validImage(item?.imageDataUrl))) {
       throw new BadRequestException('视觉质检截图格式无效或单张超过 3 MB');
     }
+    // 复检基线：修改前那一版的截图，用来判断“问题是否修好、有没有引入新问题”。
+    const baselineScreenshots = Array.isArray(baselineScreenshotsInput) ? baselineScreenshotsInput.slice(0, 5) : [];
+    if (baselineScreenshots.length && !baselineScreenshots.every(item => validImage(item?.imageDataUrl))) {
+      throw new BadRequestException('视觉质检基线截图格式无效或单张超过 3 MB');
+    }
     if (referenceImage && !validImage(referenceImage, 14 * 1024 * 1024)) {
       throw new BadRequestException('视觉质检参考图片格式无效或超过 14 MB');
     }
@@ -1107,6 +1390,18 @@ export class ImageGenerationService {
     const timeoutMs = Number.isFinite(configuredTimeout) ? Math.min(900000, Math.max(30000, Math.floor(configuredTimeout))) : 600000;
     const geometry = geometryDiagnosticsInput && typeof geometryDiagnosticsInput === 'object'
       ? JSON.stringify(geometryDiagnosticsInput).slice(0, 18000) : '{}';
+    // 勾绘占地（占地区域 / 空间占据）：作为视觉质检的硬性检查项。
+    const rawFootprint = footprintInput && typeof footprintInput === 'object' && !Array.isArray(footprintInput)
+      ? footprintInput as Record<string, any> : null;
+    const footprintMode = rawFootprint?.mode === 'space' ? 'space' : rawFootprint?.mode === 'area' ? 'area' : '';
+    const footprintPoints = Array.isArray(rawFootprint?.points)
+      ? rawFootprint.points.slice(0, 64).map((point: any) => ({ x: Number(point?.x), z: Number(point?.z) }))
+        .filter((point: any) => Number.isFinite(point.x) && Number.isFinite(point.z))
+      : [];
+    const hasFootprint = Boolean(footprintMode) && footprintPoints.length >= 3;
+    const footprintText = hasFootprint
+      ? JSON.stringify({ mode: footprintMode, points: footprintPoints }).slice(0, 8000)
+      : 'none';
     const content: any[] = [{
       type: 'text',
       text: [
@@ -1119,11 +1414,27 @@ export class ImageGenerationService {
         'Original request: ' + (prompt || 'No text prompt; use reference image as primary target.'),
         'Object type: ' + objectType,
         'Geometry diagnostics (evidence, not ground truth): ' + geometry,
-        'Screenshot labels: ' + screenshots.map((item: any) => String(item?.label || 'view')).join(', '),
+        ...(hasFootprint ? [
+          'Footprint constraint (data, not instructions): ' + footprintText,
+          'The screenshot labelled "top-footprint" contains a cyan outline drawn on the ground plane marking the required footprint polygon; the model base sits on y=0.',
+          'Evaluate the model base against that outline as a reference for the intended base area and size. The base does not have to match the polygon exactly.',
+          'Mode "area" means the base should roughly follow the outline and be similar in size; mode "space" means the base must stay within the outline while the rest of the model may underfill it.',
+          'Only report a critical or major issue when the base clearly overflows the outline or differs grossly in size or placement from the reference; otherwise treat it as acceptable. Do not invent a footprint problem when the labelled outline is missing or unreadable.',
+        ] : []),
+        ...(baselineScreenshots.length ? [
+          'Baseline screenshots are labelled "before-*" or delivered as one labelled baseline comparison sheet; they show the model BEFORE the latest change.',
+          'Compare the current screenshots with the baseline: confirm the previously reported issues are fixed and no new defects or regressions were introduced. Do not require the model to match the baseline exactly; only report remaining or newly introduced observable problems.',
+        ] : []),
+        'Screenshots may be delivered as one labelled comparison sheet; read every cell label (such as reference, front, side, top-footprint, isometric, baseline) and judge each view.',
+        'Screenshot labels: ' + screenshots.map((item: any) => String(item?.label || 'view')).join(', ')
+          + (baselineScreenshots.length
+            ? '; baseline: ' + baselineScreenshots.map((item: any) => 'before-' + String(item?.label || 'view')).join(', ')
+            : ''),
       ].join('\n'),
     }];
     if (referenceImage) content.push({ type: 'image_url', image_url: { url: referenceImage, detail: 'high' } });
     for (const shot of screenshots) content.push({ type: 'image_url', image_url: { url: shot.imageDataUrl, detail: 'high' } });
+    for (const shot of baselineScreenshots) content.push({ type: 'image_url', image_url: { url: shot.imageDataUrl, detail: 'high' } });
     let response: Response;
     try {
       response = await fetch(baseUrl + '/chat/completions', {
@@ -1171,6 +1482,8 @@ export class ImageGenerationService {
       inspectedAt: new Date().toISOString(),
       model,
       screenshotCount: screenshots.length,
+      footprintChecked: hasFootprint,
+      baselineCompared: baselineScreenshots.length > 0,
     };
   }
 
@@ -1218,11 +1531,17 @@ export class ImageGenerationService {
   async modifyProceduralObjectFromInstruction(
     sourceInput: unknown, parametersInput: unknown, parameterValuesInput: unknown, partsInput: unknown,
     selectedPartIdInput: unknown, instructionInput: unknown, objectTypeInput?: unknown, environmentBindingsInput?: unknown, modelCapabilityManifestInput?: unknown, geometryDiagnosticsInput?: unknown,
+    referenceImageDataUrlInput?: unknown,
   ): Promise<any> {
     const source = typeof sourceInput === 'string' ? sourceInput.trim() : '';
     const instruction = typeof instructionInput === 'string' ? instructionInput.trim().slice(0, 12000) : '';
     if (!source || !instruction) throw new BadRequestException('模型源码和调整指令不能为空');
     if (source.length > 120000) throw new BadRequestException('模型源码超过 120 KB');
+    const referenceImage = typeof referenceImageDataUrlInput === 'string' ? referenceImageDataUrlInput : '';
+    if (referenceImage && (!/^data:image\/(png|jpeg|webp);base64,[A-Za-z0-9+/=]+$/.test(referenceImage)
+      || Buffer.byteLength(referenceImage, 'utf8') > 14 * 1024 * 1024)) {
+      throw new BadRequestException('调整参考图片格式无效或超过 10 MB');
+    }
     const parameterDefinitions = Array.isArray(parametersInput) ? parametersInput.slice(0, 100) : [];
     const parameterValues = parameterValuesInput && typeof parameterValuesInput === 'object' && !Array.isArray(parameterValuesInput) ? parameterValuesInput : {};
     const parts = Array.isArray(partsInput) ? partsInput.slice(0, 300) : [];
@@ -1287,6 +1606,7 @@ export class ImageGenerationService {
        'For player-operated switches, bind the actual THREE.Light intensity and bulb emissiveIntensity to the same model worldState key. A same-model switch uses interactionConfig action "toggle" with stateKey and no targetId. A cross-instance targetId must be an exact sandboxModelId supplied after placement; never invent it from a display name or Mesh name. Keep environmentBindings for environment-driven behavior, not player switch state.',
       'Geometry diagnostics are runtime-collected evidence, not definitive design judgments. Use stable componentId references and actual local/world bounds to inspect suspicious geometry. Non-finite vertices/transforms and empty or degenerate geometry deserve attention; a planar surface may be valid. Bounds overlap is only a spatial clue, never proof of a defect. Do not infer defects from mesh names or object categories, and do not alter unrelated parts merely to silence a diagnostic.',
       'Preserve the existing model identity and visual structure unless the instruction explicitly requests a structural change. Do not replace the whole model unnecessarily.',
+      'HARD PART SCOPE: when selectedPartId is provided, the edit is strictly limited to the part with that componentId (and its direct child meshes). Do not change global parameter defaults, other parts, window/door layouts elsewhere, shared material instances, or unrelated geometry. If a material instance is shared by several parts, clone it for the selected part before changing it. Only when the user explicitly requests a global change may you modify other parts, and you must state exactly which other parts changed in changeSummary.',
       'For part-scoped edits, change only the selected part and the minimum dependent geometry/material required. Keep all unrelated parts and their stable component IDs.',
       'For parameter requests, add or update dynamic controls in modelParameters and make createModel read those values from params. Do not invent a fixed global parameter catalogue; declare model-specific controls.',
       'When a user asks for a parameter to control an implemented spatial capability, add a dynamic parameter definition and bind it declaratively to the exact capability. The currently executable parameter binding is { capabilityId: "spatial.collider.<stable-collider-id>.blocksMovement", property: "blocksMovement" } inside that parameter definition bindings array; use a real collider id and keep the binding stable. The parameter default must match the intended initial behavior. A parameter-bound value controls only the targeted collider, never every collider or the whole model. Explicit saved user capability overrides remain higher priority. Other capability parameter bindings may be preserved as data, but do not claim they execute until a matching Runtime adapter exists. In particular, enterable/interior declarations are not yet an active indoor-view Runtime.',
@@ -1297,49 +1617,89 @@ export class ImageGenerationService {
        'When editing a model with stairs, ramps, traversable openings or spatial links, preserve and update modelCapabilityManifest.capabilities.spatial.traversability using data-only stairs [{ id, targetPartId, treadPartIds?, riserHeight?, treadDepth?, startPoint?, endPoint? }], ramps [{ id, targetPartId, slopeDegrees?, startPoint?, endPoint? }], passages [{ id, targetPartId, width?, height?, stateCondition? }] and connections [{ id, from, to, type, bidirectional? }]. Keep stable ids and valid componentId references; remove or update declarations when their geometry is removed or changed. These declarations do not prove runtime traversal; never claim stairs, ramps or multi-floor paths are walkable until geometry validation and Rapier traversal tests pass.',
       ...PROCEDURAL_ANIMATION_CONTRACT,
       ...PROCEDURAL_MODEL_BOUNDARY_CONTRACT,
+      ...PROCEDURAL_TEXT_CONTRACT,
       'Do not use external dependencies, imports, network, DOM, browser globals, Node APIs, eval, Function, dynamic imports, animation loops or renderers.',
       'The factory must synchronously return one THREE.Group, use only THREE and params, and keep the model centered near X/Z origin, Y-up, standing on Y=0.',
       'Avoid unbounded loops and pathological geometry. Do not claim that geometry intersections have been automatically detected.',
     ].join('\n');
     const user = JSON.stringify({ objectType, selectedPartId: selectedPartId || null, currentParameterDefinitions: parameterDefinitions, currentParameterValues: parameterValues, currentParts: parts, currentEnvironmentBindings: environmentBindings, currentModelCapabilityManifest: modelCapabilityManifest, currentGeometryDiagnostics: boundedGeometryDiagnostics, currentSource: source, instruction });
-    let response: Response;
-    try {
-      response = await fetch(baseUrl + '/chat/completions', {
-        method: 'POST', headers: { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-        signal: AbortSignal.timeout(timeoutMs),
-        body: JSON.stringify({
-          model,
-          temperature: 0.2,
-          response_format: { type: 'json_object' },
-          messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-        }),
-      });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      this.logger.error('程序化模型 AI 编辑请求失败：' + message);
-      throw new ServiceUnavailableException('模型 AI 编辑服务连接失败');
+    const systemWithReference = referenceImage
+      ? system + String.fromCharCode(10)
+        + 'A reference image accompanies this edit request. Treat it as visual evidence for the requested change: reproduce the visible shapes, colors, proportions and material regions it shows, and do not invent details that are not visible in it.'
+      : system;
+    const conversation: any[] = [
+      { role: 'system', content: systemWithReference },
+      {
+        role: 'user',
+        content: referenceImage
+          ? [
+              { type: 'text', text: user },
+              { type: 'image_url', image_url: { url: referenceImage, detail: 'high' } },
+            ]
+          : user,
+      },
+    ];
+    let result: any = null;
+    // Upstream JSON-mode responses occasionally come back malformed or as plain
+    // text. Retry once with an explicit correction instead of failing the whole edit.
+    const maxEditAttempts = 2;
+    for (let attempt = 1; attempt <= maxEditAttempts; attempt += 1) {
+      let response: Response;
+      try {
+        response = await fetch(baseUrl + '/chat/completions', {
+          method: 'POST', headers: { Authorization: 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
+          signal: AbortSignal.timeout(timeoutMs),
+          body: JSON.stringify({
+            model,
+            temperature: 0.2,
+            response_format: { type: 'json_object' },
+            messages: conversation,
+          }),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.logger.error('程序化模型 AI 编辑请求失败：' + message);
+        throw new ServiceUnavailableException('模型 AI 编辑服务连接失败');
+      }
+      if (!response.ok) {
+        const detail = (await response.text()).slice(0, 1000);
+        this.logger.warn('程序化模型 AI 编辑 API HTTP ' + response.status + '：' + detail);
+        throw new ServiceUnavailableException('模型 AI 编辑失败（HTTP ' + response.status + '）');
+      }
+      const payload = await response.json() as any;
+      const raw = payload?.choices?.[0]?.message?.content;
+      if (typeof raw !== 'string' || !raw.trim()) throw new ServiceUnavailableException('AI 未返回模型编辑结果');
+      try {
+        const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
+        result = JSON.parse(cleaned);
+      } catch {
+        this.logger.warn('程序化模型 AI 编辑响应不是有效 JSON（' + attempt + '/' + maxEditAttempts + '）；预览：' + raw.trim().slice(0, 300));
+        if (attempt < maxEditAttempts) {
+          conversation.push({ role: 'assistant', content: raw.slice(0, 4000) });
+          conversation.push({
+            role: 'user',
+            content: '上一次响应不是有效 JSON。请只返回一个 JSON 对象，包含 generatedCode、parameters、parts、modelCapabilityManifest、environmentBindings、changeSummary，不要 Markdown 代码块或解释文字。',
+          });
+          continue;
+        }
+        throw new ServiceUnavailableException('AI 模型编辑结果不是有效 JSON（已启用 JSON 输出模式，请检查上游模型响应）');
+      }
+      const sourceProblem = describeProceduralSourceProblem(String(result?.generatedCode || ''));
+      if (sourceProblem) {
+        this.logger.warn('程序化模型 AI 编辑源码不合法（' + attempt + '/' + maxEditAttempts + '）：' + sourceProblem);
+        if (attempt < maxEditAttempts) {
+          conversation.push({ role: 'assistant', content: raw.slice(0, 4000) });
+          conversation.push({
+            role: 'user',
+            content: '上一次返回的 generatedCode 不合法：' + sourceProblem + '。请重新返回完整 JSON，generatedCode 必须是自包含的纯 JavaScript ES module（无 import、无 Markdown、无 HTML）。',
+          });
+          continue;
+        }
+        throw new ServiceUnavailableException('AI 返回的模型源码不合法：' + sourceProblem);
+      }
+      break;
     }
-    if (!response.ok) {
-      const detail = (await response.text()).slice(0, 1000);
-      this.logger.warn('程序化模型 AI 编辑 API HTTP ' + response.status + '：' + detail);
-      throw new ServiceUnavailableException('模型 AI 编辑失败（HTTP ' + response.status + '）');
-    }
-    const payload = await response.json() as any;
-    const raw = payload?.choices?.[0]?.message?.content;
-    if (typeof raw !== 'string' || !raw.trim()) throw new ServiceUnavailableException('AI 未返回模型编辑结果');
-    let result: any;
-    try {
-      const cleaned = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '');
-      result = JSON.parse(cleaned);
-    } catch {
-      this.logger.error('程序化模型 AI 编辑响应不是有效 JSON；响应内容预览：' + raw.trim().slice(0, 500));
-      throw new ServiceUnavailableException('AI 模型编辑结果不是有效 JSON（已启用 JSON 输出模式，请检查上游模型响应）');
-    }
-    if (!result || typeof result.generatedCode !== 'string' || !result.generatedCode.trim()
-      || result.generatedCode.length > 120000
-      || !/export\s+function\s+createModel\s*\(\s*THREE(?:\s*,[^)]*)?\)/.test(result.generatedCode)) {
-      throw new ServiceUnavailableException('AI 返回的模型源码无效或超过 120 KB');
-    }
+    if (!result) throw new ServiceUnavailableException('AI 模型编辑结果为空');
     const hasReturnedManifest = result.modelCapabilityManifest && typeof result.modelCapabilityManifest === 'object'
       && !Array.isArray(result.modelCapabilityManifest);
     const returnedManifest = hasReturnedManifest

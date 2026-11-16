@@ -588,6 +588,79 @@ describe('ImageGenerationService', () => {
     });
   });
 
+  it('adds the drawn footprint constraint to the visual QA prompt', async () => {
+    const service = createService({
+      VISION_API_KEY: 'vision-key',
+      VISION_API_BASE_URL: 'http://vision.local/v1',
+      VISION_MODEL: 'vision-test',
+    });
+    const report = {
+      score: 70,
+      passed: false,
+      summary: '底面明显小于占地区域',
+      issues: [],
+    };
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: JSON.stringify(report) } }] }),
+    });
+    global.fetch = fetchMock as never;
+    const imageDataUrl = 'data:image/png;base64,' + png.toString('base64');
+
+    const result = await service.inspectProceduralModelVisualQuality(
+      '一栋 L 形教学楼',
+      '教学楼',
+      '',
+      [
+        { label: 'front', imageDataUrl },
+        { label: 'top-footprint', imageDataUrl },
+        { label: 'isometric', imageDataUrl },
+      ],
+      null,
+      { mode: 'area', points: [{ x: -5, z: -4 }, { x: 5, z: -4 }, { x: 5, z: 4 }, { x: -5, z: 4 }] },
+    );
+
+    const request = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const promptText = request.messages[0].content[0].text;
+    expect(promptText).toContain('Footprint constraint');
+    expect(promptText).toContain('top-footprint');
+    expect(promptText).toContain('"mode":"area"');
+    expect(promptText).toContain('does not have to match');
+    expect(result.footprintChecked).toBe(true);
+  });
+
+  it('compares re-inspection screenshots against the pre-change baseline', async () => {
+    const service = createService({
+      VISION_API_KEY: 'vision-key',
+      VISION_API_BASE_URL: 'http://vision.local/v1',
+      VISION_MODEL: 'vision-test',
+    });
+    const report = { score: 88, passed: true, summary: '问题已修复，无新问题', issues: [] };
+    const fetchMock = jest.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ choices: [{ message: { content: JSON.stringify(report) } }] }),
+    });
+    global.fetch = fetchMock as never;
+    const imageDataUrl = 'data:image/png;base64,' + png.toString('base64');
+
+    const result = await service.inspectProceduralModelVisualQuality(
+      '一栋现代教学楼',
+      '教学楼',
+      '',
+      [{ label: 'front', imageDataUrl }, { label: 'isometric', imageDataUrl }],
+      null,
+      undefined,
+      [{ label: 'front', imageDataUrl }, { label: 'isometric', imageDataUrl }],
+    );
+
+    const request = JSON.parse(fetchMock.mock.calls[0][1].body);
+    const promptText = request.messages[0].content[0].text;
+    expect(promptText).toContain('Baseline screenshots');
+    expect(promptText).toContain('before-');
+    expect(request.messages[0].content.filter((item: any) => item.type === 'image_url')).toHaveLength(4);
+    expect(result.baselineCompared).toBe(true);
+  });
+
   it('rejects visual inspection without actual rendered screenshots', async () => {
     const service = createService({ VISION_API_KEY: 'vision-key', VISION_MODEL: 'vision-test' });
     await expect(service.inspectProceduralModelVisualQuality(

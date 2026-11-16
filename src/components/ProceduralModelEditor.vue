@@ -10,6 +10,7 @@ import {
   cloneSandboxObjectResources,
   disposeSandboxObjectResources,
 } from '../three/engine/sandboxModelLifecycle.js'
+import { getPartTextSpec, updateTextPlate } from '../three/sandbox/textPlateRuntime.js'
 
 const PREVIEW_MODEL_ID = 'preview'
 
@@ -21,6 +22,7 @@ const props = defineProps({
   canUndo: { type: Boolean, default: false },
   mode: { type: String, default: 'edit' },
   progress: { type: Array, default: () => [] },
+  messages: { type: Array, default: () => [] },
 })
 const emit = defineEmits(['close', 'edit', 'parameter-change', 'part-select', 'capability-change', 'undo', 'save'])
 const canvasHost = ref(null)
@@ -30,8 +32,15 @@ const selectedPartName = ref('整体模型')
 const parameterValues = ref({})
 const previewParts = ref([])
 const parameters = ref([])
+// 调整时附带的参考图片（支持粘贴/选择），随本次编辑请求发送，不写入模型存档
+const composerImage = ref('')
+const composerImageName = ref('')
+const composerImageError = ref('')
+const composerImageInput = ref(null)
+const MAX_EDIT_IMAGE_BYTES = 8 * 1024 * 1024
 
 const activeProgress = computed(() => [...props.progress].reverse().find(item => item?.status === 'active') || null)
+const progressDone = computed(() => props.progress.filter(item => item?.status === 'done').length)
 const capabilityManifest = computed(() => props.model?.userData?.proceduralModelCapabilityManifest || {})
 const visualQualityReport = computed(() => props.model?.userData?.proceduralModelVisualQuality || null)
 const capabilityControl = computed(() => props.model?.userData?.proceduralModelCapabilityControlDocument || {})
@@ -106,6 +115,80 @@ let previewRoot = null
 let previewAnimationRuntime = null
 let resizeObserver = null
 let raycaster = null
+let selectionHelper = null
+let highlightedMeshes = []
+const SELECTION_COLOR = 0x6fce9f
+
+function clearSelectionHighlight() {
+  if (selectionHelper) {
+    scene?.remove(selectionHelper)
+    selectionHelper.geometry?.dispose?.()
+    selectionHelper.material?.dispose?.()
+    selectionHelper = null
+  }
+  // 逐个还原被替换的材质并释放临时克隆，绝不修改共享材质
+  for (const record of highlightedMeshes) {
+    record.mesh.material = record.original
+    for (const clone of record.clones) clone?.dispose?.()
+  }
+  highlightedMeshes = []
+}
+
+function highlightMaterial(material, dimRest) {
+  if (!material?.clone) return { material, clone: null }
+  const clone = material.clone()
+  if (dimRest) {
+    clone.transparent = true
+    clone.opacity = Math.min(Number.isFinite(clone.opacity) ? clone.opacity : 1, 0.32)
+    clone.depthWrite = false
+  } else if (clone.emissive) {
+    clone.emissive.setHex(SELECTION_COLOR)
+    clone.emissiveIntensity = 0.32
+  } else {
+    return { material, clone: null }
+  }
+  clone.needsUpdate = true
+  return { material: clone, clone }
+}
+
+function replaceMeshMaterial(mesh, dimRest) {
+  const original = mesh.material
+  if (Array.isArray(original)) {
+    const results = original.map(material => highlightMaterial(material, dimRest))
+    const clones = results.map(result => result.clone).filter(Boolean)
+    if (!clones.length) return
+    mesh.material = results.map(result => result.material)
+    highlightedMeshes.push({ mesh, original, clones })
+    return
+  }
+  const result = highlightMaterial(original, dimRest)
+  if (!result.clone) return
+  mesh.material = result.material
+  highlightedMeshes.push({ mesh, original, clones: [result.clone] })
+}
+
+function applySelectionHighlight() {
+  clearSelectionHighlight()
+  if (!scene || !previewRoot || !selectedPartId.value) return
+  let target = null
+  previewRoot.traverse(object => {
+    if (!target && String(object.userData?.componentId || '') === selectedPartId.value) target = object
+  })
+  if (!target) return
+  // 选中的部件加发光；其余部件整体压暗，形成精确的对比高亮
+  const selectedMeshes = new Set()
+  target.traverse(object => { if (object.isMesh) selectedMeshes.add(object) })
+  previewRoot.traverse(object => {
+    if (!object.isMesh || !object.material) return
+    replaceMeshMaterial(object, !selectedMeshes.has(object))
+  })
+  selectionHelper = new THREE.BoxHelper(target, SELECTION_COLOR)
+  selectionHelper.material.depthTest = false
+  selectionHelper.material.transparent = true
+  selectionHelper.material.opacity = 0.6
+  selectionHelper.renderOrder = 999
+  scene.add(selectionHelper)
+}
 let pointer = new THREE.Vector2()
 let frame = 0
 let clockStartMs = 0
@@ -119,6 +202,8 @@ function reportPreviewAnimationError(error, detail) {
 
 function syncPreview() {
   if (!scene) return
+  // 先清理高亮，避免继续引用即将被释放的旧预览对象
+  clearSelectionHighlight()
   previewAnimationRuntime?.remove(PREVIEW_MODEL_ID)
   if (previewRoot) {
     scene.remove(previewRoot)
@@ -149,6 +234,8 @@ function syncPreview() {
   controls.target.set(0, 0, 0)
   controls.update()
   syncModelMetadata(props.model)
+  // 重建预览后尽量保留当前选中的部件并重新高亮
+  const previousPartId = selectedPartId.value
   selectedPartId.value = ''
   selectedPartName.value = '整体模型'
   previewAnimationRuntime?.register(
@@ -156,6 +243,17 @@ function syncPreview() {
     previewRoot,
     createSandboxEnvironmentSnapshot(props.environment),
   )
+  if (previousPartId) {
+    let part = null
+    previewRoot.traverse(object => {
+      if (!part && String(object.userData?.componentId || '') === previousPartId) part = object
+    })
+    if (part) {
+      selectedPartId.value = previousPartId
+      selectedPartName.value = part.name || previousPartId
+      applySelectionHighlight()
+    }
+  }
   render()
 }
 function resize() {
@@ -170,6 +268,7 @@ function resize() {
 function render() {
   if (!renderer || !scene || !camera) return
   controls?.update()
+  selectionHelper?.update()
   renderer.render(scene, camera)
 }
 function animate(now) {
@@ -205,18 +304,153 @@ function selectPart(event) {
   while (part && part !== previewRoot && !part.userData?.componentId) part = part.parent
   selectedPartId.value = part && part !== previewRoot ? String(part.userData.componentId) : ''
   selectedPartName.value = part && part !== previewRoot ? (part.name || selectedPartId.value) : '整体模型'
+  applySelectionHighlight()
   emit('part-select', selectedPartId.value)
 }
 function updateParameter(parameter, value) {
   parameterValues.value = { ...parameterValues.value, [parameter.id]: value }
   emit('parameter-change', { id: parameter.id, value, values: parameterValues.value })
 }
+const selectedPartTextSpec = computed(() => {
+  if (!props.model || !selectedPartId.value) return null
+  return getPartTextSpec(props.model, selectedPartId.value)
+})
+function updatePartText(value) {
+  if (!props.model || !selectedPartId.value) return
+  const text = String(value || '').slice(0, 200)
+  if (!text.trim()) return
+  updateTextPlate(THREE, props.model, selectedPartId.value, { text })
+  syncPreview()
+}
+function clearPartSelection() {
+  selectedPartId.value = ''
+  selectedPartName.value = '整体模型'
+  clearSelectionHighlight()
+  emit('part-select', '')
+}
+function readComposerImage(file) {
+  if (!file) return
+  if (!String(file.type || '').startsWith('image/')) {
+    composerImageError.value = '只支持图片文件'
+    return
+  }
+  if (file.size > MAX_EDIT_IMAGE_BYTES) {
+    composerImageError.value = '图片超过 8MB，请压缩后再试'
+    return
+  }
+  const reader = new FileReader()
+  reader.onload = () => {
+    composerImage.value = typeof reader.result === 'string' ? reader.result : ''
+    composerImageName.value = file.name || '粘贴的图片'
+    composerImageError.value = ''
+  }
+  reader.onerror = () => { composerImageError.value = '图片读取失败' }
+  reader.readAsDataURL(file)
+}
+function extractImageFromHtml(html) {
+  if (!html) return ''
+  const match = String(html).match(/<img[^>]+src=["'](data:image\/[^"']+)["']/i)
+  return match ? match[1] : ''
+}
+function onComposerPaste(event) {
+  const clipboard = event.clipboardData
+  if (!clipboard) return
+  const files = Array.from(clipboard.files || []).filter(file => String(file.type || '').startsWith('image/'))
+  let file = files[0] || null
+  if (!file) {
+    const item = Array.from(clipboard.items || []).find(entry => String(entry.type || '').startsWith('image/'))
+    file = item?.getAsFile?.() || null
+  }
+  if (!file) {
+    // 从网页复制的图片常常只在 text/html 里带 data: 图片
+    const dataUrl = extractImageFromHtml(clipboard.getData?.('text/html'))
+      || (String(clipboard.getData?.('text/plain') || '').startsWith('data:image/') ? clipboard.getData('text/plain') : '')
+    if (dataUrl) {
+      event.preventDefault?.()
+      composerImage.value = dataUrl
+      composerImageName.value = '粘贴的图片'
+      composerImageError.value = ''
+    }
+    return
+  }
+  event.preventDefault?.()
+  readComposerImage(file)
+}
+function onComposerDrop(event) {
+  const file = Array.from(event.dataTransfer?.files || []).find(entry => String(entry.type || '').startsWith('image/'))
+  if (!file) return
+  event.preventDefault?.()
+  readComposerImage(file)
+}
+function onComposerImageChange(event) {
+  const file = event?.target?.files?.[0]
+  if (file) readComposerImage(file)
+  if (event?.target) event.target.value = ''
+}
+function clearComposerImage() {
+  composerImage.value = ''
+  composerImageName.value = ''
+  composerImageError.value = ''
+}
 function submitEdit() {
   const text = instruction.value.trim()
-  if (!text || props.busy) return
-  emit('edit', { instruction: text, selectedPartId: selectedPartId.value, parameterValues: parameterValues.value })
+  if ((!text && !composerImage.value) || props.busy) return
+  emit('edit', {
+    instruction: text || '参考这张图片调整模型',
+    selectedPartId: selectedPartId.value,
+    selectedPartName: selectedPartId.value ? selectedPartName.value : '',
+    parameterValues: parameterValues.value,
+    referenceImageDataUrl: composerImage.value || undefined,
+  })
   instruction.value = ''
+  clearComposerImage()
 }
+// 视觉质检用的占地叠层：在模型底面画出勾绘的占地多边形（青色），
+// 只用于顶部截图，让视觉模型能对照判断模型底面是否贴合占地区域。
+function buildFootprintOverlay() {
+  const points = props.model?.userData?.sandboxFootprintPolygon?.points
+  if (!Array.isArray(points) || points.length < 3) return null
+  const group = new THREE.Group()
+  group.name = 'visual-qc-footprint-overlay'
+  const y = 0.02
+  const positions = []
+  for (let index = 1; index < points.length; index += 1) {
+    positions.push(points[index - 1].x, y, points[index - 1].z, points[index].x, y, points[index].z)
+  }
+  const last = points[points.length - 1]
+  positions.push(last.x, y, last.z, points[0].x, y, points[0].z)
+  const lineGeometry = new THREE.BufferGeometry()
+  lineGeometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+  const line = new THREE.LineSegments(lineGeometry, new THREE.LineBasicMaterial({
+    color: '#38e8ff', depthTest: false, transparent: true, opacity: 0.95,
+  }))
+  line.renderOrder = 100
+  group.add(line)
+  const contour = points.map(point => new THREE.Vector2(point.x, point.z))
+  const faces = THREE.ShapeUtils.triangulateShape(contour, [])
+  const fillPositions = []
+  for (const face of faces) {
+    for (const index of face) fillPositions.push(points[index].x, y - 0.005, points[index].z)
+  }
+  if (fillPositions.length) {
+    const fillGeometry = new THREE.BufferGeometry()
+    fillGeometry.setAttribute('position', new THREE.Float32BufferAttribute(fillPositions, 3))
+    const fill = new THREE.Mesh(fillGeometry, new THREE.MeshBasicMaterial({
+      color: '#38e8ff', transparent: true, opacity: 0.28, depthWrite: false, side: THREE.DoubleSide,
+    }))
+    fill.renderOrder = 99
+    group.add(fill)
+  }
+  return group
+}
+
+function disposeFootprintOverlay(overlay) {
+  overlay.traverse(object => {
+    object.geometry?.dispose?.()
+    object.material?.dispose?.()
+  })
+}
+
 async function captureVisualViews() {
   if (!renderer || !previewRoot || !camera || !controls) throw new Error('模型预览尚未完成渲染，无法采集视觉质检截图')
   const originalPosition = camera.position.clone()
@@ -249,6 +483,11 @@ async function captureVisualViews() {
       target.texture.colorSpace = THREE.SRGBColorSpace
       const previousTarget = renderer.getRenderTarget()
       const pixels = new Uint8Array(width * height * 4)
+      const footprintOverlay = view.label === 'top' ? buildFootprintOverlay() : null
+      if (footprintOverlay) previewRoot.add(footprintOverlay)
+      // 质检截图不带上选择高亮框，避免干扰视觉模型判断
+      const helperWasVisible = selectionHelper ? selectionHelper.visible : false
+      if (selectionHelper) selectionHelper.visible = false
       try {
         renderer.setRenderTarget(target)
         renderer.setViewport(0, 0, width, height)
@@ -257,6 +496,11 @@ async function captureVisualViews() {
       } finally {
         renderer.setRenderTarget(previousTarget)
         target.dispose()
+        if (selectionHelper) selectionHelper.visible = helperWasVisible
+        if (footprintOverlay) {
+          previewRoot.remove(footprintOverlay)
+          disposeFootprintOverlay(footprintOverlay)
+        }
       }
       const canvas = document.createElement('canvas')
       canvas.width = width
@@ -270,7 +514,7 @@ async function captureVisualViews() {
       }
       context.putImageData(image, 0, 0)
       screenshots.push({
-        label: view.label,
+        label: footprintOverlay ? view.label + '-footprint' : view.label,
         imageDataUrl: canvas.toDataURL('image/jpeg', 0.68),
       })
     }
@@ -286,6 +530,10 @@ async function captureVisualViews() {
   return screenshots
 }
 defineExpose({ captureVisualViews })
+watch(selectedPartId, () => {
+  // 部件列表按钮等非射线选择路径也需要同步高亮
+  applySelectionHighlight()
+})
 watch(() => props.model, (model) => {
   syncModelMetadata(model)
   syncPreview()
@@ -318,6 +566,7 @@ onMounted(() => {
 })
 onBeforeUnmount(() => {
   cancelAnimationFrame(frame)
+  clearSelectionHighlight()
   resizeObserver?.disconnect()
   renderer?.domElement?.removeEventListener('click', selectPart)
   controls?.dispose()
@@ -335,100 +584,150 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="model-editor" role="dialog" aria-modal="true" aria-label="AI 模型编辑器">
+  <div class="model-editor" role="dialog" aria-modal="true" aria-label="AI 模型编辑器" @paste="onComposerPaste">
     <header class="model-editor__header">
       <div><strong>{{ mode === 'create' ? (model ? '模型生成与编辑工作台' : '正在创建模型') : '模型编辑工作台' }}</strong><span>{{ model?.name || (mode === 'create' ? '生成完成后可继续调整参数与结构' : '程序化模型') }}</span></div>
       <div class="model-editor__header-actions"><button :disabled="busy || !canUndo" @click="emit('undo')">撤销上一步</button><button :disabled="busy" @click="emit('close')">关闭</button></div>
     </header>
     <div class="model-editor__body">
-      <section class="model-editor__preview">
-        <div ref="canvasHost" class="model-editor__canvas"></div>
-        <div v-if="!model" class="model-editor__preview-empty" :class="{ 'is-loading': busy }">
-          <div v-if="busy" class="model-editor__loading-rings" aria-hidden="true">
-            <span class="model-editor__loading-ring"></span>
-            <span class="model-editor__loading-ring"></span>
-            <span class="model-editor__loading-ring"></span>
-            <span class="model-editor__loading-core"></span>
+      <section class="model-editor__left">
+        <div class="model-editor__preview">
+          <div ref="canvasHost" class="model-editor__canvas"></div>
+          <div v-if="!model" class="model-editor__preview-empty" :class="{ 'is-loading': busy }">
+            <div v-if="busy" class="model-editor__loading-rings" aria-hidden="true">
+              <span class="model-editor__loading-ring"></span>
+              <span class="model-editor__loading-ring"></span>
+              <span class="model-editor__loading-ring"></span>
+              <span class="model-editor__loading-core"></span>
+            </div>
+            <strong>{{ busy ? (activeProgress?.label || '正在生成模型') : '模型预览' }}</strong>
+            <span>{{ busy ? (activeProgress?.detail || 'AI 正在构建完整 Three.js 模型…') : '模型生成完成后将在这里显示' }}</span>
           </div>
-          <strong>{{ busy ? (activeProgress?.label || '正在生成模型') : '模型预览' }}</strong>
-          <span>{{ busy ? (activeProgress?.detail || 'AI 正在构建完整 Three.js 模型…') : '模型生成完成后将在这里显示' }}</span>
+          <div v-else class="model-editor__preview-hint">单击模型部件进行选择 · 拖动旋转 · 滚轮缩放</div>
+          <div v-if="model" class="model-editor__part-chip">当前范围：{{ selectedPartName }}</div>
         </div>
-        <div v-else class="model-editor__preview-hint">单击模型部件进行选择 · 拖动旋转 · 滚轮缩放</div>
-        <div v-if="model" class="model-editor__part-chip">当前范围：{{ selectedPartName }}</div>
+        <div v-if="model" class="model-editor__info">
+          <div class="model-editor__info-block">
+            <div class="model-editor__section-title"><h3>组件结构</h3><span>{{ previewParts.length }} 个部件</span></div>
+            <div class="model-editor__parts">
+              <button :class="{ active: !selectedPartId }" @click="selectedPartId = ''; selectedPartName = '整体模型'; emit('part-select', '')">整体模型</button>
+              <button v-for="part in previewParts" :key="part.id" :class="{ active: selectedPartId === part.id }" @click="selectedPartId = part.id; selectedPartName = part.name || part.id; emit('part-select', part.id)">{{ part.name || part.id }}</button>
+            </div>
+            <label v-if="selectedPartTextSpec" class="model-editor__field">
+              <span>文字内容<small>宿主用中文字体渲染，保存后写入模型</small></span>
+              <input type="text" :value="selectedPartTextSpec.text" @change="updatePartText($event.target.value)">
+            </label>
+          </div>
+          <div class="model-editor__info-block">
+            <div class="model-editor__section-title"><h3>模型结构参数</h3><span>由 AI 动态声明</span></div>
+            <p v-if="!parameters.length" class="model-editor__empty">当前模型还没有可调参数。通过右侧对话要求 AI 新增控制参数。</p>
+            <label v-for="parameter in parameters" :key="parameter.id" class="model-editor__field">
+              <span>{{ parameter.label || parameter.id }}<small v-if="parameter.description">{{ parameter.description }}</small></span>
+              <input v-if="parameter.type === 'color'" type="color" :value="parameterValues[parameter.id] ?? parameter.default ?? '#ffffff'" @input="updateParameter(parameter, $event.target.value)">
+              <input v-else-if="parameter.type === 'number'" type="number" :value="parameterValues[parameter.id] ?? parameter.default ?? 0" :min="parameter.min" :max="parameter.max" :step="parameter.step || 'any'" @change="updateParameter(parameter, Number($event.target.value))">
+              <input v-else-if="parameter.type === 'boolean'" type="checkbox" :checked="Boolean(parameterValues[parameter.id] ?? parameter.default)" @change="updateParameter(parameter, $event.target.checked)">
+              <select v-else-if="parameter.type === 'select'" :value="parameterValues[parameter.id] ?? parameter.default" @change="updateParameter(parameter, $event.target.value)">
+                <option v-for="option in (parameter.options || [])" :key="String(option.value ?? option)" :value="option.value ?? option">{{ option.label ?? option }}</option>
+              </select>
+              <input v-else type="text" :value="parameterValues[parameter.id] ?? parameter.default ?? ''" @change="updateParameter(parameter, $event.target.value)">
+            </label>
+          </div>
+          <div class="model-editor__info-block">
+            <div class="model-editor__section-title"><h3>模型能力</h3><span>AI 自动推断 · 可随时调整</span></div>
+            <p v-if="!capabilityNamespaces.length" class="model-editor__empty">模型尚未声明能力。AI 可在后续建模或对话编辑中补充。</p>
+            <div v-for="item in capabilityNamespaces" :key="item.id" class="model-editor__capability-row">
+              <div><strong>{{ item.id }}</strong><small>{{ item.runtime }}</small></div>
+              <span class="model-editor__runtime-state">{{ capabilityRuntimeState(item.id) }}</span>
+            </div>
+            <div class="model-editor__capability-controls">
+              <h4>{{ selectedPartId ? '当前部件的空间控制' : '模型空间控制' }}</h4>
+              <p v-if="!spatialColliders.length" class="model-editor__empty">当前范围没有可控制的 box 碰撞体。选择模型部件可查看其能力。</p>
+              <label v-for="collider in spatialColliders" :key="collider.capabilityId" class="model-editor__capability-control">
+                <span><strong>{{ previewParts.find(part => part.id === collider.targetPartId)?.name || collider.targetPartId }}</strong><small>{{ collider.id || '空间碰撞体' }} · {{ collider.source }} · {{ collider.runtimeReason }}</small></span>
+                <span class="model-editor__toggle">
+                  <input type="checkbox" :checked="collider.blocksMovement" :disabled="!collider.runtimeSupported || busy" @change="updateColliderBlocking(collider, $event.target.checked)">
+                  <span>阻挡玩家移动</span>
+                </span>
+              </label>
+            </div>
+          </div>
+        </div>
       </section>
-      <section v-if="model" class="model-editor__controls">
-        <div class="model-editor__scope">
-          <button :class="{ active: !selectedPartId }" @click="selectedPartId = ''; selectedPartName = '整体模型'; emit('part-select', '')">整体模型</button>
-          <span v-if="selectedPartId">{{ selectedPartName }} · {{ selectedPartId }}</span>
-          <span v-else>对整个模型进行调整</span>
-        </div>
-        <div class="model-editor__chat">
-          <h3>AI 调整对话</h3>
-          <textarea v-model="instruction" rows="4" placeholder="例如：新增一个屋顶颜色控制参数，默认深蓝色；或者把选中的屋顶向外延伸 0.5 米。" @keydown.ctrl.enter="submitEdit"></textarea>
-          <button class="primary" :disabled="busy || !instruction.trim()" @click="submitEdit">{{ busy ? 'AI 正在修改模型…' : '发送调整指令' }}</button>
+      <section class="model-editor__chat-panel">
+        <div class="model-editor__messages">
+          <article
+            v-for="message in messages"
+            :key="message.id"
+            class="model-msg"
+            :class="['model-msg--' + message.role, message.type ? 'model-msg--' + message.type : '']"
+          >
+            <template v-if="message.type === 'visual-qc'">
+              <div class="model-msg__head">
+                <strong>{{ message.stageLabel || (message.round === 0 ? '视觉质检' : '复检 · 第 ' + message.round + ' 轮') }}</strong>
+                <span :class="message.report?.passed ? 'is-passed' : 'is-warning'">{{ message.report?.passed ? '通过' : '未通过' }} · {{ message.report?.score }}/100</span>
+              </div>
+              <p v-if="message.report?.summary">{{ message.report.summary }}</p>
+              <ul v-if="message.report?.issues?.length">
+                <li v-for="(issue, index) in message.report.issues" :key="index">
+                  <strong>{{ issue.severity === 'critical' ? '严重' : issue.severity === 'major' ? '主要' : '轻微' }}</strong>
+                  <span>{{ issue.issue }}</span>
+                </li>
+              </ul>
+            </template>
+            <template v-else>
+              <p>{{ message.text }}</p>
+              <div v-if="message.referenceImage || message.footprint || message.selectedPartId" class="model-msg__tags">
+                <span v-if="message.referenceImage">含参考图</span>
+                <span v-if="message.footprint">占地 · {{ message.footprint.mode === 'space' ? '空间占据' : '占地区域' }}</span>
+                <span v-if="message.selectedPartId">@{{ message.selectedPartName || message.selectedPartId }}</span>
+              </div>
+            </template>
+          </article>
+          <article v-if="busy" class="model-msg model-msg--assistant model-msg--progress">
+            <div class="model-msg__head">
+              <strong>{{ activeProgress?.label || (mode === 'create' ? 'AI 正在生成模型…' : 'AI 正在修改模型…') }}</strong>
+              <span v-if="activeProgress">{{ progressDone }}/{{ progress.length }}</span>
+            </div>
+            <p v-if="activeProgress?.detail">{{ activeProgress.detail }}</p>
+            <ol v-if="activeProgress" class="model-editor__progress">
+              <li v-for="(item, index) in progress" :key="item.stage || index" :class="item.status">
+                <span class="model-editor__progress-mark">{{ item.status === 'done' ? '✓' : item.status === 'failed' ? '!' : '•' }}</span>
+                <span><strong>{{ item.label }}</strong><small>{{ item.detail || (item.status === 'active' ? '正在处理…' : item.status === 'done' ? '已完成' : item.status === 'failed' ? '执行失败' : '等待执行') }}</small></span>
+              </li>
+            </ol>
+          </article>
           <p v-if="error" class="model-editor__error">{{ error }}</p>
           <p v-if="previewAnimationError" class="model-editor__error">{{ previewAnimationError }}</p>
         </div>
-        <div v-if="visualQualityReport" class="model-editor__visual-quality">
-          <div class="model-editor__section-title"><h3>AI 视觉质检</h3><strong :class="visualQualityReport.passed ? 'is-passed' : 'is-warning'">{{ visualQualityReport.passed ? '检测通过' : '需要关注' }} · {{ visualQualityReport.score }}/100</strong></div>
-          <p>{{ visualQualityReport.summary }}</p>
-          <ul v-if="visualQualityReport.issues?.length">
-            <li v-for="(issue, index) in visualQualityReport.issues" :key="index">
-              <strong>{{ issue.severity === 'critical' ? '严重' : issue.severity === 'major' ? '主要' : '轻微' }}</strong>
-              <span>{{ issue.issue }}</span>
-            </li>
-          </ul>
-        </div>
-        <div class="model-editor__capabilities">
-          <div class="model-editor__section-title"><h3>模型能力</h3><span>AI 自动推断 · 可随时调整</span></div>
-          <p v-if="!capabilityNamespaces.length" class="model-editor__empty">模型尚未声明能力。AI 可在后续建模或对话编辑中补充。</p>
-          <div v-for="item in capabilityNamespaces" :key="item.id" class="model-editor__capability-row">
-            <div><strong>{{ item.id }}</strong><small>{{ item.runtime }}</small></div>
-            <span class="model-editor__runtime-state">{{ capabilityRuntimeState(item.id) }}</span>
+        <div class="model-editor__composer" @dragover.prevent @drop="onComposerDrop">
+          <div v-if="selectedPartId" class="model-editor__target-chip" title="本次调整只针对该部件">
+            <span class="model-editor__target-at">@</span>
+            <span>{{ selectedPartName }}</span>
+            <button type="button" @click="clearPartSelection" aria-label="取消部件选择">×</button>
           </div>
-          <div class="model-editor__capability-controls">
-            <h4>{{ selectedPartId ? '当前部件的空间控制' : '模型空间控制' }}</h4>
-            <p v-if="!spatialColliders.length" class="model-editor__empty">当前范围没有可控制的 box 碰撞体。选择模型部件可查看其能力。</p>
-            <label v-for="collider in spatialColliders" :key="collider.capabilityId" class="model-editor__capability-control">
-              <span><strong>{{ previewParts.find(part => part.id === collider.targetPartId)?.name || collider.targetPartId }}</strong><small>{{ collider.id || '空间碰撞体' }} · {{ collider.source }} · {{ collider.runtimeReason }}</small></span>
-              <span class="model-editor__toggle">
-                <input type="checkbox" :checked="collider.blocksMovement" :disabled="!collider.runtimeSupported || busy" @change="updateColliderBlocking(collider, $event.target.checked)">
-                <span>阻挡玩家移动</span>
-              </span>
-            </label>
+          <div v-if="composerImage" class="model-editor__image-chip">
+            <img :src="composerImage" alt="调整参考图">
+            <span>{{ composerImageName || '参考图' }}</span>
+            <button type="button" @click="clearComposerImage" aria-label="移除参考图">×</button>
+          </div>
+          <p v-if="composerImageError" class="model-editor__error">{{ composerImageError }}</p>
+          <textarea
+            v-model="instruction"
+            rows="3"
+            :placeholder="selectedPartId
+              ? `针对「${selectedPartName}」调整，例如：按照参考图把这个部件改成这种材质。`
+              : '继续对话调整，例如：按照参考图把入口改成这个样子；也可以直接粘贴图片。'"
+            @keydown.ctrl.enter="submitEdit"
+          ></textarea>
+          <div class="model-editor__composer-bar">
+            <span class="model-editor__composer-tip">Ctrl + Enter 发送{{ selectedPartId ? ' · 已锁定部件微调' : '' }} · 可粘贴/拖入图片</span>
+            <span class="model-editor__composer-actions">
+              <input ref="composerImageInput" type="file" accept="image/png,image/jpeg,image/webp" hidden @change="onComposerImageChange">
+              <button type="button" class="model-editor__upload-button" @click="composerImageInput?.click()">上传图片</button>
+              <button class="primary" :disabled="busy || !model || (!instruction.trim() && !composerImage)" @click="submitEdit">{{ busy ? 'AI 正在处理…' : '发送调整' }}</button>
+            </span>
           </div>
         </div>
-        <div class="model-editor__parameters">
-          <div class="model-editor__section-title"><h3>模型结构参数</h3><span>由 AI 动态声明</span></div>
-          <p v-if="!parameters.length" class="model-editor__empty">当前模型还没有可调参数。通过上方对话要求 AI 新增控制参数。</p>
-          <label v-for="parameter in parameters" :key="parameter.id" class="model-editor__field">
-            <span>{{ parameter.label || parameter.id }}<small v-if="parameter.description">{{ parameter.description }}</small></span>
-            <input v-if="parameter.type === 'color'" type="color" :value="parameterValues[parameter.id] ?? parameter.default ?? '#ffffff'" @input="updateParameter(parameter, $event.target.value)">
-            <input v-else-if="parameter.type === 'number'" type="number" :value="parameterValues[parameter.id] ?? parameter.default ?? 0" :min="parameter.min" :max="parameter.max" :step="parameter.step || 'any'" @change="updateParameter(parameter, Number($event.target.value))">
-            <input v-else-if="parameter.type === 'boolean'" type="checkbox" :checked="Boolean(parameterValues[parameter.id] ?? parameter.default)" @change="updateParameter(parameter, $event.target.checked)">
-            <select v-else-if="parameter.type === 'select'" :value="parameterValues[parameter.id] ?? parameter.default" @change="updateParameter(parameter, $event.target.value)">
-              <option v-for="option in (parameter.options || [])" :key="String(option.value ?? option)" :value="option.value ?? option">{{ option.label ?? option }}</option>
-            </select>
-            <input v-else type="text" :value="parameterValues[parameter.id] ?? parameter.default ?? ''" @change="updateParameter(parameter, $event.target.value)">
-          </label>
-        </div>
-        <div class="model-editor__parts">
-          <h3>模型部件</h3>
-          <button :class="{ active: !selectedPartId }" @click="selectedPartId = ''; selectedPartName = '整体模型'; emit('part-select', '')">整体模型</button>
-          <button v-for="part in previewParts" :key="part.id" :class="{ active: selectedPartId === part.id }" @click="selectedPartId = part.id; selectedPartName = part.name || part.id; emit('part-select', part.id)">{{ part.name || part.id }}</button>
-        </div>
-      </section>
-      <section v-else class="model-editor__generation">
-        <h3>模型生成进程</h3>
-        <p>以下状态来自实际 AI 请求与 Worker 执行阶段，不使用虚构百分比。</p>
-        <ol class="model-editor__progress">
-          <li v-for="(item, index) in progress" :key="item.stage || index" :class="item.status">
-            <span class="model-editor__progress-mark">{{ item.status === 'done' ? '✓' : item.status === 'failed' ? '!' : '•' }}</span>
-            <span><strong>{{ item.label }}</strong><small>{{ item.detail || (item.status === 'active' ? '正在处理…' : item.status === 'done' ? '已完成' : item.status === 'failed' ? '执行失败' : '等待执行') }}</small></span>
-          </li>
-        </ol>
-        <p v-if="error" class="model-editor__error">{{ error }}</p>
-        <p v-else-if="busy" class="model-editor__generation-hint">生成完成后，右侧将自动切换为参数、部件和 AI 对话编辑面板。</p>
       </section>
     </div>
     <footer v-if="model" class="model-editor__footer">
@@ -509,4 +808,68 @@ onBeforeUnmount(() => {
 .model-editor__toggle input { accent-color:#a5c9b1; }
 .model-editor__parts { display:flex; flex-wrap:wrap; gap:6px; }.model-editor__parts h3 { width:100%; }
 @media(max-width:760px) { .model-editor { inset:1vh 1vw; }.model-editor__body { grid-template-columns:1fr; grid-template-rows:minmax(220px,.8fr) minmax(280px,1fr); }.model-editor__preview { border-right:0; border-bottom:1px solid rgba(255,255,255,.1); } }
+/* 对话式 AI 建模工作台：左侧预览 + 组件结构，右侧对话记录 */
+.model-editor__body { grid-template-columns:minmax(0,1.1fr) minmax(360px,.9fr); }
+.model-editor__left { display:flex; flex-direction:column; min-width:0; min-height:0; border-right:1px solid rgba(255,255,255,.1); }
+.model-editor__left .model-editor__preview { flex:1; min-height:0; border-right:0; }
+.model-editor__info { flex:none; max-height:46%; overflow:auto; padding:14px 16px; border-top:1px solid rgba(255,255,255,.1); display:grid; gap:18px; }
+.model-editor__info-block { display:grid; gap:10px; min-width:0; }
+.model-editor__chat-panel { display:flex; flex-direction:column; min-width:0; min-height:0; }
+.model-editor__messages { flex:1; min-height:0; overflow:auto; padding:16px; display:grid; gap:10px; align-content:start; }
+.model-msg { max-width:92%; min-width:0; padding:10px 12px; border-radius:10px; background:#17242b; border:1px solid rgba(255,255,255,.1); color:#dce7e3; font-size:12px; line-height:1.6; }
+.model-msg p { margin:0; white-space:pre-wrap; word-break:break-word; }
+.model-msg--user { justify-self:end; background:#234233; border-color:#3c6a52; }
+.model-msg--stage { justify-self:center; max-width:100%; padding:2px 0; background:transparent; border:none; color:#8fa2a5; font-size:11px; text-align:center; }
+.model-msg--visual-qc { justify-self:start; background:#1a2a31; border-color:rgba(159,200,173,.35); }
+.model-msg--repair { justify-self:start; background:#2c2a1e; border-color:rgba(224,178,95,.35); color:#e8dcc0; }
+.model-msg__head { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:6px; }
+.model-msg__head strong { font-size:12px; }
+.model-msg__head span { font-size:11px; font-family:ui-monospace, Consolas, monospace; }
+.model-msg .is-passed { color:#9fc8ad; }
+.model-msg .is-warning { color:#e0b25f; }
+.model-msg ul { margin:6px 0 0; padding-left:16px; display:grid; gap:4px; }
+.model-msg li strong { margin-right:6px; }
+.model-msg__tags { display:flex; flex-wrap:wrap; gap:6px; margin-top:6px; }
+.model-msg__tags span { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid rgba(255,255,255,.16); color:#9fb3ae; }
+.model-editor__messages .model-editor__progress { margin:8px 0 0; }
+.model-editor__composer { flex:none; border-top:1px solid rgba(255,255,255,.1); padding:12px 14px; display:grid; gap:8px; }
+.model-editor__composer textarea { width:100%; resize:vertical; min-height:64px; padding:10px; border-radius:8px; border:1px solid rgba(255,255,255,.16); background:#0e1a20; color:#e6f0ec; font:inherit; font-size:12px; }
+.model-editor__composer textarea:focus { outline:2px solid rgba(159,200,173,.5); outline-offset:1px; }
+.model-editor__composer-bar { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.model-editor__composer-tip { color:#7f9294; font-size:10px; }
+.model-editor__target-chip {
+  display:inline-flex; align-items:center; gap:6px; justify-self:start;
+  padding:3px 8px 3px 10px; border-radius:999px;
+  background:rgba(111,206,159,.14); border:1px solid rgba(111,206,159,.45);
+  color:#a8e0c2; font-size:11px; max-width:100%;
+}
+.model-editor__target-chip span:nth-child(2) {
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0;
+}
+.model-editor__target-at { font-weight:700; color:#6fce9f; }
+.model-editor__target-chip button {
+  padding:0 4px; border:0; background:transparent; color:#a8e0c2; cursor:pointer; font-size:13px; line-height:1;
+}
+.model-editor__target-chip button:hover { color:#ffffff; }
+.model-editor__image-chip {
+  display:inline-flex; align-items:center; gap:8px; justify-self:start; max-width:100%;
+  padding:4px 8px 4px 4px; border-radius:8px;
+  background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.16);
+  color:#c5d2ce; font-size:11px;
+}
+.model-editor__image-chip img { width:34px; height:34px; object-fit:cover; border-radius:5px; display:block; }
+.model-editor__image-chip span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.model-editor__image-chip button {
+  padding:0 4px; border:0; background:transparent; color:#c5d2ce; cursor:pointer; font-size:13px; line-height:1;
+}
+.model-editor__image-chip button:hover { color:#ffffff; }
+.model-editor__composer-actions { display:flex; align-items:center; gap:8px; }
+.model-editor__upload-button { border-color:rgba(111,206,159,.5); color:#a8e0c2; }
+.model-editor__upload-button:hover { border-color:#6fce9f; color:#d8f3e6; }
+@media(max-width:900px) {
+  .model-editor__body { grid-template-columns:1fr; grid-template-rows:minmax(240px,44vh) minmax(0,1fr); }
+  .model-editor__left { border-right:0; border-bottom:1px solid rgba(255,255,255,.1); }
+  .model-editor__info { max-height:38%; }
+  .model-editor { inset:2vh 2vw; }
+}
 </style>

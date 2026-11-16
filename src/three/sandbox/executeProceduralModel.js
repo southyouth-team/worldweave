@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { applyTextPlates } from './textPlateRuntime.js'
 
 const MAX_SOURCE_LENGTH = 120000
 
@@ -91,6 +92,8 @@ export async function executeProceduralModel(source, options = {}) {
         }
 
         root.name = data.name || root.name || 'AI 生成模型'
+        // 可编辑文字：按 userData.textSpec 由宿主渲染中文文字平面
+        applyTextPlates(THREE, root)
         root.traverse((object) => {
           if (object.isMesh) {
             object.castShadow = true

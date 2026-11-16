@@ -101,6 +101,38 @@ export function createBlankSandboxScene(THREE, dimensions = {}) {
   addChunk(0, 0)
   rebuildBoundary()
 
+  function recomputeBounds() {
+    const coordinates = Array.from(chunks.values(), item => item.userData.worldChunk)
+    const xs = coordinates.map(item => item.x)
+    const zs = coordinates.map(item => item.z)
+    bounds.minX = Math.min(...xs) * chunkWidth - chunkWidth / 2
+    bounds.maxX = Math.max(...xs) * chunkWidth + chunkWidth / 2
+    bounds.minZ = Math.min(...zs) * chunkDepth - chunkDepth / 2
+    bounds.maxZ = Math.max(...zs) * chunkDepth + chunkDepth / 2
+    root.userData.sampleBounds.width = bounds.maxX - bounds.minX
+    root.userData.sampleBounds.depth = bounds.maxZ - bounds.minZ
+    root.userData.sampleBounds.centerX = (bounds.minX + bounds.maxX) / 2
+    root.userData.sampleBounds.centerZ = (bounds.minZ + bounds.maxZ) / 2
+    root.userData.worldChunks = coordinates.map(({ x, z }) => ({ x, z }))
+    rebuildBoundary()
+  }
+
+  // 单块扩建：只添加与现有地块相邻的那个区块，不动其他地块。
+  function addWorldChunk(chunkX, chunkZ) {
+    const x = Number(chunkX)
+    const z = Number(chunkZ)
+    if (!Number.isInteger(x) || !Number.isInteger(z)) return false
+    if (Math.abs(x) > 50 || Math.abs(z) > 50) return false
+    if (chunks.has(x + ':' + z)) return false
+    const adjacent = chunks.has((x - 1) + ':' + z) || chunks.has((x + 1) + ':' + z)
+      || chunks.has(x + ':' + (z - 1)) || chunks.has(x + ':' + (z + 1))
+    if (!adjacent) return false
+    if (chunks.size >= 2500) return false
+    if (!addChunk(x, z)) return false
+    recomputeBounds()
+    return true
+  }
+
   function expandWorld(direction, count = 1) {
     const normalized = String(direction || '').toLowerCase()
     if (!['north', 'south', 'east', 'west'].includes(normalized)) return false
@@ -195,6 +227,7 @@ export function createBlankSandboxScene(THREE, dimensions = {}) {
   root.userData.worldChunks = [{ x: 0, z: 0 }]
   root.userData.worldChunkSize = { width: chunkWidth, depth: chunkDepth }
   root.userData.expandWorld = expandWorld
+  root.userData.addWorldChunk = addWorldChunk
   root.userData.removeWorldChunk = removeWorldChunk
   root.userData.setChunkManagementState = setChunkManagementState
   root.userData.getWorldState = () => ({

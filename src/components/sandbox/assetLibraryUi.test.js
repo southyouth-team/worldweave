@@ -185,7 +185,7 @@ describe('createRoadEditPersistence', () => {
 })
 
 describe('groupBuiltinAssetsByCategory', () => {
-  it('按 BUILTIN_CATEGORY_LABELS 顺序输出 7 个非空分组，常规道路在末位，条目总数 20', () => {
+  it('按 BUILTIN_CATEGORY_LABELS 顺序输出 7 个非空分组，常规道路在末位，条目总数 22', () => {
     const groups = groupBuiltinAssetsByCategory(listBuiltinAssets())
     expect(groups.map(group => group.category)).toEqual(Object.keys(BUILTIN_CATEGORY_LABELS))
     expect(groups.map(group => group.label)).toEqual(Object.values(BUILTIN_CATEGORY_LABELS))
@@ -193,7 +193,7 @@ describe('groupBuiltinAssetsByCategory', () => {
     expect(groups.at(-1).category).toBe('road')
     expect(groups.at(-1).label).toBe('常规道路')
     expect(groups.every(group => group.items.length > 0)).toBe(true)
-    expect(groups.flatMap(group => group.items)).toHaveLength(20)
+    expect(groups.flatMap(group => group.items)).toHaveLength(22)
   })
 
   it('目录 note 原样透传到分组条目，无 note 的旧素材保持 undefined', () => {

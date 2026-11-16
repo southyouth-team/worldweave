@@ -18,6 +18,32 @@ function createBareRig() {
   return rig
 }
 
+describe('CameraRig 总览投影选择', () => {
+  function createProjectionRig({ freeOverviewActive, viewMode }) {
+    const rig = Object.create(CameraRig.prototype)
+    rig.freeOverviewActive = freeOverviewActive
+    rig.viewMode = viewMode
+    rig.overviewCamera = { isOrthographicCamera: true }
+    rig.perspectiveCamera = { isPerspectiveCamera: true }
+    return rig
+  }
+
+  it('自由视角使用透视相机（近大远小）', () => {
+    const rig = createProjectionRig({ freeOverviewActive: true, viewMode: '2.5d' })
+    expect(rig.getOverviewCamera()).toBe(rig.perspectiveCamera)
+  })
+
+  it('2.5D 非自由视角使用正交相机（地图编辑比例一致）', () => {
+    const rig = createProjectionRig({ freeOverviewActive: false, viewMode: '2.5d' })
+    expect(rig.getOverviewCamera()).toBe(rig.overviewCamera)
+  })
+
+  it('3D 视角始终使用透视相机', () => {
+    const rig = createProjectionRig({ freeOverviewActive: false, viewMode: '3d' })
+    expect(rig.getOverviewCamera()).toBe(rig.perspectiveCamera)
+  })
+})
+
 describe('CameraRig 俯仰限制', () => {
   it('第一人称持续抬头可接近天顶（大于 80° 且不越过 90°）', () => {
     const rig = createBareRig()

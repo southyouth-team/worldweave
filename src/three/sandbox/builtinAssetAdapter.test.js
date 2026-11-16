@@ -43,14 +43,14 @@ function colliderTargetIds(root) {
 }
 
 describe('内置素材目录与标签', () => {
-  it('只暴露 7 类 20 个规范英文 objectType，别名全部去重，每个条目有中文标签', () => {
+  it('只暴露 7 类 22 个规范英文 objectType，别名全部去重，每个条目有中文标签', () => {
     const items = listBuiltinAssets()
-    expect(items).toHaveLength(20)
+    expect(items).toHaveLength(22)
     expect(Object.keys(BUILTIN_CATEGORY_LABELS)).toEqual([
       'vegetation', 'structure', 'facility', 'decoration', 'sports', 'campus', 'road',
     ])
     const keys = items.map(item => `${item.category}:${item.objectType}`)
-    expect(new Set(keys).size).toBe(20)
+    expect(new Set(keys).size).toBe(22)
     for (const item of items) {
       expect(item.objectType).toMatch(/^[a-z][a-z0-9-]*$/)
       expect(BUILTIN_ASSET_LABELS[`${item.category}:${item.objectType}`]).toBe(item.label)
@@ -153,6 +153,9 @@ describe('内置素材真实比例（以 1.7m 玩家为基准）', () => {
     'campus:east-gate': { width: [30.6, 41.4], height: [11.05, 14.95], depth: [6.8, 9.2] },
     'campus:sports-field': { width: [158.1, 213.9], height: [10.2, 13.8], depth: [85, 115] },
     'campus:zhiyuan-building': { width: [68, 92], height: [17.85, 24.15], depth: [13.6, 18.4] },
+    // 风格对照试点：遮阳鳍片/雨棚/台阶外挑使深度包络大于主楼体
+    'campus:zhiyuan-stylized': { width: [68, 92], height: [17.85, 24.15], depth: [13.6, 21] },
+    'campus:zhiyuan-realistic': { width: [68, 92], height: [17.85, 24.15], depth: [13.6, 21] },
     'road:asphalt-road': { width: [23.5, 24.5], height: [0.01, 0.24], depth: [5.8, 6.2] },
     'road:concrete-road': { width: [19.5, 20.5], height: [0.01, 0.24], depth: [3.8, 4.2] },
     'road:brick-walkway': { width: [15.5, 16.5], height: [0.01, 0.24], depth: [2.2, 2.6] },

@@ -14,7 +14,109 @@ function createAnchor() {
   return anchor
 }
 
+function createLimbModel() {
+  const model = new THREE.Group()
+  const addLimb = name => {
+    const group = new THREE.Group()
+    group.name = name
+    group.add(new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.5, 0.2), new THREE.MeshBasicMaterial()))
+    model.add(group)
+    return group
+  }
+  return {
+    model,
+    leftLeg: addLimb('player-left-leg'),
+    rightLeg: addLimb('player-right-leg'),
+    leftArm: addLimb('player-left-arm'),
+    rightArm: addLimb('player-right-arm'),
+  }
+}
+
 describe('PlayerCharacterRuntime', () => {
+  it('无动画片段的生成角色复用默认关节步态：腿部反相摆动、整体起伏', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    const { model, leftLeg, rightLeg, leftArm, rightArm } = createLimbModel()
+    runtime.setModel(model, [], { assetId: 'procedural-character' })
+    const wrapper = anchor.getObjectByName('player-character-asset')
+    const baseY = wrapper.position.y
+
+    runtime.updateAnimation(true, 0, 0.1, 0, false, 1, false)
+    runtime.updateAnimation(true, 0.1, 0.1, 0, false, 1, false)
+
+    expect(Math.abs(leftLeg.rotation.x)).toBeGreaterThan(0.01)
+    expect(leftLeg.rotation.x).toBeCloseTo(-rightLeg.rotation.x, 6)
+    expect(leftArm.rotation.x).toBeCloseTo(-rightArm.rotation.x, 6)
+    expect(wrapper.position.y).not.toBe(baseY)
+  })
+
+  it('空中状态给生成角色跳跃姿态：双腿收拢、双臂上举', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    const { model, leftLeg, rightLeg, leftArm } = createLimbModel()
+    runtime.setModel(model, [], { assetId: 'jump-character' })
+    runtime.updateAnimation(true, 0, 0, 0, false, 1, true)
+    expect(leftLeg.rotation.x).toBeCloseTo(0.35, 6)
+    expect(rightLeg.rotation.x).toBeCloseTo(-0.35, 6)
+    expect(leftArm.rotation.x).toBeCloseTo(-1.0, 6)
+  })
+
+  it('无命名无骨架的多部件模型按空间位置分段绑定到默认关节', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    const model = new THREE.Group()
+    const addPart = (x, y, z) => {
+      const mesh = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.3, 0.2), new THREE.MeshBasicMaterial())
+      mesh.position.set(x, y, z)
+      model.add(mesh)
+      return mesh
+    }
+    addPart(0, 1.9, 0) // 头
+    addPart(0, 1.2, 0) // 躯干
+    addPart(-0.15, 0.2, 0) // 左腿
+    addPart(0.15, 0.2, 0) // 右腿
+    addPart(-0.6, 1.2, 0) // 左臂
+    addPart(0.6, 1.2, 0) // 右臂
+    runtime.setModel(model, [], { assetId: 'segmented-character' })
+
+    const wrapper = anchor.getObjectByName('player-character-asset')
+    const leftLeg = wrapper.getObjectByName('player-left-leg')
+    const rightLeg = wrapper.getObjectByName('player-right-leg')
+    const leftArm = wrapper.getObjectByName('player-left-arm')
+    expect(leftLeg).toBeTruthy()
+    expect(rightLeg).toBeTruthy()
+    expect(leftArm).toBeTruthy()
+
+    runtime.updateAnimation(true, 0, 0, 0, false, 1, false)
+    runtime.updateAnimation(true, 0.1, 0, 0, false, 1, false)
+    expect(Math.abs(leftLeg.rotation.x)).toBeGreaterThan(0.01)
+    expect(leftLeg.rotation.x).toBeCloseTo(-rightLeg.rotation.x, 6)
+    expect(Math.abs(leftArm.rotation.x)).toBeGreaterThan(0.01)
+  })
+
+  it('没有可识别肢体的整体模型也有走跳反馈，不保持静止', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    const model = new THREE.Group()
+    model.add(new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial()))
+    runtime.setModel(model, [], { assetId: 'single-mesh-character' })
+    const wrapper = anchor.getObjectByName('player-character-asset')
+    runtime.updateAnimation(true, 0, 0, 0, false, 1, false)
+    runtime.updateAnimation(true, 0.1, 0, 0, false, 1, false)
+    expect(wrapper.rotation.z).not.toBe(0)
+  })
+
+  it('有动画片段时仍走片段，不叠加程序化关节驱动', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    const { model, leftLeg } = createLimbModel()
+    const clip = new THREE.AnimationClip('walk', 1, [])
+    runtime.setModel(model, [clip], { assetId: 'clip-character' })
+    runtime.updateAnimation(true, 0, 0, 0, false, 1, false)
+    runtime.updateAnimation(true, 0.1, 0, 0, false, 1, false)
+    expect(leftLeg.rotation.x).toBe(0)
+  })
+
   it('keeps the movement anchor stable while replacing only its visual model', () => {
     const anchor = createAnchor()
     anchor.position.set(4, 0, 7)
@@ -105,6 +207,30 @@ describe('PlayerCharacterRuntime', () => {
     runtime.playState('walk')
     expect(walk.play).toHaveBeenCalledOnce()
     expect(idle.stop).toHaveBeenCalledOnce()
+    runtime.dispose()
+  })
+
+  it('序列化角色保留分段骨架接管前的原始模型，默认角色返回 null', () => {
+    const anchor = createAnchor()
+    const runtime = new PlayerCharacterRuntime(THREE, anchor)
+    expect(runtime.serialize()).toBeNull()
+
+    const model = new THREE.Group()
+    model.add(new THREE.Mesh(new THREE.BoxGeometry(1, 2, 1), new THREE.MeshBasicMaterial()))
+    const limb = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.5, 0.2), new THREE.MeshBasicMaterial())
+    limb.position.set(-0.3, 0.2, 0)
+    model.add(limb)
+    runtime.setModel(model, [], { assetId: 'saved-character', prompt: '测试角色' })
+    const serialized = runtime.serialize()
+    expect(serialized).toBeTruthy()
+    expect(serialized.assetId).toBe('saved-character')
+    expect(serialized.prompt).toBe('测试角色')
+    // 分段骨架会把部件 attach 到关节组；快照必须是接管前的完整模型。
+    const snapshotObjects = serialized.object.object?.children?.length || 0
+    expect(snapshotObjects).toBeGreaterThanOrEqual(2)
+
+    runtime.restoreFallback()
+    expect(runtime.serialize()).toBeNull()
     runtime.dispose()
   })
 

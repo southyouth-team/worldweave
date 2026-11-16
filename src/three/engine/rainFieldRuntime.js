@@ -62,6 +62,14 @@ export function createRainFieldRuntime(THREE) {
     object.visible = Boolean(visible)
   }
 
+  // 雨量强度：只渲染前 N 个粒子（drawRange 以顶点计，每粒子 2 个端点），并微调不透明度。
+  function setIntensity(value) {
+    const intensity = Math.max(0, Math.min(1, Number(value) || 0))
+    const count = Math.max(0, Math.round(RAIN_PARTICLE_COUNT * intensity))
+    geometry.setDrawRange(0, count * 2)
+    material.opacity = 0.28 + 0.34 * intensity
+  }
+
   let disposed = false
   function dispose() {
     if (disposed) return
@@ -75,6 +83,7 @@ export function createRainFieldRuntime(THREE) {
     update,
     followCamera,
     setVisible,
+    setIntensity,
     get visible() {
       return object.visible
     },

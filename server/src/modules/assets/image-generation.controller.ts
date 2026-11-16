@@ -68,6 +68,7 @@ export class ImageGenerationController {
     @Body('objectType') objectType: string,
     @Body('visualStyle') visualStyle: string,
     @Body('imageDataUrl') imageDataUrl: string,
+    @Body('stage') stage: string,
     @Res() response: Response,
   ) {
     response.status(200);
@@ -83,6 +84,7 @@ export class ImageGenerationController {
             response.write(JSON.stringify(event) + '\n');
           }
         },
+        stage,
       );
     } catch (error) {
       if (!response.writableEnded && !response.destroyed) {
@@ -105,9 +107,11 @@ export class ImageGenerationController {
     @Body('referenceImageDataUrl') referenceImageDataUrl: string,
     @Body('screenshots') screenshots: unknown,
     @Body('geometryDiagnostics') geometryDiagnostics: unknown,
+    @Body('footprint') footprint: unknown,
+    @Body('baselineScreenshots') baselineScreenshots: unknown,
   ) {
     return this.service.inspectProceduralModelVisualQuality(
-      prompt, objectType, referenceImageDataUrl, screenshots, geometryDiagnostics,
+      prompt, objectType, referenceImageDataUrl, screenshots, geometryDiagnostics, footprint, baselineScreenshots,
     );
   }
 
@@ -140,9 +144,10 @@ export class ImageGenerationController {
     @Body('environmentBindings') environmentBindings: unknown,
     @Body('modelCapabilityManifest') modelCapabilityManifest: unknown,
     @Body('geometryDiagnostics') geometryDiagnostics: unknown,
+    @Body('referenceImageDataUrl') referenceImageDataUrl: string,
   ) {
     return this.service.modifyProceduralObjectFromInstruction(
-      source, parameters, parameterValues, parts, selectedPartId, instruction, objectType, environmentBindings, modelCapabilityManifest, geometryDiagnostics,
+      source, parameters, parameterValues, parts, selectedPartId, instruction, objectType, environmentBindings, modelCapabilityManifest, geometryDiagnostics, referenceImageDataUrl,
     );
   }
 

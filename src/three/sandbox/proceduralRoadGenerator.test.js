@@ -255,9 +255,9 @@ describe('道路 adapter、碰撞清单与持久化', () => {
     }
   })
 
-  it('目录在校园地标后追加常规道路，总计 7 类 20 件且旧 16 件键不变', () => {
+  it('目录在校园地标后追加常规道路，总计 7 类 22 件且旧 16 件键不变', () => {
     const items = listBuiltinAssets()
-    expect(items).toHaveLength(20)
+    expect(items).toHaveLength(22)
     const categories = [...new Set(items.map(item => item.category))]
     expect(categories).toEqual([
       'vegetation', 'structure', 'facility', 'decoration', 'sports', 'campus', 'road',

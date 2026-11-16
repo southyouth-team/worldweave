@@ -10,22 +10,36 @@ export function createCampusPlayer(THREE, options = {}) {
     roughness,
     flatShading: true,
   })
+  // 色板覆盖：内置角色预设通过 palette 换装，不传时保持原有配色。
+  const palette = options.palette || {}
   const materials = {
-    skin: material('#e9b98e'),
-    skinShade: material('#c98f69'),
-    hair: material('#49382f'),
-    hairLight: material('#69503c'),
-    shirt: material('#477da5'),
-    shirtLight: material('#6c9fc0'),
-    shirtShade: material('#315b7c'),
-    pants: material('#394653'),
-    pantsLight: material('#536170'),
-    shoes: material('#e8dfca'),
-    sole: material('#8d8270'),
-    backpack: material('#b87943'),
-    backpackShade: material('#81502f'),
-    eye: material('#282c30'),
+    skin: material(palette.skin || '#e9b98e'),
+    skinShade: material(palette.skinShade || '#c98f69'),
+    hair: material(palette.hair || '#49382f'),
+    hairLight: material(palette.hairLight || '#69503c'),
+    shirt: material(palette.shirt || '#477da5'),
+    shirtLight: material(palette.shirtLight || '#6c9fc0'),
+    shirtShade: material(palette.shirtShade || '#315b7c'),
+    pants: material(palette.pants || '#394653'),
+    pantsLight: material(palette.pantsLight || '#536170'),
+    shoes: material(palette.shoes || '#e8dfca'),
+    sole: material(palette.sole || '#8d8270'),
+    backpack: material(palette.backpack || '#b87943'),
+    backpackShade: material(palette.backpackShade || '#81502f'),
+    eye: material(palette.eye || '#282c30'),
   }
+
+  // 男女区分（方块版）：女性肩/躯干略窄、腿距更收、后发更长并带两侧长发。
+  const gender = options.gender === 'female' ? 'female' : 'male'
+  const isFemale = gender === 'female'
+  const torsoWidth = isFemale ? 0.58 : 0.68
+  const torsoPanelWidth = isFemale ? 0.36 : 0.42
+  const hemWidth = isFemale ? 0.6 : 0.7
+  const backpackWidth = isFemale ? 0.42 : 0.48
+  const armOffsetX = isFemale ? 0.38 : 0.42
+  const legOffsetX = isFemale ? 0.15 : 0.17
+  const hairBackSize = isFemale ? [0.62, 0.8, 0.16] : [0.61, 0.42, 0.16]
+  const hairBackY = isFemale ? -0.22 : -0.02
 
   const makePart = (name, size, mat, parent, position, castShadow = true) => {
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(...size), mat)
@@ -45,7 +59,7 @@ export function createCampusPlayer(THREE, options = {}) {
   // 腿部关节：髋部作为旋转中心，鞋子独立成型。
   const leftLeg = new THREE.Group()
   leftLeg.name = 'player-left-leg'
-  leftLeg.position.set(-0.17, 0.79, 0)
+  leftLeg.position.set(-legOffsetX, 0.79, 0)
   body.add(leftLeg)
   makePart('player-left-trouser', [0.25, 0.62, 0.29], materials.pants, leftLeg, [0, -0.31, 0])
   makePart('player-left-trouser-highlight', [0.07, 0.48, 0.018], materials.pantsLight, leftLeg, [-0.055, -0.31, 0.153], false)
@@ -54,7 +68,7 @@ export function createCampusPlayer(THREE, options = {}) {
 
   const rightLeg = new THREE.Group()
   rightLeg.name = 'player-right-leg'
-  rightLeg.position.set(0.17, 0.79, 0)
+  rightLeg.position.set(legOffsetX, 0.79, 0)
   body.add(rightLeg)
   makePart('player-right-trouser', [0.25, 0.62, 0.29], materials.pants, rightLeg, [0, -0.31, 0])
   makePart('player-right-trouser-highlight', [0.07, 0.48, 0.018], materials.pantsLight, rightLeg, [0.055, -0.31, 0.153], false)
@@ -62,16 +76,16 @@ export function createCampusPlayer(THREE, options = {}) {
   makePart('player-right-shoe-sole', [0.30, 0.055, 0.40], materials.sole, rightLeg, [0, -0.735, 0.055])
 
   // 躯干与背包形成清晰的前后厚度，侧面不再退化成一张平面。
-  makePart('player-torso', [0.68, 0.76, 0.43], materials.shirt, body, [0, 1.18, 0])
-  makePart('player-shirt-front-panel', [0.42, 0.52, 0.025], materials.shirtLight, body, [0, 1.2, 0.229], false)
-  makePart('player-shirt-hem', [0.7, 0.12, 0.45], materials.shirtShade, body, [0, 0.83, 0])
-  makePart('player-backpack', [0.48, 0.55, 0.22], materials.backpack, body, [0, 1.25, -0.29])
+  makePart('player-torso', [torsoWidth, 0.76, 0.43], materials.shirt, body, [0, 1.18, 0])
+  makePart('player-shirt-front-panel', [torsoPanelWidth, 0.52, 0.025], materials.shirtLight, body, [0, 1.2, 0.229], false)
+  makePart('player-shirt-hem', [hemWidth, 0.12, 0.45], materials.shirtShade, body, [0, 0.83, 0])
+  makePart('player-backpack', [backpackWidth, 0.55, 0.22], materials.backpack, body, [0, 1.25, -0.29])
   makePart('player-backpack-pocket', [0.32, 0.22, 0.035], materials.backpackShade, body, [0, 1.12, -0.415])
 
   // 手臂从肩部摆动，与对侧腿部反相。
   const leftArm = new THREE.Group()
   leftArm.name = 'player-left-arm'
-  leftArm.position.set(-0.42, 1.45, 0)
+  leftArm.position.set(-armOffsetX, 1.45, 0)
   body.add(leftArm)
   makePart('player-left-sleeve', [0.25, 0.38, 0.31], materials.shirtShade, leftArm, [0, -0.17, 0])
   makePart('player-left-forearm', [0.19, 0.34, 0.22], materials.skin, leftArm, [0, -0.49, 0.015])
@@ -79,7 +93,7 @@ export function createCampusPlayer(THREE, options = {}) {
 
   const rightArm = new THREE.Group()
   rightArm.name = 'player-right-arm'
-  rightArm.position.set(0.42, 1.45, 0)
+  rightArm.position.set(armOffsetX, 1.45, 0)
   body.add(rightArm)
   makePart('player-right-sleeve', [0.25, 0.38, 0.31], materials.shirt, rightArm, [0, -0.17, 0])
   makePart('player-right-forearm', [0.19, 0.34, 0.22], materials.skin, rightArm, [0, -0.49, 0.015])
@@ -92,7 +106,14 @@ export function createCampusPlayer(THREE, options = {}) {
   body.add(head)
   makePart('player-face', [0.58, 0.57, 0.49], materials.skin, head, [0, 0, 0.015])
   makePart('player-hair-cap', [0.62, 0.22, 0.55], materials.hair, head, [0, 0.22, -0.005])
-  makePart('player-hair-back', [0.61, 0.42, 0.16], materials.hair, head, [0, -0.02, -0.25])
+  makePart('player-hair-back', hairBackSize, materials.hair, head, [0, hairBackY, -0.25])
+  // 女性两侧长发：从头部两侧垂到肩部，方块版也能一眼区分男女。
+  if (isFemale) {
+    makePart('player-hair-side-left', [0.1, 0.7, 0.14], materials.hair, head, [-0.34, -0.2, 0.06])
+    makePart('player-hair-side-right', [0.1, 0.7, 0.14], materials.hair, head, [0.34, -0.2, 0.06])
+    makePart('player-hair-tie-left', [0.08, 0.08, 0.08], materials.backpack, head, [-0.35, 0.16, 0.02])
+    makePart('player-hair-tie-right', [0.08, 0.08, 0.08], materials.backpack, head, [0.35, 0.16, 0.02])
+  }
   makePart('player-hair-fringe-left', [0.22, 0.16, 0.12], materials.hairLight, head, [-0.17, 0.12, 0.29])
   makePart('player-hair-fringe-right', [0.22, 0.13, 0.12], materials.hair, head, [0.16, 0.15, 0.29])
   makePart('player-left-ear', [0.11, 0.18, 0.14], materials.skinShade, head, [-0.32, -0.02, 0.015])

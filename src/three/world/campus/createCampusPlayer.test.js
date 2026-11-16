@@ -2,6 +2,35 @@ import { describe, expect, it } from 'vitest'
 import * as THREE from 'three'
 import { createCampusPlayer } from './createCampusPlayer.js'
 
+describe('createCampusPlayer gender variants', () => {
+  it('女性体型：躯干更窄、肩部更收、后发更长；默认男性保持原尺寸', () => {
+    const male = createCampusPlayer(THREE)
+    const female = createCampusPlayer(THREE, { gender: 'female' })
+    const torsoWidth = root => {
+      let width = 0
+      const torso = root.getObjectByName('player-torso')
+      torso?.geometry?.computeBoundingBox?.()
+      torso?.geometry?.boundingBox?.getSize(new THREE.Vector3()) && (width = torso.geometry.boundingBox.getSize(new THREE.Vector3()).x)
+      return width
+    }
+    const hairHeight = root => {
+      const hair = root.getObjectByName('player-hair-back')
+      hair?.geometry?.computeBoundingBox?.()
+      return hair.geometry.boundingBox.getSize(new THREE.Vector3()).y * hair.scale.y
+    }
+    expect(torsoWidth(male)).toBeCloseTo(0.68, 3)
+    expect(torsoWidth(female)).toBeCloseTo(0.58, 3)
+    expect(hairHeight(female)).toBeGreaterThan(hairHeight(male))
+    // 方块版：脸与躯干都是 BoxGeometry
+    expect(male.getObjectByName('player-face').geometry.type).toBe('BoxGeometry')
+    expect(male.getObjectByName('player-torso').geometry.type).toBe('BoxGeometry')
+    // 女性额外带两侧长发与头绳，男性没有
+    expect(female.getObjectByName('player-hair-side-left')).toBeTruthy()
+    expect(male.getObjectByName('player-hair-side-left')).toBeFalsy()
+    expect(createCampusPlayer(THREE, { gender: 'male' }).getObjectByName('player-torso')).toBeTruthy()
+  })
+})
+
 describe('createCampusPlayer locomotion presentation', () => {
   it('advances gait from one continuous clock at different render cadences', () => {
     const runCadence = (hz) => {

@@ -11,12 +11,17 @@ import { CameraRig } from '../camera/CameraRig.js'
 import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { InputController } from '../controls/InputController.js'
 import { PlayerCharacterRuntime } from '../characters/PlayerCharacterRuntime.js'
+import { createPlayerPresetModel, getPlayerPreset } from '../characters/playerPresets.js'
+import { snapPlacementCenter } from '../sandbox/placementSnap.js'
 import { CollisionWorld } from '../physics/CollisionWorld.js'
 import { PhysicsRuntime } from '../physics/PhysicsRuntime.js'
 import { getVirtualSunState } from './solarPosition.js'
 import { getSkyVisualState } from './skyVisualState.js'
 import { createSkyRuntime } from './skyRuntime.js'
 import { createRainFieldRuntime } from './rainFieldRuntime.js'
+import {
+  createCloudLayerRuntime, createSnowFieldRuntime, getCloudTint, resolveWeatherMode,
+} from './weatherRuntime.js'
 import { applyEnvironmentBindings, applyWorldStateBindings } from './worldStateRuntime.js'
 import { applySandboxLightingState } from './sandboxLightingRuntime.js'
 import { refreshModelPhysicsRegistration, refreshModelSpatialRegistration } from './modelSpatialRuntime.js'
@@ -42,7 +47,31 @@ import { mapEditorPointToCalibratedWorld } from '../../editor/campusMapCalibrati
 import { createCampusMaterials, createPixelBuilding, validateBuildingFootprint } from '../world/campus/campusAssetLibrary.js'
 import { disposeOwnedGeometry } from '../world/proceduralGeometry.js'
 import { createBuiltinSandboxModel } from '../sandbox/builtinAssetAdapter.js'
-import { isStretchableRoadModel } from '../sandbox/roadEndpointMath.js'
+import {
+  ROAD_OBJECT_TYPES,
+  areRoadPointsValid,
+  getRoadEndpoints,
+  getRoadEdgeStations,
+  getRoadFootprint,
+  getRoadStations,
+  insertRoadBreakpointAt,
+  insertRoadBreakpoints,
+  isAnyStretchableRoadModel,
+  isPolylineRoadModel,
+  mergeRoadPointSequences,
+  pointsTotalLength,
+  removeRoadPoint,
+  snapRoadPointToExisting,
+} from '../sandbox/roadEndpointMath.js'
+import { ROAD_DEFINITIONS, createPolylineRoadModel, createProceduralRoadModel, createRoadSurfaceMaterial } from '../sandbox/proceduralRoadGenerator.js'
+import { buildRoadJunctionPatches } from '../sandbox/roadJunctionBuilder.js'
+import {
+  buildFootprintProbes,
+  polygonBounds as footprintPolygonBounds,
+  polygonCentroid,
+  polygonSelfIntersects,
+  triangulatePolygon,
+} from '../sandbox/footprintPolygon.js'
 import { createSandboxRoadEditor } from './sandboxRoadEditor.js'
 
 function getObjectLocalBounds(THREE, root) {
@@ -160,6 +189,8 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   let sandboxSelectionHelper = null
   let sandboxTransform = null
   let sandboxRoadEditor = null
+  let sandboxRoadJunctionGroup = null
+  const sandboxRoadJunctionMaterials = new Map()
   let placementState = null
   // AI 沙盒模型采用分层选址；与旧 generatedAssets 的 placementState 完全隔离。
   let sandboxPlacementState = null
@@ -415,6 +446,13 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   let hemisphereLight = null
   let skyRuntime = null
   let rainField = null
+  let cloudLayer = null
+  let snowField = null
+  let weatherModeName = 'clear'
+  let weatherModeIntensity = 0.5
+  let playerCharacterPresetId = null
+  let playerCharacterTargetHeight = 2.25
+  let playerCharacterGender = 'male'
   let windSwayTargets = []
   let environmentConfig = {
     time: 14,
@@ -679,6 +717,133 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return true
   }
 
+  // ---- 地块管理：每个地块四邻空缺处一个「+」单块扩建标记（平铺地面） ----
+  let sandboxExpandMarkers = null
+
+  // 「+」标记轮廓：白色细实线完整网格。相邻空缺地块之间的共享边也要画，
+  // 用无向边去重保证每条边只画一次（不重叠加粗），所有可扩建格连成一片；
+  // 每格中心一个细线加号。
+  function buildExpandOutline(positions, specs, chunkWidth, chunkDepth, centerY) {
+    const halfW = chunkWidth / 2
+    const halfD = chunkDepth / 2
+    const plus = Math.min(chunkWidth, chunkDepth) * 0.14
+    const edgeSeen = new Set()
+    for (const spec of specs) {
+      const corners = [
+        [spec.x - halfW, spec.z - halfD],
+        [spec.x + halfW, spec.z - halfD],
+        [spec.x + halfW, spec.z + halfD],
+        [spec.x - halfW, spec.z + halfD],
+      ]
+      const edges = [[0, 1], [1, 2], [2, 3], [3, 0]]
+      for (const [a, b] of edges) {
+        const [ax, az] = corners[a]
+        const [bx, bz] = corners[b]
+        const key = (ax < bx || (ax === bx && az <= bz))
+          ? `${ax},${az}|${bx},${bz}`
+          : `${bx},${bz}|${ax},${az}`
+        if (edgeSeen.has(key)) continue
+        edgeSeen.add(key)
+        positions.push(ax, centerY, az, bx, centerY, bz)
+      }
+      positions.push(spec.x - plus, centerY, spec.z, spec.x + plus, centerY, spec.z)
+      positions.push(spec.x, centerY, spec.z - plus, spec.x, centerY, spec.z + plus)
+    }
+  }
+
+  function clearSandboxExpandMarkers() {
+    if (!sandboxExpandMarkers) return
+    scene?.remove(sandboxExpandMarkers)
+    sandboxExpandMarkers.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.map?.dispose?.()
+      object.material?.dispose?.()
+    })
+    sandboxExpandMarkers = null
+  }
+
+  function refreshSandboxExpandMarkers() {
+    clearSandboxExpandMarkers()
+    if (!chunkManagementActive || !scene || !isBlankSandbox) return
+    const state = getSandboxWorldState()
+    const chunkWidth = Number(state?.chunkSize?.width)
+    const chunkDepth = Number(state?.chunkSize?.depth)
+    const chunks = state?.chunks
+    if (!(chunkWidth > 0) || !(chunkDepth > 0) || !Array.isArray(chunks)) return
+    const existing = new Set(chunks.map(chunk => chunk.x + ':' + chunk.z))
+    // 每个已有地块的四邻空缺各生成一个「+」；同一空缺只保留一个标记
+    const specs = []
+    const seen = new Set()
+    const neighbors = [
+      [1, 0, 'east'], [-1, 0, 'west'], [0, 1, 'south'], [0, -1, 'north'],
+    ]
+    for (const chunk of chunks) {
+      for (const [dx, dz, direction] of neighbors) {
+        const chunkX = chunk.x + dx
+        const chunkZ = chunk.z + dz
+        const key = chunkX + ':' + chunkZ
+        if (existing.has(key) || seen.has(key)) continue
+        if (Math.abs(chunkX) > 50 || Math.abs(chunkZ) > 50) continue
+        seen.add(key)
+        specs.push({ chunkX, chunkZ, direction, x: chunkX * chunkWidth, z: chunkZ * chunkDepth })
+      }
+    }
+    if (!specs.length) return
+    sandboxExpandMarkers = new THREE.Group()
+    sandboxExpandMarkers.name = 'sandbox-expand-markers'
+    const centerY = 0.12
+    // 每个空缺块一个透明点击平面（覆盖整块，raycast 命中用）
+    for (const spec of specs) {
+      const hitPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(chunkWidth, chunkDepth),
+        new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }),
+      )
+      hitPlane.name = 'sandbox-expand-hit-' + spec.chunkX + '-' + spec.chunkZ
+      hitPlane.rotation.x = -Math.PI / 2
+      hitPlane.position.set(spec.x, centerY, spec.z)
+      hitPlane.userData.expandDirection = spec.direction
+      hitPlane.userData.expandChunk = { x: spec.chunkX, z: spec.chunkZ }
+      sandboxExpandMarkers.add(hitPlane)
+    }
+    // 合并成一个 LineSegments：完整网格 + 每格中心加号
+    const positions = []
+    buildExpandOutline(positions, specs, chunkWidth, chunkDepth, centerY)
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    const outline = new THREE.LineSegments(
+      geometry,
+      new THREE.LineBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.95 }),
+    )
+    outline.name = 'sandbox-expand-outline'
+    outline.frustumCulled = false
+    sandboxExpandMarkers.add(outline)
+    scene.add(sandboxExpandMarkers)
+    requestFrame()
+  }
+
+  function tryExpandFromMarker(event) {
+    if (!sandboxExpandMarkers || !renderer || !cameraRig) return false
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return false
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const hits = raycaster.intersectObjects(sandboxExpandMarkers.children, false)
+    if (!hits.length) return false
+    const marker = hits[0].object
+    const target = marker.userData.expandChunk
+    if (!target || !addSandboxWorldChunk(target.x, target.z)) return false
+    callbacks.onSandboxChunkSelectionChange?.({
+      active: chunkManagementActive,
+      chunks: Array.from(selectedSandboxChunkKeys, key => {
+        const [x, z] = key.split(':').map(Number)
+        return { x, z }
+      }),
+      expanded: marker.userData.expandDirection,
+      addedChunk: { x: target.x, z: target.z },
+    })
+    return true
+  }
+
   function setSandboxChunkManagement(enabled) {
     if (!isBlankSandbox) return false
     const nextEnabled = Boolean(enabled)
@@ -703,6 +868,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       chunkManagementPreviousCameraMode = null
     }
     campus?.userData?.setChunkManagementState?.(chunkManagementActive, Array.from(selectedSandboxChunkKeys))
+    refreshSandboxExpandMarkers()
     callbacks.onSandboxChunkSelectionChange?.({
       chunks: Array.from(selectedSandboxChunkKeys, key => {
         const [x, z] = key.split(':').map(Number)
@@ -730,6 +896,8 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     const width = Number(state?.chunkSize?.width)
     const depth = Number(state?.chunkSize?.depth)
     if (!(width > 0) || !(depth > 0) || !renderer || !cameraRig) return false
+    // 优先命中四边「+」扩建标记：点它直接扩一格，不参与地块选择
+    if (tryExpandFromMarker(event)) return true
     const rect = renderer.domElement.getBoundingClientRect()
     if (!rect.width || !rect.height) return false
     pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
@@ -775,6 +943,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     const world = getSandboxPlacementWorldBounds()
     if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
     if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
     callbacks.onSandboxWorldChange?.(getSandboxWorldState())
     requestFrame()
     return true
@@ -845,6 +1014,24 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     syncSandboxPhysicsWorld()
   }
 
+  // 单块扩建：只添加指定相邻地块（与四邻「+」标记对应），不整行/整列扩展。
+  function addSandboxWorldChunk(chunkX, chunkZ) {
+    if (!isBlankSandbox || !campus?.userData?.addWorldChunk) return false
+    if (!campus.userData.addWorldChunk(chunkX, chunkZ)) return false
+    syncSandboxWalkableChunks()
+    if (collisionWorld) collisionWorld.bounds = campus.userData.walkableBounds
+    if (input) {
+      input.bounds = campus.userData.walkableBounds
+      if (input.collisionWorld) input.collisionWorld.bounds = campus.userData.walkableBounds
+    }
+    const world = getSandboxPlacementWorldBounds()
+    if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxWorldChange?.(getSandboxWorldState())
+    requestFrame()
+    return true
+  }
+
   function removeSandboxWorldChunk(chunkX, chunkZ) {
     if (!isBlankSandbox || !campus?.userData?.removeWorldChunk) {
       return { ok: false, reason: 'unsupported-world' }
@@ -904,6 +1091,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     const world = getSandboxPlacementWorldBounds()
     if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
     if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
     callbacks.onSandboxWorldChange?.(getSandboxWorldState())
     requestFrame()
     return { ok: true, world: getSandboxWorldState() }
@@ -922,6 +1110,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     const world = getSandboxPlacementWorldBounds()
     if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
     if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
     callbacks.onSandboxWorldChange?.(getSandboxWorldState())
     requestFrame()
     return true
@@ -945,24 +1134,32 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.025), point) ? point : null
   }
 
-  function getSandboxPlacementConflict(bounds, state) {
+  function getSandboxPlacementConflict(bounds, state, options = {}) {
+    // 普通模型用整体包围盒；道路提供逐段探针，按道路形状判重。
+    const probes = Array.isArray(state?.footprintProbes) && state.footprintProbes.length
+      ? state.footprintProbes
+      : [bounds]
     if (isBlankSandbox) {
       const worldState = getSandboxWorldState()
       const width = Number(worldState?.chunkSize?.width)
       const depth = Number(worldState?.chunkSize?.depth)
       if (width > 0 && depth > 0) {
-        const minChunkX = Math.floor((bounds.min.x + width / 2 + 0.001) / width)
-        const maxChunkX = Math.floor((bounds.max.x + width / 2 - 0.001) / width)
-        const minChunkZ = Math.floor((bounds.min.z + depth / 2 + 0.001) / depth)
-        const maxChunkZ = Math.floor((bounds.max.z + depth / 2 - 0.001) / depth)
         const existing = new Set((worldState.chunks || []).map(chunk => chunk.x + ':' + chunk.z))
-        for (let x = minChunkX; x <= maxChunkX; x += 1) {
-          for (let z = minChunkZ; z <= maxChunkZ; z += 1) {
-            if (!existing.has(x + ':' + z)) return '该位置包含已回收的地块'
+        for (const probe of probes) {
+          const minChunkX = Math.floor((probe.min.x + width / 2 + 0.001) / width)
+          const maxChunkX = Math.floor((probe.max.x + width / 2 - 0.001) / width)
+          const minChunkZ = Math.floor((probe.min.z + depth / 2 + 0.001) / depth)
+          const maxChunkZ = Math.floor((probe.max.z + depth / 2 - 0.001) / depth)
+          for (let x = minChunkX; x <= maxChunkX; x += 1) {
+            for (let z = minChunkZ; z <= maxChunkZ; z += 1) {
+              if (!existing.has(x + ':' + z)) return '该位置包含已回收的地块'
+            }
           }
         }
       }
     }
+    // 道路端点拉伸是编辑行为，允许贴着/压着附近模型；放置新模型仍做完整判重。
+    if (options.ignoreModels === true) return null
     const overlaps = (a, b) => a.min.x < b.max.x - 0.015 && a.max.x > b.min.x + 0.015
       && a.min.z < b.max.z - 0.015 && a.max.z > b.min.z + 0.015
       && a.min.y < b.max.y - 0.015 && a.max.y > b.min.y + 0.015
@@ -971,20 +1168,77 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       if (model === state.model || !model.visible) continue
       model.updateWorldMatrix(true, true)
       const otherBounds = new THREE.Box3().setFromObject(model)
-      if (!otherBounds.isEmpty() && overlaps(bounds, otherBounds)) return model.name || id
+      if (otherBounds.isEmpty()) continue
+      for (const probe of probes) {
+        if (overlaps(probe, otherBounds)) return model.name || id
+      }
     }
 
     // Also respect registered world colliders, including future static obstacles.
     // This is a conservative XZ broad-phase; model-vs-model checks above include height.
     for (const obstacle of collisionWorld?.obstacles || []) {
       if (obstacle.ownerId && obstacle.ownerId === state.id) continue
-      if (bounds.max.x > obstacle.minX + 0.015 && bounds.min.x < obstacle.maxX - 0.015
-        && bounds.max.z > obstacle.minZ + 0.015 && bounds.min.z < obstacle.maxZ - 0.015) {
-        const owner = obstacle.ownerId ? sandboxModels.get(String(obstacle.ownerId)) : null
-        return owner?.name || '已有场景碰撞区域'
+      for (const probe of probes) {
+        if (probe.max.x > obstacle.minX + 0.015 && probe.min.x < obstacle.maxX - 0.015
+          && probe.max.z > obstacle.minZ + 0.015 && probe.min.z < obstacle.maxZ - 0.015) {
+          const owner = obstacle.ownerId ? sandboxModels.get(String(obstacle.ownerId)) : null
+          return owner?.name || '已有场景碰撞区域'
+        }
       }
     }
     return null
+  }
+
+  function getSandboxRoadJunctionMaterial(objectType) {
+    if (!sandboxRoadJunctionMaterials.has(objectType)) {
+      sandboxRoadJunctionMaterials.set(objectType, createRoadSurfaceMaterial(THREE, objectType))
+    }
+    return sandboxRoadJunctionMaterials.get(objectType)
+  }
+
+  // 路口拼接面：两两道路的占地交叠区铺一块路面（高于边线/中线），
+  // 口对口、口接路身都能盖住接缝。派生数据，随时重建，不进存档。
+  function rebuildSandboxRoadJunctions() {
+    if (!scene) return
+    if (!sandboxRoadJunctionGroup) {
+      sandboxRoadJunctionGroup = new THREE.Group()
+      sandboxRoadJunctionGroup.name = 'sandbox-road-junctions'
+      scene.add(sandboxRoadJunctionGroup)
+    }
+    for (const child of [...sandboxRoadJunctionGroup.children]) {
+      sandboxRoadJunctionGroup.remove(child)
+      child.geometry?.dispose?.()
+    }
+    const roads = []
+    for (const model of sandboxModels.values()) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      const bounds = new THREE.Box3().setFromObject(model)
+      roads.push({
+        objectType: model.userData.proceduralRoad.objectType,
+        topY: Number.isFinite(bounds.max.y) ? bounds.max.y : 0.1,
+        footprint: getRoadFootprint(model),
+      })
+    }
+    if (roads.length < 2) return
+    for (const patch of buildRoadJunctionPatches(roads)) {
+      const positions = []
+      for (const polygon of patch.polygons) {
+        for (let index = 1; index < polygon.length - 1; index += 1) {
+          positions.push(polygon[0].x, patch.y, polygon[0].z)
+          positions.push(polygon[index].x, patch.y, polygon[index].z)
+          positions.push(polygon[index + 1].x, patch.y, polygon[index + 1].z)
+        }
+      }
+      if (!positions.length) continue
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      geometry.computeVertexNormals()
+      const mesh = new THREE.Mesh(geometry, getSandboxRoadJunctionMaterial(patch.objectType))
+      mesh.name = 'road-junction-patch'
+      mesh.userData.roadJunction = true
+      mesh.renderOrder = 4
+      sandboxRoadJunctionGroup.add(mesh)
+    }
   }
 
   function getSandboxRoadEditor() {
@@ -994,9 +1248,10 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       domElement: renderer.domElement,
       camera: cameraRig.camera,
       getGroundPoint: getSandboxGroundPoint,
-      getPlacementConflict: (bounds, state) => getSandboxPlacementConflict(bounds, state),
+      getPlacementConflict: (bounds, state) => getSandboxPlacementConflict(bounds, state, { ignoreModels: true }),
       getWorldBounds: getSandboxPlacementWorldBounds,
       commitRoadEdit: commitSandboxRoadEdit,
+      insertBreakpointAt: (modelId, point) => insertSandboxRoadBreakpoint(modelId, point),
       onChange: payload => callbacks.onSandboxRoadEditChange?.(payload),
       requestFrame,
     })
@@ -1006,6 +1261,96 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   function commitSandboxRoadEdit(current, solution) {
     const id = String(current.userData.sandboxModelId)
     const ref = current.userData.builtinAssetRef
+    const width = Number(current.userData?.proceduralRoad?.width) || undefined
+
+    // 折线道路（≥3 控制点）：按世界坐标重建，根固定在原点。
+    if (Array.isArray(solution.points) && solution.points.length > 2) {
+      const replacement = createPolylineRoadModel(THREE, {
+        objectType: ref.objectType,
+        width: Number(solution.width) || width,
+        points: solution.points,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: { x: 0, y: current.position.y, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (!accepted) return { ok: false, reason: '道路提交失败' }
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return { ok: true, replacement: sandboxModels.get(id) }
+    }
+
+    // 两控制点：宽度一致时回到直线道路（v1），宽度不同则保留为两点折线（v3/v4）。
+    if (Array.isArray(solution.points) && solution.points.length === 2) {
+      // 边缘点拖拽（端点编辑器）：按左右边缘点原样重建，松手后形状与预览完全一致。
+      if (Number.isFinite(solution.points[0]?.lx) && Number.isFinite(solution.points[1]?.lx)) {
+        const replacement = createPolylineRoadModel(THREE, {
+          objectType: ref.objectType,
+          width: Math.max(Number(solution.width) || 0, Number(width) || 0) || 1,
+          points: solution.points,
+        })
+        const accepted = replaceSandboxModel(id, replacement, {
+          transform: {
+            position: { x: 0, y: current.position.y, z: 0 },
+            rotation: { x: 0, y: 0, z: 0 },
+            scale: { x: 1, y: 1, z: 1 },
+          },
+        })
+        if (!accepted) return { ok: false, reason: '道路提交失败' }
+        cameraRig?.setOrbitInteractionEnabled?.(false)
+        return { ok: true, replacement: sandboxModels.get(id) }
+      }
+      const stations = normalizeSolutionStations(solution.points)
+      const [start, end] = stations
+      const fallbackHalf = (Number(width) || 2) / 2
+      const hwStart = Number.isFinite(start.hw) ? start.hw : fallbackHalf
+      const hwEnd = Number.isFinite(end.hw) ? end.hw : hwStart
+      const equalWidth = Math.abs(hwStart - hwEnd) <= 1e-3
+      if (!equalWidth) {
+        const replacement = createPolylineRoadModel(THREE, {
+          objectType: ref.objectType,
+          width: Math.max(hwStart, hwEnd) * 2,
+          points: [start, end],
+        })
+        const accepted = replaceSandboxModel(id, replacement, {
+          transform: {
+            position: { x: 0, y: current.position.y, z: 0 },
+            rotation: { x: 0, y: 0, z: 0 },
+            scale: { x: 1, y: 1, z: 1 },
+          },
+        })
+        if (!accepted) return { ok: false, reason: '道路提交失败' }
+        cameraRig?.setOrbitInteractionEnabled?.(false)
+        return { ok: true, replacement: sandboxModels.get(id) }
+      }
+      const dx = end.x - start.x
+      const dz = end.z - start.z
+      const rawLength = Math.hypot(dx, dz)
+      const clampedLength = Math.min(120, Math.max(2, rawLength))
+      const fallbackDirection = rawLength > 0 ? { x: dx / rawLength, z: dz / rawLength } : { x: 1, z: 0 }
+      const replacement = createProceduralRoadModel(THREE, {
+        objectType: ref.objectType,
+        length: clampedLength,
+        width: hwStart * 2,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: {
+            x: start.x + fallbackDirection.x * clampedLength / 2,
+            y: current.position.y,
+            z: start.z + fallbackDirection.z * clampedLength / 2,
+          },
+          rotation: { x: 0, y: Math.atan2(-fallbackDirection.z, fallbackDirection.x), z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (!accepted) return { ok: false, reason: '道路提交失败' }
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return { ok: true, replacement: sandboxModels.get(id) }
+    }
+
     const replacement = createBuiltinSandboxModel(THREE, null, {
       category: ref.category,
       objectType: ref.objectType,
@@ -1024,14 +1369,256 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return { ok: true, replacement: sandboxModels.get(id) }
   }
 
+  // 当前道路的控制点（中心线 + 半宽，世界坐标）；各类模型统一成同一结构。
+  function roadPointsOf(model) {
+    return getRoadStations(model).map(station => ({
+      x: station.x,
+      z: station.z,
+      hw: Number.isFinite(station.hw) ? station.hw : undefined,
+    }))
+  }
+
+  // 提交解里的点可能是「边缘点」（lx/lz/rx/rz）或「中心线+半宽」，统一成中心+半宽。
+  function normalizeSolutionStations(points) {
+    return points.map(point => {
+      if (Number.isFinite(point?.lx)) {
+        return {
+          x: (point.lx + point.rx) / 2,
+          z: (point.lz + point.rz) / 2,
+          hw: Math.hypot(point.rx - point.lx, point.rz - point.lz) / 2,
+        }
+      }
+      return {
+        x: point.x,
+        z: point.z,
+        hw: Number.isFinite(point.hw) ? point.hw : undefined,
+      }
+    })
+  }
+
+  function reattachRoadEditor(id, replacement) {
+    if (!sandboxRoadEditor?.isAttached?.()) return
+    if (String(sandboxRoadEditor.getModelId?.()) !== String(id)) return
+    sandboxRoadEditor.attach(replacement)
+  }
+
+  // 控制点序列：v4 道路直接用左右边缘点，加/删断点时不会把不对称的路缘拉回居中。
+  function breakpointSourcePoints(model) {
+    if (Number(model?.userData?.proceduralRoad?.version) === 4) {
+      return getRoadEdgeStations(model).map(station => ({
+        lx: station.left.x,
+        lz: station.left.z,
+        rx: station.right.x,
+        rz: station.right.z,
+      }))
+    }
+    return roadPointsOf(model)
+  }
+
+  // 加断点：直线道路一次给四个控制点（两端 + 1/3、2/3），折线在最长段中点再加一个。
+  function addSandboxRoadPoint(id) {
+    const model = sandboxModels.get(String(id))
+    if (!model || !isAnyStretchableRoadModel(model)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    let points
+    try {
+      points = insertRoadBreakpoints(breakpointSourcePoints(model))
+    } catch {
+      return false
+    }
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    const current = sandboxModels.get(String(id))
+    reattachRoadEditor(id, current)
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 在点击位置插入单个断点（端点编辑器的加断点拾取）。
+  function insertSandboxRoadBreakpoint(id, target) {
+    const model = sandboxModels.get(String(id))
+    if (!model || !isAnyStretchableRoadModel(model)) return false
+    if (!Number.isFinite(target?.x) || !Number.isFinite(target?.z)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    let points
+    try {
+      points = insertRoadBreakpointAt(breakpointSourcePoints(model), target)
+    } catch {
+      return false
+    }
+    if (!areRoadPointsValid(points)) return false
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    reattachRoadEditor(id, sandboxModels.get(String(id)))
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 删除最后一个转折点；剩两个点时退回直线道路。
+  function removeSandboxRoadPoint(id) {
+    const model = sandboxModels.get(String(id))
+    if (!model) return false
+    if (!isPolylineRoadModel(model)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    const currentPoints = breakpointSourcePoints(model)
+    let points
+    try {
+      points = removeRoadPoint(currentPoints)
+    } catch {
+      return false
+    }
+    if (points.length === 2) {
+      // 收回到两个控制点时转成中心线+半宽，直线道路仍回到 v1（带 length 语义）。
+      const centerPoints = points.map(point => {
+        if (!Number.isFinite(point?.lx)) return point
+        return {
+          x: (point.lx + point.rx) / 2,
+          z: (point.lz + point.rz) / 2,
+          hw: Math.hypot(point.rx - point.lx, point.rz - point.lz) / 2,
+        }
+      })
+      const accepted = commitSandboxRoadEdit(model, { points: centerPoints })
+      if (!accepted?.ok) return false
+      reattachRoadEditor(id, sandboxModels.get(String(id)))
+      selectSandboxModel(String(id))
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return true
+    }
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    reattachRoadEditor(id, sandboxModels.get(String(id)))
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 道路占地几何：填充带按平滑路缘分段成三角形，轮廓是闭合路缘多边形。
+  function buildRoadFootprintFillGeometry(footprint, y) {
+    const positions = []
+    const push = point => positions.push(point.x, y, point.z)
+    const quad = (a, b, c, d) => { push(a); push(b); push(c); push(a); push(c); push(d) }
+    const { left, right } = footprint
+    for (let index = 1; index < left.length; index += 1) {
+      quad(left[index - 1], right[index - 1], right[index], left[index])
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.computeVertexNormals()
+    return geometry
+  }
+
+  function roadFootprintOutlinePoints(footprint) {
+    return [...footprint.left, ...footprint.right.slice().reverse()]
+  }
+
+  function buildRoadFootprintOutlineGeometry(footprint, y) {
+    const points = roadFootprintOutlinePoints(footprint)
+    const positions = []
+    for (let index = 0; index < points.length; index += 1) {
+      const start = points[index]
+      const end = points[(index + 1) % points.length]
+      positions.push(start.x, y, start.z, end.x, y, end.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    return geometry
+  }
+
+  // 分段探针：占地冲突按道路形状逐段判重，不再用整条路的大包围盒。
+  function buildRoadFootprintProbes(footprint, topY) {
+    const { left, right } = footprint
+    const probes = []
+    const maxY = Math.max(Number(topY) || 0, 0.05)
+    for (let index = 1; index < left.length; index += 1) {
+      const xs = [left[index - 1].x, left[index].x, right[index - 1].x, right[index].x]
+      const zs = [left[index - 1].z, left[index].z, right[index - 1].z, right[index].z]
+      probes.push(new THREE.Box3(
+        new THREE.Vector3(Math.min(...xs), 0, Math.min(...zs)),
+        new THREE.Vector3(Math.max(...xs), maxY, Math.max(...zs)),
+      ))
+    }
+    return probes
+  }
+
+  // 勾绘占地多边形（本地坐标）→ 世界坐标：随模型位置与 Y 轴旋转。
+  function placementFootprintWorldPolygon(state) {
+    const polygon = state.footprintPolygon || []
+    const yaw = Number(state.model?.rotation?.y) || 0
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    const origin = state.model?.position || { x: 0, z: 0 }
+    return polygon.map(point => ({
+      x: origin.x + point.x * cos + point.z * sin,
+      z: origin.z - point.x * sin + point.z * cos,
+    }))
+  }
+
+  function buildPolygonFillGeometry(polygon, y) {
+    const positions = []
+    for (const triangle of triangulatePolygon(polygon)) {
+      for (const point of triangle) positions.push(point.x, y, point.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.computeVertexNormals()
+    return geometry
+  }
+
+  function buildPolygonOutlineGeometry(polygon, y) {
+    const positions = []
+    for (let index = 0; index < polygon.length; index += 1) {
+      const start = polygon[index]
+      const end = polygon[(index + 1) % polygon.length]
+      positions.push(start.x, y, start.z, end.x, y, end.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    return geometry
+  }
+
   function updateSandboxPlacementPreview(point) {
     const state = sandboxPlacementState
     if (!state || !point) return false
     const world = getSandboxPlacementWorldBounds()
     const halfWidth = state.footprintWidth / 2
     const halfDepth = state.footprintDepth / 2
-    const x = THREE.MathUtils.clamp(point.x, world.centerX - world.width / 2 + halfWidth, world.centerX + world.width / 2 - halfWidth)
-    const z = THREE.MathUtils.clamp(point.z, world.centerZ - world.depth / 2 + halfDepth, world.centerZ + world.depth / 2 - halfDepth)
+    // 吸附：先保证模型完整落在可放置区内，再在靠近边界时自动贴边、其余按 0.5m 网格对齐。
+    const snapped = snapPlacementCenter({
+      x: point.x,
+      z: point.z,
+      limitMinX: world.centerX - world.width / 2 + halfWidth,
+      limitMaxX: world.centerX + world.width / 2 - halfWidth,
+      limitMinZ: world.centerZ - world.depth / 2 + halfDepth,
+      limitMaxZ: world.centerZ + world.depth / 2 - halfDepth,
+    })
+    const x = snapped.x
+    const z = snapped.z
     state.model.visible = true
     state.model.position.x = x
     state.model.position.z = z
@@ -1040,25 +1627,58 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     if (!bounds.isEmpty()) state.model.position.y += 0.012 - bounds.min.y
     state.model.updateWorldMatrix(true, true)
     const placedBounds = new THREE.Box3().setFromObject(state.model)
+    if (state.footprintPolygon) {
+      // 勾绘占地：按多边形（随模型位置/旋转）更新填充、轮廓与三角探针。
+      const worldPolygon = placementFootprintWorldPolygon(state)
+      state.footprintProbes = buildFootprintProbes(worldPolygon, placedBounds.max.y)
+      if (sandboxPlacementFootprint) {
+        sandboxPlacementFootprint.geometry?.dispose?.()
+        sandboxPlacementFootprint.geometry = buildPolygonFillGeometry(worldPolygon, 0.035)
+        sandboxPlacementFootprint.position.set(0, 0, 0)
+      }
+      if (sandboxPlacementFootprintOutline) {
+        sandboxPlacementFootprintOutline.geometry?.dispose?.()
+        sandboxPlacementFootprintOutline.geometry = buildPolygonOutlineGeometry(worldPolygon, 0.055)
+        sandboxPlacementFootprintOutline.position.set(0, 0, 0)
+      }
+    } else if (state.roadFootprint) {
+      // 道路按实际形状更新占地填充/轮廓，冲突也用逐段探针判定。
+      const footprint = getRoadFootprint(state.model)
+      state.footprintProbes = buildRoadFootprintProbes(footprint, placedBounds.max.y)
+      if (sandboxPlacementFootprint) {
+        sandboxPlacementFootprint.geometry?.dispose?.()
+        sandboxPlacementFootprint.geometry = buildRoadFootprintFillGeometry(footprint, 0.035)
+        sandboxPlacementFootprint.position.set(0, 0, 0)
+      }
+      if (sandboxPlacementFootprintOutline) {
+        sandboxPlacementFootprintOutline.geometry?.dispose?.()
+        sandboxPlacementFootprintOutline.geometry = buildRoadFootprintOutlineGeometry(footprint, 0.055)
+        sandboxPlacementFootprintOutline.position.set(0, 0, 0)
+      }
+    }
     const blockerName = getSandboxPlacementConflict(placedBounds, state)
     state.blocked = Boolean(blockerName)
     state.blockerName = blockerName
     if (sandboxPlacementFootprint) {
       sandboxPlacementFootprint.material.color.set(state.blocked ? '#e66b68' : '#8bd5a5')
-      sandboxPlacementFootprint.position.set(
-        (placedBounds.min.x + placedBounds.max.x) / 2,
-        0.035,
-        (placedBounds.min.z + placedBounds.max.z) / 2,
-      )
+      if (!state.roadFootprint) {
+        sandboxPlacementFootprint.position.set(
+          (placedBounds.min.x + placedBounds.max.x) / 2,
+          0.035,
+          (placedBounds.min.z + placedBounds.max.z) / 2,
+        )
+      }
       sandboxPlacementFootprint.visible = true
     }
     if (sandboxPlacementFootprintOutline) {
       sandboxPlacementFootprintOutline.material.color.set(state.blocked ? '#ff8b82' : '#b8f5c8')
-      sandboxPlacementFootprintOutline.position.set(
-        (placedBounds.min.x + placedBounds.max.x) / 2,
-        0.055,
-        (placedBounds.min.z + placedBounds.max.z) / 2,
-      )
+      if (!state.roadFootprint) {
+        sandboxPlacementFootprintOutline.position.set(
+          (placedBounds.min.x + placedBounds.max.x) / 2,
+          0.055,
+          (placedBounds.min.z + placedBounds.max.z) / 2,
+        )
+      }
       sandboxPlacementFootprintOutline.visible = true
     }
     state.hasTarget = true
@@ -1125,6 +1745,8 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
 
   function beginSandboxModelPlacement(modelOrId) {
     if (!scene || sandboxPlacementState || placementState || indoorGroup) return false
+    // 勾绘占地只是生成前的辅助预览，进入摆放后交给模型自身的多边形占地显示。
+    clearSandboxFootprintRegion()
     const existingEntry = typeof modelOrId === 'string'
       ? [String(modelOrId), sandboxModels.get(String(modelOrId))]
       : Array.from(sandboxModels.entries()).find(([, item]) => item === modelOrId) || null
@@ -1135,8 +1757,15 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     const initialBounds = new THREE.Box3().setFromObject(model)
     if (initialBounds.isEmpty()) return false
     const size = initialBounds.getSize(new THREE.Vector3())
-    const footprintWidth = Math.max(0.25, size.x)
-    const footprintDepth = Math.max(0.25, size.z)
+    const roadFootprint = isAnyStretchableRoadModel(model)
+    // 勾绘占地（AI 生成时画的区域）：本地坐标多边形，随模型移动/旋转。
+    const rawFootprintPolygon = model.userData?.sandboxFootprintPolygon?.points
+    const footprintPolygon = Array.isArray(rawFootprintPolygon) && rawFootprintPolygon.length >= 3
+      ? rawFootprintPolygon.map(point => ({ x: Number(point.x) || 0, z: Number(point.z) || 0 }))
+      : null
+    const polygonBounds = footprintPolygon ? footprintPolygonBounds(footprintPolygon) : null
+    const footprintWidth = polygonBounds ? Math.max(0.25, polygonBounds.width) : Math.max(0.25, size.x)
+    const footprintDepth = polygonBounds ? Math.max(0.25, polygonBounds.depth) : Math.max(0.25, size.z)
     const worldBounds = getSandboxPlacementWorldBounds()
     if (footprintWidth > worldBounds.width || footprintDepth > worldBounds.depth) return false
     sandboxPlacementState = {
@@ -1151,6 +1780,9 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       originalInputMode: input?.mode || cameraRig?.mode || 'thirdPerson',
       footprintWidth,
       footprintDepth,
+      roadFootprint,
+      footprintPolygon,
+      footprintProbes: null,
       stage: 'point',
       level: 0,
       hasTarget: false,
@@ -1175,22 +1807,33 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       side: THREE.DoubleSide,
     })
     sandboxPlacementFootprint = new THREE.Mesh(
-      new THREE.PlaneGeometry(footprintWidth, footprintDepth),
+      (roadFootprint || footprintPolygon) ? new THREE.BufferGeometry() : new THREE.PlaneGeometry(footprintWidth, footprintDepth),
       footprintMaterial,
     )
-    sandboxPlacementFootprint.rotation.x = -Math.PI / 2
-    sandboxPlacementFootprint.position.y = 0.035
+    sandboxPlacementFootprint.name = 'sandbox-placement-footprint'
+    if (!roadFootprint && !footprintPolygon) {
+      sandboxPlacementFootprint.rotation.x = -Math.PI / 2
+      sandboxPlacementFootprint.position.y = 0.035
+    }
     sandboxPlacementFootprint.visible = false
     sandboxPlacementFootprint.renderOrder = 5
     scene.add(sandboxPlacementFootprint)
-    const outlineSourceGeometry = new THREE.PlaneGeometry(footprintWidth, footprintDepth)
-    const outlineGeometry = new THREE.EdgesGeometry(outlineSourceGeometry)
-    outlineSourceGeometry.dispose()
+    let outlineGeometry
+    if (roadFootprint || footprintPolygon) {
+      outlineGeometry = new THREE.BufferGeometry()
+    } else {
+      const outlineSourceGeometry = new THREE.PlaneGeometry(footprintWidth, footprintDepth)
+      outlineGeometry = new THREE.EdgesGeometry(outlineSourceGeometry)
+      outlineSourceGeometry.dispose()
+    }
     sandboxPlacementFootprintOutline = new THREE.LineSegments(outlineGeometry, new THREE.LineBasicMaterial({
       color: '#b8f5c8', transparent: true, opacity: 0.98, depthTest: false,
     }))
-    sandboxPlacementFootprintOutline.rotation.x = -Math.PI / 2
-    sandboxPlacementFootprintOutline.position.y = 0.055
+    sandboxPlacementFootprintOutline.name = 'sandbox-placement-footprint-outline'
+    if (!roadFootprint && !footprintPolygon) {
+      sandboxPlacementFootprintOutline.rotation.x = -Math.PI / 2
+      sandboxPlacementFootprintOutline.position.y = 0.055
+    }
     sandboxPlacementFootprintOutline.visible = false
     sandboxPlacementFootprintOutline.renderOrder = 1001
     scene.add(sandboxPlacementFootprintOutline)
@@ -1412,6 +2055,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     // 静态装饰 mesh 按材质合批，把数百个 draw call 降到材质数量级；部件子树受保护不参与。
     batchStaticModel(model)
     registerSandboxModelAnimation(model)
+    if (isAnyStretchableRoadModel(model)) rebuildSandboxRoadJunctions()
     selectSandboxModel(id)
     invalidateShadowMap()
     requestFrame()
@@ -1488,6 +2132,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     applySandboxEnvironmentBindings(replacement)
     batchStaticModel(replacement)
     registerSandboxModelAnimation(replacement)
+    if (isAnyStretchableRoadModel(replacement)) rebuildSandboxRoadJunctions()
     const wasSelected = sandboxSelectedModel === current
     if (wasSelected) sandboxSelectedModel = replacement
     current.parent?.remove(current)
@@ -1514,6 +2159,31 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     sandboxSelectionHelper = null
   }
 
+  // 道路选中轮廓贴合道路形状；其他模型仍用包围盒。
+  function roadOutlineY(model) {
+    const box = new THREE.Box3().setFromObject(model)
+    return Number.isFinite(box.max.y) ? box.max.y + 0.02 : 0.1
+  }
+
+  function createRoadSelectionOutline(model) {
+    const outline = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({
+      color: '#a5c9b1',
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95,
+      toneMapped: false,
+    }))
+    outline.name = 'sandbox-selection-outline'
+    outline.renderOrder = 1000
+    outline.update = () => {
+      const geometry = buildRoadFootprintOutlineGeometry(getRoadFootprint(model), roadOutlineY(model))
+      outline.geometry?.dispose?.()
+      outline.geometry = geometry
+    }
+    outline.update()
+    return outline
+  }
+
   function selectSandboxModel(id) {
     if (sandboxPlacementState && id) return false
     const model = id ? sandboxModels.get(String(id)) : null
@@ -1523,12 +2193,16 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     sandboxSelectedModel = model || null
     clearSandboxSelectionHelper()
     if (sandboxSelectedModel) {
-      sandboxSelectionHelper = new THREE.BoxHelper(sandboxSelectedModel, '#a5c9b1')
-      sandboxSelectionHelper.material.depthTest = false
-      sandboxSelectionHelper.material.transparent = true
-      sandboxSelectionHelper.material.opacity = 0.95
-      sandboxSelectionHelper.material.toneMapped = false
-      sandboxSelectionHelper.renderOrder = 1000
+      if (isAnyStretchableRoadModel(sandboxSelectedModel)) {
+        sandboxSelectionHelper = createRoadSelectionOutline(sandboxSelectedModel)
+      } else {
+        sandboxSelectionHelper = new THREE.BoxHelper(sandboxSelectedModel, '#a5c9b1')
+        sandboxSelectionHelper.material.depthTest = false
+        sandboxSelectionHelper.material.transparent = true
+        sandboxSelectionHelper.material.opacity = 0.95
+        sandboxSelectionHelper.material.toneMapped = false
+        sandboxSelectionHelper.renderOrder = 1000
+      }
       scene?.add(sandboxSelectionHelper)
     }
     // 选中与精细调整分离：单击只更新选择，不自动挂载 Gizmo，也不接管相机。
@@ -1554,7 +2228,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
 
   function setSandboxTransformMode(mode) {
     if (mode === 'road-endpoints') {
-      if (!isStretchableRoadModel(sandboxSelectedModel)) return false
+      if (!isAnyStretchableRoadModel(sandboxSelectedModel)) return false
       sandboxTransform?.detach()
       const editor = getSandboxRoadEditor()
       if (!editor?.attach(sandboxSelectedModel)) return false
@@ -1572,7 +2246,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       return true
     }
     if (!['translate', 'rotate', 'scale'].includes(mode)) return false
-    const selectedIsRoad = isStretchableRoadModel(sandboxSelectedModel)
+    const selectedIsRoad = isAnyStretchableRoadModel(sandboxSelectedModel)
     if (selectedIsRoad && mode === 'scale') return false
     if (sandboxSelectedModel) sandboxTransform?.attach(sandboxSelectedModel)
     cameraRig?.setOrbitInteractionEnabled?.(!sandboxSelectedModel)
@@ -1591,11 +2265,13 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   function removeSandboxModel(id) {
     const model = sandboxModels.get(String(id))
     if (!model || sandboxPlacementState?.model === model || activeSandboxInterior?.modelId === String(id)) return false
+    const wasRoad = isAnyStretchableRoadModel(model)
     if (sandboxSelectedModel === model) selectSandboxModel(null)
     sandboxModels.delete(String(id))
     removeSandboxModelSpatialRegistration(id)
     model.parent?.remove(model)
     disposeObjectGroup(model)
+    if (wasRoad) rebuildSandboxRoadJunctions()
     invalidateShadowMap()
     callbacks.onSandboxModelsChange?.(getSandboxModels())
     requestFrame()
@@ -1634,6 +2310,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     if (!hasValidTransformInput) return true
     model.updateMatrixWorld(true)
     refreshSandboxModelSpatial(model)
+    if (isAnyStretchableRoadModel(model)) rebuildSandboxRoadJunctions()
     if (sandboxSelectedModel === model) sandboxSelectionHelper?.update()
     invalidateShadowMap()
     requestFrame()
@@ -1849,6 +2526,606 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return { ...environmentConfig }
   }
 
+  // 天气模式：扩展后的「天气模式」下拉。只改天气相关效果（降水、云、雪、雾、光照修正），
+  // 不改时间与风力——时间归时间滑杆、风力归风力开关，避免互相覆盖。
+  // intensity（0–1）是每种天气的统一强度维度：晴天=阳光强度、多云=云量、阴天=暗度、
+  // 下雨=雨量、下雪=雪量、大雾=浓度。下雨模式进入即自动下雨，无需额外开关。
+  // 不改变沙盒存档结构（存档仍只存既有 time/weather/wind 字段）。
+  function setWeatherMode(name, intensity = 0.5) {
+    const mode = resolveWeatherMode(name, intensity)
+    weatherModeName = mode.key
+    weatherModeIntensity = mode.intensity
+    // 仅更新 weather 字段，time 与 wind 保持当前值（下雨模式自动显示雨场）
+    const environment = setEnvironment({ weather: mode.weather })
+    // 在 setEnvironment 按当前时间算出的光照基础上叠加天气修正：
+    // 阴天/雨/雾压低直射光、抬高环境漫射光，并把天空向天气色混合，避免"晴天强光 + 灰天空"的割裂。
+    if (directionalLight) directionalLight.intensity *= mode.sunScale
+    if (hemisphereLight) hemisphereLight.intensity *= mode.hemiScale
+    if (mode.skyTint && scene?.background?.isColor) {
+      scene.background = scene.background.clone().lerp(new THREE.Color(mode.skyTint), mode.skyMix)
+      if (skyRuntime) {
+        const solar = getVirtualSunState(environmentConfig.time)
+        skyRuntime.update(getSkyVisualState(solar, environmentConfig.weather, {
+          r: scene.background.r,
+          g: scene.background.g,
+          b: scene.background.b,
+        }))
+      }
+    }
+    cloudLayer?.setCloudiness(mode.cloudiness)
+    cloudLayer?.setTint(getCloudTint(environmentConfig.time))
+    snowField?.setVisible(mode.snow && !indoorGroup)
+    snowField?.setIntensity(mode.snowIntensity)
+    rainField?.setIntensity(mode.weather === 'rain' ? mode.rainIntensity : 0)
+    if (mode.fog && scene) {
+      scene.fog = new THREE.Fog(mode.fog.color, mode.fog.near, mode.fog.far)
+    }
+    invalidateShadowMap()
+    requestFrame()
+    return {
+      ...environment,
+      mode: weatherModeName,
+      intensity: weatherModeIntensity,
+      cloudiness: mode.cloudiness,
+      snow: mode.snow,
+      sunScale: mode.sunScale,
+      hemiScale: mode.hemiScale,
+    }
+  }
+
+  function getWeatherModeState() {
+    return { mode: weatherModeName, intensity: weatherModeIntensity }
+  }
+
+  function getSandboxExpandMarkerDirections() {
+    return (sandboxExpandMarkers?.children || [])
+      .filter(marker => marker.userData.expandChunk)
+      .map(marker => marker.userData.expandDirection)
+  }
+
+  function getSandboxExpandMarkers() {
+    return (sandboxExpandMarkers?.children || [])
+      .filter(marker => marker.userData.expandChunk)
+      .map(marker => ({
+        direction: marker.userData.expandDirection,
+        chunk: { ...marker.userData.expandChunk },
+      }))
+  }
+
+  // ---- 道路绘制模式：点击地面逐个生成端点，端点自动吸附已有道路，完工时自动接合 ----
+  let roadDrawingState = null
+  let sandboxFootprintDrawingState = null
+
+  function collectExistingRoadPoints() {
+    const points = []
+    for (const model of sandboxModels.values()) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      points.push(...roadPointsOf(model))
+    }
+    return points
+  }
+
+  function clearRoadDrawingPreview() {
+    if (!roadDrawingState?.preview) return
+    const preview = roadDrawingState.preview
+    preview.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.dispose?.()
+    })
+    scene?.remove(preview)
+    roadDrawingState.preview = null
+  }
+
+  function updateRoadDrawingPreview() {
+    if (!roadDrawingState) return
+    const { preview, points } = roadDrawingState
+    if (!preview) return
+    // 清空旧预览子对象
+    for (const child of [...preview.children]) {
+      preview.remove(child)
+      child.geometry?.dispose?.()
+      child.material?.dispose?.()
+    }
+    const y = 0.15
+    if (points.length >= 2) {
+      const positions = []
+      for (let index = 1; index < points.length; index += 1) {
+        positions.push(points[index - 1].x, y, points[index - 1].z, points[index].x, y, points[index].z)
+      }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      const line = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: '#8bd5a5' }))
+      line.renderOrder = 20
+      preview.add(line)
+    }
+    for (const point of points) {
+      const marker = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.35, 0.35, 0.1, 16),
+        new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+      )
+      marker.position.set(point.x, y, point.z)
+      marker.renderOrder = 20
+      preview.add(marker)
+    }
+    requestFrame()
+  }
+
+  function onRoadDrawingPointerDown(event) {
+    if (!roadDrawingState || event.button !== 0) return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    addSandboxRoadDrawingPoint(point.x, point.z)
+  }
+
+  function beginSandboxRoadDrawing(objectType) {
+    if (!isBlankSandbox || !scene) return false
+    if (!ROAD_OBJECT_TYPES.includes(objectType)) return false
+    cancelSandboxRoadDrawing()
+    sandboxRoadEditor?.detach()
+    sandboxTransform?.detach()
+    const definition = ROAD_DEFINITIONS.find(item => item.objectType === objectType)
+    if (!definition) return false
+    const preview = new THREE.Group()
+    preview.name = 'sandbox-road-drawing'
+    scene.add(preview)
+    roadDrawingState = { objectType, width: definition.width, points: [], preview }
+    renderer?.domElement?.addEventListener('pointerdown', onRoadDrawingPointerDown, true)
+    updateRoadDrawingPreview()
+    callbacks.onSandboxRoadDrawingChange?.({ active: true, objectType, points: [] })
+    return true
+  }
+
+  // 添加一个绘制端点：自动吸附到附近已有道路控制点，并限制在世界范围内。
+  function addSandboxRoadDrawingPoint(x, z) {
+    if (!roadDrawingState) return null
+    const world = getSandboxPlacementWorldBounds()
+    const clampedX = THREE.MathUtils.clamp(Number(x), world.centerX - world.width / 2, world.centerX + world.width / 2)
+    const clampedZ = THREE.MathUtils.clamp(Number(z), world.centerZ - world.depth / 2, world.centerZ + world.depth / 2)
+    if (!Number.isFinite(clampedX) || !Number.isFinite(clampedZ)) return null
+    const snapped = snapRoadPointToExisting({ x: clampedX, z: clampedZ }, collectExistingRoadPoints())
+    const point = { x: snapped.x, z: snapped.z }
+    const last = roadDrawingState.points[roadDrawingState.points.length - 1]
+    if (!last || Math.hypot(last.x - point.x, last.z - point.z) > 0.05) {
+      roadDrawingState.points.push(point)
+      updateRoadDrawingPreview()
+      callbacks.onSandboxRoadDrawingChange?.({
+        active: true,
+        objectType: roadDrawingState.objectType,
+        points: roadDrawingState.points.map(item => ({ ...item })),
+        snapped: snapped.snapped,
+      })
+    }
+    return { ...point, snapped: snapped.snapped }
+  }
+
+  function finishSandboxRoadDrawing() {
+    if (!roadDrawingState) return { ok: false, reason: 'not-drawing' }
+    const { objectType, width, points } = roadDrawingState
+    if (!areRoadPointsValid(points)) {
+      cancelSandboxRoadDrawing()
+      return { ok: false, reason: 'too-short' }
+    }
+    // 尝试与已有道路接合：新路端点与旧路端点重合时合并成一条折线。
+    let mergedId = null
+    for (const [id, model] of sandboxModels) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      const combined = mergeRoadPointSequences(roadPointsOf(model), points)
+      if (!combined || !areRoadPointsValid(combined)) continue
+      const replacement = createPolylineRoadModel(THREE, {
+        objectType: model.userData.proceduralRoad.objectType,
+        width: Number(model.userData.proceduralRoad.width),
+        points: combined,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: { x: 0, y: model.position.y, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (accepted) { mergedId = id; break }
+    }
+    if (!mergedId) {
+      const road = createPolylineRoadModel(THREE, { objectType, width, points })
+      addSandboxModel(road, { position: { x: 0, y: 0, z: 0 } })
+    }
+    cancelSandboxRoadDrawing()
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    requestFrame()
+    return { ok: true, mergedId, points: points.length }
+  }
+
+  function cancelSandboxRoadDrawing() {
+    if (!roadDrawingState) return false
+    renderer?.domElement?.removeEventListener('pointerdown', onRoadDrawingPointerDown, true)
+    clearRoadDrawingPreview()
+    roadDrawingState = null
+    callbacks.onSandboxRoadDrawingChange?.({ active: false, points: [] })
+    requestFrame()
+    return true
+  }
+
+  function getSandboxRoadDrawingState() {
+    if (!roadDrawingState) return { active: false, objectType: null, points: [] }
+    return {
+      active: true,
+      objectType: roadDrawingState.objectType,
+      width: roadDrawingState.width,
+      points: roadDrawingState.points.map(point => ({ ...point })),
+    }
+  }
+
+  // ---- 占地勾绘/编辑：画多边形 → 完成后保留，顶点与整体都能拖动 ----
+  function footprintEventTarget() {
+    return renderer?.domElement || null
+  }
+
+  function removeFootprintListeners() {
+    const target = footprintEventTarget()
+    if (!target) return
+    target.removeEventListener('pointerdown', onFootprintEditPointerDown, true)
+    target.removeEventListener('pointermove', onFootprintEditPointerMove, true)
+    target.removeEventListener('pointerup', onFootprintEditPointerUp, true)
+  }
+
+  function disposeFootprintPreview() {
+    const state = sandboxFootprintDrawingState
+    if (!state?.preview) return
+    state.preview.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.dispose?.()
+    })
+    scene?.remove(state.preview)
+    state.preview = null
+  }
+
+  function footprintEditHandles() {
+    const state = sandboxFootprintDrawingState
+    if (!state) return []
+    return [...(state.handles || []), ...(state.centerHandle ? [state.centerHandle] : [])]
+  }
+
+  function emitFootprintState() {
+    const state = sandboxFootprintDrawingState
+    callbacks.onSandboxFootprintDrawingChange?.({
+      active: Boolean(state),
+      editing: state?.phase === 'editing',
+      drawing: state?.phase === 'drawing',
+      selfIntersecting: state?.selfIntersecting === true,
+      points: state ? state.points.map(point => ({ ...point })) : [],
+    })
+  }
+
+  // 占地边界：沿多边形每条边铺一条贴地的窄带。
+  // 绘制阶段只按标点顺序连成折线（不自动收尾），完成后才连成闭合边界。
+  function footprintBoundaryPositions(points, y, halfWidth, closed) {
+    const positions = []
+    const count = points.length
+    const edgeCount = closed ? count : count - 1
+    for (let index = 0; index < edgeCount; index += 1) {
+      const a = points[index]
+      const b = points[(index + 1) % count]
+      const dx = b.x - a.x
+      const dz = b.z - a.z
+      const length = Math.hypot(dx, dz)
+      if (length < 1e-6) continue
+      const nx = (-dz / length) * halfWidth
+      const nz = (dx / length) * halfWidth
+      positions.push(a.x + nx, y, a.z + nz)
+      positions.push(b.x + nx, y, b.z + nz)
+      positions.push(b.x - nx, y, b.z - nz)
+      positions.push(a.x + nx, y, a.z + nz)
+      positions.push(b.x - nx, y, b.z - nz)
+      positions.push(a.x - nx, y, a.z - nz)
+    }
+    return positions
+  }
+
+  function updateFootprintPreview() {
+    const state = sandboxFootprintDrawingState
+    if (!state?.preview) return
+    const { preview, points } = state
+    for (const child of [...preview.children]) {
+      preview.remove(child)
+      child.geometry?.dispose?.()
+      child.material?.dispose?.()
+    }
+    state.handles = []
+    state.centerHandle = null
+    state.fillMesh = null
+    const editing = state.phase === 'editing'
+    state.selfIntersecting = editing && points.length >= 4 && polygonSelfIntersects(points)
+    const y = 0.12
+    if (editing && points.length >= 3) {
+      // 完成后才铺填充面；轮廓自交时换橙色提示
+      const positions = []
+      for (const triangle of triangulatePolygon(points)) {
+        for (const point of triangle) positions.push(point.x, 0.02, point.z)
+      }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      const fill = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+        color: state.selfIntersecting ? '#e6a06b' : '#6cc08d',
+        transparent: true,
+        opacity: 0.45,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }))
+      fill.name = 'footprint-fill'
+      fill.renderOrder = 5
+      preview.add(fill)
+      state.fillMesh = fill
+    }
+    if (points.length >= 2) {
+      // 绘制中按标点顺序连线，完成后收尾闭合
+      const boundary = footprintBoundaryPositions(points, 0.04, 0.09, editing)
+      if (boundary.length) {
+        const geometry = new THREE.BufferGeometry()
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(boundary, 3))
+        const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+          color: state.selfIntersecting ? '#e66b68' : '#46b978',
+          transparent: true,
+          opacity: 0.95,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        }))
+        mesh.name = 'footprint-boundary'
+        mesh.renderOrder = 6
+        preview.add(mesh)
+      }
+    }
+    if (editing) {
+      // 顶点手柄：拖动只改这个点
+      points.forEach((point, index) => {
+        const handle = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.28, 0.28, 0.2, 18),
+          new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+        )
+        handle.name = `footprint-vertex-handle-${index}`
+        handle.userData.footprintHandleRole = 'vertex'
+        handle.userData.index = index
+        handle.position.set(point.x, y + 0.04, point.z)
+        handle.renderOrder = 21
+        preview.add(handle)
+        state.handles.push(handle)
+      })
+      // 中心手柄：拖动整体平移
+      if (points.length >= 3) {
+        const center = polygonCentroid(points)
+        const handle = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.38, 0.38, 0.24, 22),
+          new THREE.MeshBasicMaterial({ color: '#9ad0ff' }),
+        )
+        handle.name = 'footprint-center-handle'
+        handle.userData.footprintHandleRole = 'center'
+        handle.position.set(center.x, y + 0.04, center.z)
+        handle.renderOrder = 21
+        preview.add(handle)
+        state.centerHandle = handle
+      }
+    } else {
+      for (const point of points) {
+        const marker = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.22, 0.22, 0.1, 16),
+          new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+        )
+        marker.name = 'footprint-point-marker'
+        marker.position.set(point.x, y, point.z)
+        marker.renderOrder = 20
+        preview.add(marker)
+      }
+    }
+    requestFrame()
+  }
+
+  function footprintHandleAt(event) {
+    if (!cameraRig || !renderer) return null
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return null
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const handles = footprintEditHandles()
+    const hit = raycaster.intersectObjects(handles, false)[0]
+    if (hit) return hit.object
+    // 屏幕距离兜底：手柄正中心偶尔会因浮点精度漏检
+    const pointerX = event.clientX - rect.left
+    const pointerY = event.clientY - rect.top
+    const world = new THREE.Vector3()
+    let best = null
+    let bestDistance = Infinity
+    for (const handle of handles) {
+      handle.getWorldPosition(world).project(cameraRig.camera)
+      const x = ((world.x + 1) / 2) * rect.width
+      const y = ((1 - world.y) / 2) * rect.height
+      const distance = Math.hypot(x - pointerX, y - pointerY)
+      if (distance < bestDistance) {
+        bestDistance = distance
+        best = handle
+      }
+    }
+    return bestDistance <= 12 ? best : null
+  }
+
+  function onFootprintEditPointerDown(event) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'editing' || state.drag || event.button !== 0) return
+    const handle = footprintHandleAt(event)
+    let kind = null
+    let index = 0
+    if (handle) {
+      kind = handle.userData.footprintHandleRole === 'center' ? 'center' : 'vertex'
+      index = Number(handle.userData.index) || 0
+    } else if (state.fillMesh) {
+      // 点在区域内部也能整体拖动（射线已在 footprintHandleAt 里按本次指针设置好）
+      const hit = raycaster.intersectObject(state.fillMesh, false)[0]
+      if (hit) kind = 'center'
+    }
+    if (!kind) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    const ground = getSandboxGroundPoint(event)
+    renderer.domElement.setPointerCapture?.(event.pointerId)
+    state.drag = {
+      pointerId: event.pointerId,
+      kind,
+      index,
+      startPointer: ground ? { x: ground.x, z: ground.z } : { x: 0, z: 0 },
+      basePoints: state.points.map(point => ({ ...point })),
+    }
+  }
+
+  function onFootprintEditPointerMove(event) {
+    const state = sandboxFootprintDrawingState
+    const drag = state?.drag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    const dx = point.x - drag.startPointer.x
+    const dz = point.z - drag.startPointer.z
+    state.points = drag.kind === 'center'
+      ? drag.basePoints.map(item => ({ x: item.x + dx, z: item.z + dz }))
+      : drag.basePoints.map((item, index) => (index === drag.index ? { x: item.x + dx, z: item.z + dz } : item))
+    updateFootprintPreview()
+    emitFootprintState()
+  }
+
+  function onFootprintEditPointerUp(event) {
+    const state = sandboxFootprintDrawingState
+    const drag = state?.drag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    state.drag = null
+    if (renderer?.domElement?.hasPointerCapture?.(event.pointerId)) {
+      renderer.domElement.releasePointerCapture(event.pointerId)
+    }
+    emitFootprintState()
+    requestFrame()
+  }
+
+  // 占地编辑器：直接给一个矩形区域，拖角点改形状、拖中心整体移动，
+  // 「添加断点」在最长边上插一个可拖动的点，做出缺口/凹凸（和道路端点编辑同一套手感）。
+  function beginSandboxFootprintDrawing() {
+    if (!isBlankSandbox || !scene) return false
+    clearSandboxFootprintRegion()
+    sandboxRoadEditor?.detach()
+    sandboxTransform?.detach()
+    const preview = new THREE.Group()
+    preview.name = 'sandbox-footprint-drawing'
+    scene.add(preview)
+    const world = getSandboxPlacementWorldBounds()
+    const halfWidth = 5
+    const halfDepth = 4
+    // 矩形落在当前角色/镜头附近，保证创建后立刻能在视野里看到；
+    // 没有角色位置时退回世界中心，并整体夹在可建造边界内。
+    const playerX = Number(cameraRig?.player?.x)
+    const playerZ = Number(cameraRig?.player?.z)
+    const anchorX = Number.isFinite(playerX) ? playerX : (Number.isFinite(world.centerX) ? world.centerX : 0)
+    const anchorZ = Number.isFinite(playerZ) ? playerZ : (Number.isFinite(world.centerZ) ? world.centerZ : 0)
+    const minX = world.centerX - world.width / 2 + halfWidth
+    const maxX = world.centerX + world.width / 2 - halfWidth
+    const minZ = world.centerZ - world.depth / 2 + halfDepth
+    const maxZ = world.centerZ + world.depth / 2 - halfDepth
+    const centerX = THREE.MathUtils.clamp(anchorX, Math.min(minX, maxX), Math.max(minX, maxX))
+    const centerZ = THREE.MathUtils.clamp(anchorZ, Math.min(minZ, maxZ), Math.max(minZ, maxZ))
+    const points = [
+      { x: centerX - halfWidth, z: centerZ - halfDepth },
+      { x: centerX + halfWidth, z: centerZ - halfDepth },
+      { x: centerX + halfWidth, z: centerZ + halfDepth },
+      { x: centerX - halfWidth, z: centerZ + halfDepth },
+    ]
+    sandboxFootprintDrawingState = {
+      phase: 'editing',
+      points,
+      preview,
+      handles: [],
+      centerHandle: null,
+      fillMesh: null,
+      drag: null,
+      lastBreakpointIndex: null,
+    }
+    const target = footprintEventTarget()
+    target?.addEventListener('pointerdown', onFootprintEditPointerDown, true)
+    target?.addEventListener('pointermove', onFootprintEditPointerMove, true)
+    target?.addEventListener('pointerup', onFootprintEditPointerUp, true)
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  // 在最长边的中点插入一个断点，返回是否成功。
+  function addSandboxFootprintBreakpoint() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.points.length < 3) return false
+    let bestIndex = 0
+    let bestLength = -1
+    for (let index = 0; index < state.points.length; index += 1) {
+      const a = state.points[index]
+      const b = state.points[(index + 1) % state.points.length]
+      const length = Math.hypot(b.x - a.x, b.z - a.z)
+      if (length > bestLength) {
+        bestLength = length
+        bestIndex = index
+      }
+    }
+    const a = state.points[bestIndex]
+    const b = state.points[(bestIndex + 1) % state.points.length]
+    const midpoint = { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 }
+    const insertAt = bestIndex + 1
+    state.points = [
+      ...state.points.slice(0, insertAt),
+      midpoint,
+      ...state.points.slice(insertAt),
+    ]
+    state.lastBreakpointIndex = insertAt
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  // 删除最近一次添加的断点（至少保留三个点）。
+  function removeSandboxFootprintBreakpoint() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.points.length <= 3) return false
+    const index = Number.isInteger(state.lastBreakpointIndex)
+      && state.lastBreakpointIndex >= 0
+      && state.lastBreakpointIndex < state.points.length
+      ? state.lastBreakpointIndex
+      : state.points.length - 1
+    state.points = state.points.filter((_, itemIndex) => itemIndex !== index)
+    state.lastBreakpointIndex = null
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  function clearSandboxFootprintRegion() {
+    if (!sandboxFootprintDrawingState) return false
+    removeFootprintListeners()
+    disposeFootprintPreview()
+    sandboxFootprintDrawingState = null
+    emitFootprintState()
+    requestFrame()
+    return true
+  }
+
+  function cancelSandboxFootprintDrawing() {
+    return clearSandboxFootprintRegion()
+  }
+
+  function getSandboxFootprintDrawingState() {
+    const state = sandboxFootprintDrawingState
+    if (!state) return { active: false, editing: false, points: [] }
+    return {
+      active: true,
+      editing: state.phase === 'editing',
+      points: state.points.map(point => ({ ...point })),
+    }
+  }
 
   function syncRenderQuality() {
     if (!renderer || !cameraRig) return
@@ -2253,6 +3530,16 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     rainField = createRainFieldRuntime(THREE)
     scene.add(rainField.object)
     if (cameraRig?.camera) rainField.followCamera(cameraRig.camera.position)
+    cloudLayer = createCloudLayerRuntime(THREE)
+    scene.add(cloudLayer.object)
+    cloudLayer.setCloudiness(resolveWeatherMode('clear').cloudiness)
+    if (cameraRig?.camera) {
+      cloudLayer.followCamera(cameraRig.camera.position)
+      cloudLayer.setOrientation(cameraRig.camera)
+    }
+    snowField = createSnowFieldRuntime(THREE)
+    scene.add(snowField.object)
+    if (cameraRig?.camera) snowField.followCamera(cameraRig.camera.position)
     syncRenderQuality()
 
     initializationStage = 'install-resize-observer'
@@ -3022,6 +4309,11 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     callbacks.onObjectSelected?.(null)
   }
   function onKeyDown(event) {
+    // 道路绘制：Esc 取消、Enter 完成
+    if (roadDrawingState) {
+      if (event.key === 'Escape') { cancelSandboxRoadDrawing(); return }
+      if (event.key === 'Enter') { finishSandboxRoadDrawing(); return }
+    }
     if (event.key === 'Escape' && sandboxRoadEditor?.handleEscape()) return
     if (placementState && event.key === 'Escape') { cancelGeneratedAssetPlacement(); return }
     if (placementState && ['q', 'Q', 'e', 'E'].includes(event.key)) {
@@ -3449,7 +4741,8 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       lastPlayerVisibility = playerSprite.visible
       lastPlayerY = playerSprite.position.y
       if (typeof playerSprite.userData.updateAnimation === 'function') {
-        playerSprite.userData.updateAnimation.call(playerSprite, moving, simulationTimeSeconds, animationDx, animationDz, running, gaitRate)
+        const airborne = input?.grounded === false
+        playerSprite.userData.updateAnimation.call(playerSprite, moving, simulationTimeSeconds, animationDx, animationDz, running, gaitRate, airborne)
       } else {
         campus?.userData.updatePlayerAnimation?.(moving, simulationTimeSeconds, animationDx, animationDz, gaitRate)
       }
@@ -3463,6 +4756,17 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     if (rainField) {
       rainField.update(delta, environmentConfig.wind)
       if (cameraRig?.camera) rainField.followCamera(cameraRig.camera.position)
+    }
+    if (cloudLayer) {
+      cloudLayer.update(delta, environmentConfig.wind)
+      if (cameraRig?.camera) {
+        cloudLayer.followCamera(cameraRig.camera.position)
+        cloudLayer.setOrientation(cameraRig.camera)
+      }
+    }
+    if (snowField) {
+      snowField.update(delta, environmentConfig.wind)
+      if (cameraRig?.camera) snowField.followCamera(cameraRig.camera.position)
     }
     if (windSwayTargets.length) {
       const wind = environmentConfig.wind
@@ -4089,11 +5393,77 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   function setPlayerCharacterModel(model, animations = [], metadata = {}) {
     if (!isBlankSandbox || !playerCharacterRuntime) throw new Error('当前场景不支持替换角色模型')
     const result = playerCharacterRuntime.setModel(model, animations, metadata)
+    // 外部模型接管后清空预设标记；预设装配函数会在调用后重新写回。
+    playerCharacterPresetId = null
+    playerCharacterTargetHeight = result.dimensions?.height || playerCharacterTargetHeight
     input?.setPlayerDimensions?.(result.dimensions)
     invalidateShadowMap()
     requestFrame()
     callbacks.onPlayerCharacterChange?.(result)
     return result
+  }
+
+  // 内置人物预设：与默认角色同一套人形结构与走跳动作，只换外观配色与性别体型。
+  function setPlayerCharacterPreset(presetId, options = {}) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    const preset = getPlayerPreset(presetId)
+    if (!preset) return null
+    const gender = options.gender === 'female' || options.gender === 'male'
+      ? options.gender
+      : (preset.gender || 'male')
+    const model = createPlayerPresetModel(THREE, presetId, { gender })
+    if (!model) return null
+    const height = Math.max(1.4, Math.min(2.6, Number(preset.height) || 1.8))
+    const result = setPlayerCharacterModel(model, [], {
+      assetId: 'preset:' + presetId,
+      targetHeight: height,
+      source: 'preset',
+    })
+    playerCharacterPresetId = presetId
+    playerCharacterTargetHeight = height
+    playerCharacterGender = gender
+    return result
+  }
+
+  // 性别切换：仅在当前为内置人物预设时重建；外部生成角色不改变外观。
+  function setPlayerCharacterGender(gender) {
+    if (!playerCharacterPresetId) return null
+    const presetId = playerCharacterPresetId
+    return setPlayerCharacterPreset(presetId, { gender })
+  }
+
+  // 人物微调：统一按目标身高重新装配（预设重建 / 外部角色按原始快照重挂）。
+  function setPlayerCharacterHeight(height) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    const target = Math.max(1.4, Math.min(2.6, Number(height)))
+    if (!Number.isFinite(target)) return null
+    if (playerCharacterPresetId) {
+      const presetId = playerCharacterPresetId
+      if (!getPlayerPreset(presetId)) return null
+      const model = createPlayerPresetModel(THREE, presetId)
+      if (!model) return null
+      const result = setPlayerCharacterModel(model, [], {
+        assetId: 'preset:' + presetId,
+        targetHeight: target,
+        source: 'preset',
+      })
+      playerCharacterPresetId = presetId
+      playerCharacterTargetHeight = target
+      return result
+    }
+    const snapshot = playerCharacterRuntime.serialize?.()
+    if (!snapshot) return null
+    const result = restorePlayerCharacterFromSnapshot({ ...snapshot, targetHeight: target })
+    if (result) playerCharacterTargetHeight = target
+    return result
+  }
+
+  function getPlayerCharacterPresetState() {
+    return {
+      presetId: playerCharacterPresetId,
+      targetHeight: playerCharacterTargetHeight,
+      gender: playerCharacterGender,
+    }
   }
 
   function setPlayerCharacterAnimation(state) {
@@ -4105,12 +5475,33 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
   function restorePlayerCharacterFallback() {
     const restored = playerCharacterRuntime?.restoreFallback() || false
     if (restored) {
+      playerCharacterPresetId = null
+      playerCharacterTargetHeight = 2.25
       input?.setPlayerDimensions?.(playerCharacterRuntime.getInfo().dimensions)
       invalidateShadowMap()
       requestFrame()
       callbacks.onPlayerCharacterChange?.(playerCharacterRuntime.getInfo())
     }
     return restored
+  }
+
+  // 角色存档：导出当前外部角色（默认角色返回 null），供沙盒快照持久化。
+  function serializePlayerCharacter() {
+    if (!isBlankSandbox) return null
+    return playerCharacterRuntime?.serialize?.() || null
+  }
+
+  // 从存档恢复外部角色：用 ObjectLoader 还原原始模型后按标准流程重挂。
+  function restorePlayerCharacterFromSnapshot(payload) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    if (!payload?.object) return null
+    const model = new THREE.ObjectLoader().parse(payload.object)
+    return setPlayerCharacterModel(model, [], {
+      assetId: payload.assetId || 'snapshot-character',
+      targetHeight: payload.targetHeight || 2.25,
+      source: payload.source || 'snapshot',
+      prompt: payload.prompt || null,
+    })
   }
 
   function getPlayerCharacterInfo() {
@@ -4181,6 +5572,9 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     window.removeEventListener('keydown', onKeyDown)
     sandboxRoadEditor?.dispose()
     sandboxRoadEditor = null
+    cancelSandboxRoadDrawing()
+    cancelSandboxFootprintDrawing()
+    clearSandboxExpandMarkers()
     renderer?.domElement?.removeEventListener('pointerdown', onScenePointerDown)
     renderer?.domElement?.removeEventListener('pointerup', onScenePointerUp)
     renderer?.domElement?.removeEventListener('pointerup', requestFrame)
@@ -4220,6 +5614,10 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     skyRuntime = null
     rainField?.dispose()
     rainField = null
+    cloudLayer?.dispose()
+    cloudLayer = null
+    snowField?.dispose()
+    snowField = null
     scene?.traverse((object) => {
       object.geometry?.dispose?.()
       if (Array.isArray(object.material)) object.material.forEach(disposeMaterial)
@@ -4230,5 +5628,5 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     initialized = false
   }
 
-  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterAnimation, restorePlayerCharacterFallback, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, dispose, get initialized() { return initialized } }
+  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
 }

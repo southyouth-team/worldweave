@@ -5,7 +5,9 @@ import { createCampusEngine } from './createCampusEngine.js'
 import { createCapabilityControlDocument } from '../sandbox/capabilityControl.js'
 import { createSceneAssetGeneratorRegistry } from '../world/campus/sceneAssetGeneratorRegistry.js'
 import { createBuiltinSandboxModel, listBuiltinAssets } from '../sandbox/builtinAssetAdapter.js'
-import { getRoadEndpoints } from '../sandbox/roadEndpointMath.js'
+import { createPolylineRoadModel } from '../sandbox/proceduralRoadGenerator.js'
+import { getRoadEndpoints, getRoadEdgeStations, getRoadStations, ROAD_CURVE_SUBDIVISIONS } from '../sandbox/roadEndpointMath.js'
+import { isPolylineRoadModel } from '../sandbox/roadEndpointMath.js'
 import { STATIC_BATCH_ROOT_NAME } from '../sandbox/staticModelBatcher.js'
 import { CameraRig } from '../camera/CameraRig.js'
 import { TransformControls } from 'three/addons/controls/TransformControls.js'
@@ -293,9 +295,27 @@ function findEditorChild(editor, role) {
 function getEditorHandles(editor) {
   const handles = []
   editor.traverse(object => {
-    if (Number.isInteger(object.userData.endpointIndex)) handles.push(object)
+    if (object.userData.editorRole === 'road-edge-handle') handles.push(object)
   })
-  return handles.sort((a, b) => a.userData.endpointIndex - b.userData.endpointIndex)
+  return handles.sort((a, b) => (
+    a.userData.stationIndex - b.userData.stationIndex
+    || String(a.userData.side).localeCompare(String(b.userData.side))
+  ))
+}
+
+function getEdgeHandle(editor, stationIndex, side) {
+  return getEditorHandles(editor).find(handle => (
+    handle.userData.stationIndex === stationIndex && handle.userData.side === side
+  )) || null
+}
+
+function getCenterHandle(editor, stationIndex) {
+  let match = null
+  editor.traverse(object => {
+    if (object.userData.editorRole === 'road-center-handle'
+      && object.userData.stationIndex === stationIndex) match = object
+  })
+  return match
 }
 
 function geometryIds(root) {
@@ -354,6 +374,176 @@ describe('共享程序化几何生命周期', () => {
   })
 })
 
+describe('天气模式引擎接线', () => {
+  it('setWeatherMode 切换天气但不覆盖时间与风力', () => {
+    engine.setEnvironment({ time: 20, wind: 0.7 })
+    const rain = engine.setWeatherMode('rain')
+    expect(rain.mode).toBe('rain')
+    expect(rain.weather).toBe('rain')
+    // 时间与风力保持调用前的值
+    expect(rain.time).toBe(20)
+    expect(rain.wind).toBe(0.7)
+    expect(engine.getWeatherModeState()).toEqual({ mode: 'rain', intensity: 0.5 })
+  })
+
+  it('未知模式回退晴天且不抛错', () => {
+    const result = engine.setWeatherMode('meteor-strike')
+    expect(result.mode).toBe('clear')
+    expect(engine.getWeatherModeState().mode).toBe('clear')
+  })
+
+  it('阴天/雨/雾携带光照联动系数，晴天强度控制阳光', () => {
+    const clearLow = engine.setWeatherMode('clear', 0)
+    expect(clearLow.sunScale).toBeCloseTo(0.85)
+    expect(clearLow.hemiScale).toBe(1)
+    const clearHigh = engine.setWeatherMode('clear', 1)
+    expect(clearHigh.sunScale).toBeCloseTo(1.45)
+    const overcast = engine.setWeatherMode('overcast')
+    expect(overcast.sunScale).toBeLessThan(0.3)
+    expect(overcast.hemiScale).toBeGreaterThan(1)
+    const fog = engine.setWeatherMode('fog')
+    expect(fog.sunScale).toBeLessThan(0.3)
+    expect(fog.hemiScale).toBeGreaterThan(1.2)
+  })
+
+  it('下雨模式传入强度即自动下雨，强度回传并在状态中保留', () => {
+    const rain = engine.setWeatherMode('rain', 1)
+    expect(rain.mode).toBe('rain')
+    expect(rain.weather).toBe('rain')
+    expect(rain.intensity).toBe(1)
+    expect(engine.getWeatherModeState()).toEqual({ mode: 'rain', intensity: 1 })
+
+    const lightRain = engine.setWeatherMode('rain', 0.2)
+    expect(lightRain.intensity).toBe(0.2)
+  })
+
+  it('下雪模式打开雪场，晴天关闭；云量随模式与强度变化', () => {
+    engine.setWeatherMode('snow')
+    expect(engine.getWeatherModeState().mode).toBe('snow')
+    // 晴天强度 0 → 云量 4，强度 1 → 云量 10
+    const clearLow = engine.setWeatherMode('clear', 0)
+    expect(clearLow.cloudiness).toBe(4)
+    const clearHigh = engine.setWeatherMode('clear', 1)
+    expect(clearHigh.cloudiness).toBe(10)
+  })
+})
+
+describe('玩家角色存档往返', () => {
+  it('外部角色可序列化并在新引擎中恢复，默认角色序列化为 null', async () => {
+    expect(engine.serializePlayerCharacter()).toBeNull()
+
+    const model = new THREE.Group()
+    const body = new THREE.Mesh(new THREE.BoxGeometry(0.6, 1.6, 0.4), new THREE.MeshBasicMaterial())
+    body.name = 'player-body'
+    model.add(body)
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.7, 0.2), new THREE.MeshBasicMaterial())
+    leg.name = 'player-left-leg'
+    leg.position.set(-0.2, 0.35, 0)
+    model.add(leg)
+
+    const info = engine.setPlayerCharacterModel(model, [], { assetId: 'saved-player', prompt: '测试角色' })
+    expect(info.hasExternalModel).toBe(true)
+    const snapshot = engine.serializePlayerCharacter()
+    expect(snapshot).toBeTruthy()
+    expect(snapshot.assetId).toBe('saved-player')
+    expect(snapshot.prompt).toBe('测试角色')
+
+    const target = await createCallbackEngine({})
+    try {
+      const restored = target.restorePlayerCharacterFromSnapshot(snapshot)
+      expect(restored?.assetId).toBe('saved-player')
+      expect(restored?.hasExternalModel).toBe(true)
+      expect(target.getPlayerCharacterInfo()?.assetId).toBe('saved-player')
+      // 恢复后的角色仍按原始模型重建，不叠加已绑定的骨架部件
+      expect(restored?.dimensions?.height).toBeGreaterThan(1)
+    } finally {
+      target.dispose()
+    }
+  })
+
+  it('缺少角色的存档恢复时保持默认角色', async () => {
+    expect(engine.serializePlayerCharacter()).toBeNull()
+    expect(engine.restorePlayerCharacterFromSnapshot(null)).toBeNull()
+    expect(engine.getPlayerCharacterInfo()?.assetId).toBe('builtin-placeholder')
+  })
+
+  it('人物预设可切换，并按目标身高微调', async () => {
+    const info = engine.setPlayerCharacterPreset('female')
+    expect(info?.hasExternalModel).toBe(true)
+    expect(info?.assetId).toBe('preset:female')
+    expect(info?.dimensions?.height).toBeCloseTo(1.8, 1)
+    expect(engine.getPlayerCharacterPresetState()).toMatchObject({ presetId: 'female', gender: 'female' })
+
+    const resized = engine.setPlayerCharacterHeight(1.6)
+    expect(resized?.dimensions?.height).toBeCloseTo(1.6, 1)
+    expect(engine.getPlayerCharacterPresetState()).toMatchObject({ presetId: 'female', targetHeight: 1.6 })
+
+    // 身高夹取在 1.4–2.6
+    const clamped = engine.setPlayerCharacterHeight(9)
+    expect(clamped?.dimensions?.height).toBeCloseTo(2.6, 1)
+
+    engine.restorePlayerCharacterFallback()
+    expect(engine.getPlayerCharacterPresetState().presetId).toBeNull()
+  })
+
+  it('未知预设不生效', () => {
+    expect(engine.setPlayerCharacterPreset('nope')).toBeNull()
+    expect(engine.getPlayerCharacterInfo()?.assetId).toBe('builtin-placeholder')
+  })
+
+  it('性别切换只作用于内置人物预设，状态可查询', () => {
+    expect(engine.setPlayerCharacterGender('female')).toBeNull()
+
+    const info = engine.setPlayerCharacterPreset('female')
+    expect(info?.hasExternalModel).toBe(true)
+    expect(engine.getPlayerCharacterPresetState()).toMatchObject({ presetId: 'female', gender: 'female' })
+
+    const male = engine.setPlayerCharacterGender('male')
+    expect(male?.hasExternalModel).toBe(true)
+    expect(engine.getPlayerCharacterPresetState()).toMatchObject({ presetId: 'female', gender: 'male' })
+
+    engine.restorePlayerCharacterFallback()
+    expect(engine.getPlayerCharacterPresetState().gender).toBe('male')
+  })
+})
+
+describe('地块管理中的 + 单块扩建标记', () => {
+  it('开启地块管理时初始单地块四邻各一个 +，关闭后移除', () => {
+    expect(engine.getSandboxExpandMarkers()).toEqual([])
+    expect(engine.setSandboxChunkManagement(true)).toBe(true)
+    const markers = engine.getSandboxExpandMarkers()
+    expect(markers).toHaveLength(4)
+    expect(markers.map(marker => marker.chunk.x + ':' + marker.chunk.z).sort())
+      .toEqual(['-1:0', '0:-1', '0:1', '1:0'])
+    expect(markers.map(marker => marker.direction).sort()).toEqual(['east', 'north', 'south', 'west'])
+    engine.setSandboxChunkManagement(false)
+    expect(engine.getSandboxExpandMarkers()).toEqual([])
+  })
+
+  it('addSandboxWorldChunk 只添加单块，且新地块补齐自己的 + 标记', () => {
+    engine.setSandboxChunkManagement(true)
+    const before = engine.getSandboxWorldState()
+    expect(before.chunks).toHaveLength(1)
+    expect(engine.addSandboxWorldChunk(1, 0)).toBe(true)
+    const after = engine.getSandboxWorldState()
+    expect(after.chunks).toHaveLength(2)
+    expect(after.chunks.some(chunk => chunk.x === 1 && chunk.z === 0)).toBe(true)
+    // 两块地块共 6 个空缺邻接：(-1,0) (0,1) (0,-1) (2,0) (1,1) (1,-1)
+    const markers = engine.getSandboxExpandMarkers()
+    expect(markers).toHaveLength(6)
+    const occupied = new Set(after.chunks.map(chunk => chunk.x + ':' + chunk.z))
+    for (const marker of markers) {
+      expect(occupied.has(marker.chunk.x + ':' + marker.chunk.z)).toBe(false)
+    }
+    engine.setSandboxChunkManagement(false)
+  })
+
+  it('不相邻的地块不能凭空添加', () => {
+    expect(engine.addSandboxWorldChunk(5, 5)).toBe(false)
+    expect(engine.getSandboxWorldState().chunks).toHaveLength(1)
+  })
+})
+
 describe('沙盒选址预览环境绑定', () => {
   it('总开关已关闭时，新致远楼进入选址预览就保持灯光关闭', () => {
     engine.setEnvironment({ artificialLightingEnabled: false })
@@ -379,6 +569,252 @@ describe('沙盒选址预览环境绑定', () => {
     engine.setEnvironment({ artificialLightingEnabled: true })
     expect(lights.every(light => light.intensity === 1.6)).toBe(true)
     expect(tubes.every(tube => tube.visible === true)).toBe(true)
+  })
+})
+
+describe('重新选址的占地形状', () => {
+  it('折线道路的占地轮廓贴合道路形状，并按形状判定冲突', async () => {
+    const onPlacementChange = vi.fn()
+    const callbackEngine = await createCallbackEngine({ onSandboxPlacementChange: onPlacementChange })
+    engine = callbackEngine
+    orientCameraTopDown()
+    try {
+      callbackEngine.addSandboxModel(createBatchableReplacement(), { position: { x: 0, y: 0.5, z: 12 } })
+      callbackEngine.beginSandboxRoadDrawing('asphalt-road')
+      callbackEngine.addSandboxRoadDrawingPoint(0, 0)
+      callbackEngine.addSandboxRoadDrawingPoint(16, 0)
+      callbackEngine.addSandboxRoadDrawingPoint(16, 16)
+      callbackEngine.finishSandboxRoadDrawing()
+      const roadId = callbackEngine.getSandboxModels().at(-1).id
+
+      const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+      expect(callbackEngine.beginSandboxModelPlacement(roadId)).toBe(true)
+      const added = spy.mock.calls.map(call => call[0])
+      spy.mockRestore()
+      const footprint = added.find(object => object?.name === 'sandbox-placement-footprint')
+      const outline = added.find(object => object?.name === 'sandbox-placement-footprint-outline')
+      expect(footprint).toBeTruthy()
+      expect(outline).toBeTruthy()
+
+      orientCameraTopDown()
+      dispatchPointer('pointermove', { x: 0, y: 0, z: 0 })
+      // 不是矩形平面：填充带按道路分段成三角形，轮廓也不是四条边
+      expect(footprint.geometry.attributes.position.count).toBeGreaterThan(6)
+      expect(outline.geometry.attributes.position.count / 2).toBeGreaterThan(4)
+      // 建筑在道路包围盒角落、但不在道路形状上 → 不冲突
+      expect(onPlacementChange.mock.calls.at(-1)[0]).toMatchObject({ active: true, blocked: false })
+
+      // 把道路挪到建筑上，形状真正穿过建筑 → 冲突
+      dispatchPointer('pointermove', { x: 0, y: 0, z: 12 })
+      expect(onPlacementChange.mock.calls.at(-1)[0]).toMatchObject({ blocked: true })
+    } finally {
+      callbackEngine.dispose()
+      engine = null
+    }
+  })
+
+  it('选中折线道路时选择轮廓贴合道路形状而不是包围盒', () => {
+    engine.beginSandboxRoadDrawing('asphalt-road')
+    engine.addSandboxRoadDrawingPoint(0, 0)
+    engine.addSandboxRoadDrawingPoint(16, 0)
+    engine.addSandboxRoadDrawingPoint(16, 16)
+    engine.finishSandboxRoadDrawing()
+    const roadId = engine.getSandboxModels().at(-1).id
+
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    engine.selectSandboxModel(roadId)
+    const added = spy.mock.calls.map(call => call[0])
+    spy.mockRestore()
+    const outline = added.find(object => object?.name === 'sandbox-selection-outline')
+    expect(outline).toBeTruthy()
+    expect(outline.geometry.attributes.position.count / 2).toBeGreaterThan(4)
+  })
+})
+
+describe('占地区域编辑器', () => {
+  it('直接给一个矩形区域，添加/删除断点可控（至少保留三个点）', () => {
+    expect(engine.beginSandboxFootprintDrawing()).toBe(true)
+    const state = engine.getSandboxFootprintDrawingState()
+    expect(state).toMatchObject({ active: true, editing: true })
+    expect(state.points).toHaveLength(4)
+    const xs = state.points.map(point => point.x)
+    const zs = state.points.map(point => point.z)
+    expect(Math.max(...xs) - Math.min(...xs)).toBeCloseTo(10, 5)
+    expect(Math.max(...zs) - Math.min(...zs)).toBeCloseTo(8, 5)
+
+    expect(engine.addSandboxFootprintBreakpoint()).toBe(true)
+    const withBreakpoint = engine.getSandboxFootprintDrawingState().points
+    expect(withBreakpoint).toHaveLength(5)
+    // 断点插在最长边的中点
+    let expectedMidpoint = null
+    let longest = -1
+    for (let index = 0; index < state.points.length; index += 1) {
+      const a = state.points[index]
+      const b = state.points[(index + 1) % state.points.length]
+      const length = Math.hypot(b.x - a.x, b.z - a.z)
+      if (length > longest) {
+        longest = length
+        expectedMidpoint = { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 }
+      }
+    }
+    expect(withBreakpoint[1]).toEqual(expectedMidpoint)
+    expect(engine.removeSandboxFootprintBreakpoint()).toBe(true)
+    expect(engine.getSandboxFootprintDrawingState().points).toHaveLength(4)
+
+    expect(engine.removeSandboxFootprintBreakpoint()).toBe(true) // 4 → 3
+    expect(engine.removeSandboxFootprintBreakpoint()).toBe(false) // 三个点保底
+  })
+
+  it('拖顶点只改该点，拖中心整体平移', () => {
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    engine.beginSandboxFootprintDrawing()
+    const initialPoints = engine.getSandboxFootprintDrawingState().points.map(point => ({ ...point }))
+    const preview = spy.mock.calls.map(call => call[0]).find(object => object?.name === 'sandbox-footprint-drawing')
+    spy.mockRestore()
+    expect(preview).toBeTruthy()
+
+    const collectVertexHandles = () => {
+      const handles = []
+      preview.traverse(object => {
+        if (object.userData?.footprintHandleRole === 'vertex') handles.push(object)
+      })
+      return handles.sort((a, b) => a.userData.index - b.userData.index)
+    }
+    const vertexHandles = collectVertexHandles()
+    expect(vertexHandles).toHaveLength(4)
+    const vertex = vertexHandles[1]
+    const start = vertex.getWorldPosition(new THREE.Vector3())
+    dispatchPointer('pointerdown', start)
+    dispatchPointer('pointermove', { x: start.x + 2, y: 0, z: start.z + 3 })
+    dispatchPointer('pointerup', { x: start.x + 2, y: 0, z: start.z + 3 })
+
+    let region = engine.getSandboxFootprintDrawingState()
+    expect(region.points[1].x).toBeCloseTo(start.x + 2, 1)
+    expect(region.points[1].z).toBeCloseTo(start.z + 3, 1)
+    expect(region.points[0]).toEqual(initialPoints[0])
+
+    // 拖动顶点后手柄会重建，重新取中心手柄
+    let centerHandle = null
+    preview.traverse(object => {
+      if (object.userData?.footprintHandleRole === 'center') centerHandle = object
+    })
+    expect(centerHandle).toBeTruthy()
+    const centerStart = centerHandle.getWorldPosition(new THREE.Vector3())
+    const before = region.points.map(point => ({ ...point }))
+    dispatchPointer('pointerdown', centerStart)
+    dispatchPointer('pointermove', { x: centerStart.x + 1.5, y: 0, z: centerStart.z + 1 })
+    dispatchPointer('pointerup', { x: centerStart.x + 1.5, y: 0, z: centerStart.z + 1 })
+    region = engine.getSandboxFootprintDrawingState()
+    before.forEach((point, index) => {
+      expect(region.points[index].x).toBeCloseTo(point.x + 1.5, 1)
+      expect(region.points[index].z).toBeCloseTo(point.z + 1, 1)
+    })
+  })
+
+  it('加断点后拖出凹口；轮廓自交时边界标红', () => {
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    engine.beginSandboxFootprintDrawing()
+    const preview = spy.mock.calls.map(call => call[0]).find(object => object?.name === 'sandbox-footprint-drawing')
+    spy.mockRestore()
+    engine.addSandboxFootprintBreakpoint()
+
+    let handle = null
+    preview.traverse(object => {
+      if (object.userData?.footprintHandleRole === 'vertex' && object.userData.index === 1) handle = object
+    })
+    expect(handle).toBeTruthy()
+    const start = handle.getWorldPosition(new THREE.Vector3())
+    dispatchPointer('pointerdown', start)
+    dispatchPointer('pointermove', { x: start.x, y: 0, z: start.z + 9 })
+    dispatchPointer('pointerup', { x: start.x, y: 0, z: start.z + 9 })
+
+    expect(engine.getSandboxFootprintDrawingState().points[1].z).toBeCloseTo(start.z + 9, 1)
+    expect(preview.getObjectByName('footprint-boundary').material.color.getHexString()).toBe('e66b68')
+  })
+
+  it('点在区域内部拖动也能整体移动', () => {
+    engine.beginSandboxFootprintDrawing()
+    const before = engine.getSandboxFootprintDrawingState().points.map(point => ({ ...point }))
+    const center = {
+      x: before.reduce((sum, point) => sum + point.x, 0) / before.length,
+      z: before.reduce((sum, point) => sum + point.z, 0) / before.length,
+    }
+    // 矩形中心偏 (2,1)，在区域内部且避开中心手柄与角点
+    dispatchPointer('pointerdown', { x: center.x + 2, y: 0, z: center.z + 1 })
+    dispatchPointer('pointermove', { x: center.x + 4, y: 0, z: center.z + 2 })
+    dispatchPointer('pointerup', { x: center.x + 4, y: 0, z: center.z + 2 })
+    const after = engine.getSandboxFootprintDrawingState().points
+    before.forEach((point, index) => {
+      expect(after[index].x).toBeCloseTo(point.x + 2, 1)
+      expect(after[index].z).toBeCloseTo(point.z + 1, 1)
+    })
+  })
+
+  it('清除区域会移除多边形预览与手柄', () => {
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    engine.beginSandboxFootprintDrawing()
+    const preview = spy.mock.calls.map(call => call[0]).find(object => object?.name === 'sandbox-footprint-drawing')
+    spy.mockRestore()
+    expect(engine.clearSandboxFootprintRegion()).toBe(true)
+    expect(engine.getSandboxFootprintDrawingState()).toMatchObject({ active: false, points: [] })
+    expect(preview.parent).toBeNull()
+  })
+})
+
+describe('勾绘占地的摆放预览', () => {
+  it('带勾绘多边形占地时，摆放预览按多边形生成并作为冲突探针', () => {
+    const model = createBatchableReplacement()
+    model.userData.sandboxFootprintPolygon = {
+      mode: 'space',
+      points: [
+        { x: -5, z: -5 }, { x: 5, z: -5 }, { x: 5, z: 0 },
+        { x: -2, z: 0 }, { x: -2, z: 5 }, { x: -5, z: 5 },
+      ],
+    }
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    expect(engine.beginSandboxModelPlacement(model)).toBe(true)
+    const added = spy.mock.calls.map(call => call[0])
+    spy.mockRestore()
+    const footprint = added.find(object => object?.name === 'sandbox-placement-footprint')
+    const outline = added.find(object => object?.name === 'sandbox-placement-footprint-outline')
+    expect(footprint).toBeTruthy()
+    expect(outline).toBeTruthy()
+
+    orientCameraTopDown()
+    dispatchPointer('pointermove', { x: 0, y: 0, z: 0 })
+    // L 形 6 个顶点 → 4 个三角形 → 12 个顶点；矩形平面只有 6 个
+    expect(footprint.geometry.attributes.position.count).toBe(12)
+    expect(outline.geometry.attributes.position.count / 2).toBe(6)
+    footprint.updateMatrixWorld(true)
+    const bounds = new THREE.Box3().setFromObject(footprint)
+    expect(bounds.max.x - bounds.min.x).toBeCloseTo(10, 1)
+    expect(bounds.max.z - bounds.min.z).toBeCloseTo(10, 1)
+  })
+})
+
+describe('道路路口拼接面', () => {
+  it('两条道路交叠时生成路口面，删掉其中一条后消失', () => {
+    const spy = vi.spyOn(THREE.Scene.prototype, 'add')
+    const firstId = engine.addSandboxModel(createRoad(20), { position: { x: 0, y: 0, z: 0 } })
+    const group = spy.mock.calls.map(call => call[0]).find(object => object?.name === 'sandbox-road-junctions')
+    spy.mockRestore()
+    expect(firstId).toBeTruthy()
+    expect(group).toBeTruthy()
+    expect(group.children).toHaveLength(0)
+
+    const secondId = engine.addSandboxModel(createPolylineRoadModel(THREE, {
+      objectType: 'asphalt-road',
+      width: 4,
+      points: [{ x: 0, z: -10 }, { x: 0, z: 10 }],
+    }), { position: { x: 0, y: 0, z: 0 } })
+
+    expect(group.children.length).toBeGreaterThan(0)
+    expect(group.children[0].name).toBe('road-junction-patch')
+    expect(group.children[0].geometry.getAttribute('position').count).toBeGreaterThan(0)
+
+    engine.removeSandboxModel(secondId)
+    expect(group.children).toHaveLength(0)
+    expect(engine.getSandboxModel(firstId)).toBeTruthy()
   })
 })
 
@@ -789,8 +1225,104 @@ describe('11-07 道路前幸存快照恢复门控（仅当 recovered 目录存�
   })
 })
 
-describe('道路端点编辑器', () => {
-  it('仅选中的有效道路可进入，并在两个世界端点生成编辑器手柄', () => {
+describe('多端点折线道路', () => {
+  it('添加断点把直线道路一次升级为四个控制点，删除后回到直线', () => {
+    const id = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
+    expect(isPolylineRoadModel(engine.getSandboxModel(id))).toBe(false)
+
+    expect(engine.addSandboxRoadPoint(id)).toBe(true)
+    const polyline = engine.getSandboxModel(id)
+    expect(isPolylineRoadModel(polyline)).toBe(true)
+    expect(polyline.userData.proceduralRoad.points).toHaveLength(4)
+
+    expect(engine.removeSandboxRoadPoint(id)).toBe(true)
+    expect(isPolylineRoadModel(engine.getSandboxModel(id))).toBe(true)
+    expect(engine.removeSandboxRoadPoint(id)).toBe(true)
+    const straight = engine.getSandboxModel(id)
+    expect(straight.userData.proceduralRoad.version).toBe(1)
+    expect(straight.userData.proceduralRoad.length).toBeGreaterThan(2)
+  })
+
+  it('边缘拖宽后的道路加断点保持路缘形状，不会跳回居中对称', () => {
+    const road = createPolylineRoadModel(THREE, {
+      objectType: 'asphalt-road',
+      width: 9,
+      points: [
+        { lx: -6, lz: 3, rx: -6, rz: -3 },
+        { lx: 6, lz: 6, rx: 6, rz: -3 },
+      ],
+    })
+    const id = engine.addSandboxModel(road, { position: { x: 0, y: 0.04, z: 0 } })
+    expect(engine.addSandboxRoadPoint(id)).toBe(true)
+    const next = engine.getSandboxModel(id)
+    expect(isPolylineRoadModel(next)).toBe(true)
+    const points = next.userData.proceduralRoad.points
+    expect(points).toHaveLength(4)
+    // 内部断点按左右路缘分别插值：lz 依次为 4、5，右缘保持 -3
+    expect(points[1].lz).toBeCloseTo(4, 5)
+    expect(points[1].rx).toBeCloseTo(points[1].lx, 5)
+    expect(points[2].lz).toBeCloseTo(5, 5)
+    expect(points.every(point => Math.abs(point.rz + 3) < 1e-6)).toBe(true)
+  })
+
+  it('折线可继续添加断点，非道路模型不可添加', () => {
+    const id = engine.addSandboxModel(createRoad(20), { position: { x: 0, y: 0.04, z: 0 } })
+    expect(engine.addSandboxRoadPoint(id)).toBe(true)
+    expect(engine.getSandboxModel(id).userData.proceduralRoad.points).toHaveLength(4)
+    expect(engine.addSandboxRoadPoint(id)).toBe(true)
+    expect(engine.getSandboxModel(id).userData.proceduralRoad.points).toHaveLength(5)
+
+    const buildingId = engine.addSandboxModel(createZhiyuanModel())
+    expect(engine.addSandboxRoadPoint(buildingId)).toBe(false)
+    expect(engine.removeSandboxRoadPoint(buildingId)).toBe(false)
+  })
+})
+
+describe('道路绘制模式', () => {
+  it('点击生成端点并创建折线道路', () => {
+    expect(engine.beginSandboxRoadDrawing('stone-path')).toBe(true)
+    expect(engine.getSandboxRoadDrawingState()).toMatchObject({ active: true, objectType: 'stone-path' })
+    engine.addSandboxRoadDrawingPoint(0, 0)
+    engine.addSandboxRoadDrawingPoint(10, 0)
+    engine.addSandboxRoadDrawingPoint(10, 10)
+    const result = engine.finishSandboxRoadDrawing()
+    expect(result.ok).toBe(true)
+    const roads = engine.getSandboxModels()
+    expect(roads).toHaveLength(1)
+    const model = engine.getSandboxModel(roads[0].id)
+    expect(isPolylineRoadModel(model)).toBe(true)
+    expect(model.userData.proceduralRoad.points).toHaveLength(3)
+    expect(engine.getSandboxRoadDrawingState().active).toBe(false)
+  })
+
+  it('新路端点接上已有道路时自动合并成一条', () => {
+    engine.beginSandboxRoadDrawing('asphalt-road')
+    engine.addSandboxRoadDrawingPoint(0, 0)
+    engine.addSandboxRoadDrawingPoint(10, 0)
+    engine.finishSandboxRoadDrawing()
+    expect(engine.getSandboxModels()).toHaveLength(1)
+
+    engine.beginSandboxRoadDrawing('asphalt-road')
+    engine.addSandboxRoadDrawingPoint(10.4, 0.2)
+    engine.addSandboxRoadDrawingPoint(10, 10)
+    const result = engine.finishSandboxRoadDrawing()
+    expect(result.ok).toBe(true)
+    expect(engine.getSandboxModels()).toHaveLength(1)
+    const model = engine.getSandboxModel(engine.getSandboxModels()[0].id)
+    expect(model.userData.proceduralRoad.points).toHaveLength(3)
+  })
+
+  it('取消绘制不产生模型', () => {
+    engine.beginSandboxRoadDrawing('concrete-road')
+    engine.addSandboxRoadDrawingPoint(0, 0)
+    engine.cancelSandboxRoadDrawing()
+    expect(engine.getSandboxRoadDrawingState().active).toBe(false)
+    expect(engine.getSandboxModels()).toHaveLength(0)
+  })
+})
+
+describe('道路端点编辑器（边缘手柄）', () => {
+  it('选中道路进入端点模式：直线道路给出四个边缘手柄，非道路不能进入', () => {
     expect(engine.setSandboxTransformMode('road-endpoints')).toBe(false)
 
     const buildingId = engine.addSandboxModel(createZhiyuanModel())
@@ -800,7 +1332,6 @@ describe('道路端点编辑器', () => {
 
     const id = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     const road = engine.getSandboxModel(id)
-    const expectedEndpoints = getRoadEndpoints(road)
     const detachCount = TransformControls.active.detachCount
     const { ok, editor } = enterRoadEndpointMode()
 
@@ -813,130 +1344,197 @@ describe('道路端点编辑器', () => {
     expect(road.children).not.toContain(editor)
 
     const handles = getEditorHandles(editor)
-    expect(handles.map(handle => handle.userData.endpointIndex)).toEqual([0, 1])
-    handles.forEach((handle, index) => {
-      expect(handle.getWorldPosition(new THREE.Vector3()).toArray())
-        .toEqual([expectedEndpoints[index].x, expectedEndpoints[index].y, expectedEndpoints[index].z])
-    })
+    expect(handles).toHaveLength(4)
+    expect(handles.map(handle => handle.userData.stationIndex + ':' + handle.userData.side))
+      .toEqual(['0:left', '0:right', '1:left', '1:right'])
+    // 路长 12、宽 6、沿 +x：四个手柄落在 (±6, ±3) 的路缘
+    for (const handle of handles) {
+      const position = handle.getWorldPosition(new THREE.Vector3())
+      expect(Math.abs(Math.abs(position.x) - 6)).toBeLessThan(0.01)
+      expect(Math.abs(Math.abs(position.z) - 3)).toBeLessThan(0.01)
+    }
+    expect(findEditorChild(editor, 'road-edit-proxy')).toBeTruthy()
     expect(JSON.stringify(road.toJSON())).not.toContain('_sandboxRoadEditor')
 
     delete road.userData.proceduralRoad
     expect(engine.setSandboxTransformMode('road-endpoints')).toBe(false)
   })
 
-  it('拖动手柄时固定端和正式道路不变，合法松手只提交一次并重建为正确长度、中心和朝向', async () => {
+  it('拖动边缘手柄：对面边缘固定，松手提交宽度与形状变化', async () => {
     const onRoadEditChange = vi.fn()
     const onModelsChange = vi.fn()
-    const onModelSelected = vi.fn()
     const callbackEngine = await createCallbackEngine({
       onSandboxRoadEditChange: onRoadEditChange,
       onSandboxModelsChange: onModelsChange,
-      onSandboxModelSelected: onModelSelected,
     })
     engine = callbackEngine
     orientCameraTopDown()
     try {
       const id = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
       const road = engine.getSandboxModel(id)
-      const originalTransform = {
-        position: road.position.toArray(),
-        rotation: road.rotation.toArray().slice(0, 3),
-        scale: road.scale.toArray(),
-      }
-      const originalGeometries = geometryIds(road)
       const { editor } = enterRoadEndpointMode()
-      const handles = getEditorHandles(editor)
-      const fixedEnd = handles[0].getWorldPosition(new THREE.Vector3())
-      const selectionCalls = onModelSelected.mock.calls.length
+      const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-      dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
+      dispatchPointer('pointerdown', handle)
       expect(activeDomElement().hasPointerCapture(1)).toBe(true)
-      expect(onModelSelected.mock.calls.length).toBe(selectionCalls)
-      dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
-
       expect(road.visible).toBe(false)
-      expect(road.position.toArray()).toEqual(originalTransform.position)
-      expect(road.rotation.toArray().slice(0, 3)).toEqual(originalTransform.rotation)
-      expect(road.scale.toArray()).toEqual(originalTransform.scale)
-      expect(geometryIds(road)).toEqual(originalGeometries)
-      expect(handles[0].getWorldPosition(new THREE.Vector3()).toArray())
-        .toEqual([fixedEnd.x, fixedEnd.y, fixedEnd.z])
+      dispatchPointer('pointermove', { x: 6, y: 0, z: 6 })
 
       const proxy = findEditorChild(editor, 'road-edit-proxy')
       proxy.updateMatrixWorld(true)
+      // 预览是随控制点连续变形的路面带：x 仍跨 12，z 覆盖固定边 -3 到被拉动的 6
       const previewBounds = new THREE.Box3().setFromObject(proxy)
-      expect(previewBounds.getSize(new THREE.Vector3()).x).toBeCloseTo(26, 5)
-      expect(previewBounds.getSize(new THREE.Vector3()).z).toBeCloseTo(6, 5)
-      expect(previewBounds.getCenter(new THREE.Vector3()).x).toBeCloseTo(7, 5)
+      expect(previewBounds.min.z).toBeCloseTo(-3, 1)
+      expect(previewBounds.max.z).toBeCloseTo(6, 1)
+      expect(previewBounds.max.x - previewBounds.min.x).toBeCloseTo(12, 1)
       expect(editPhases(onRoadEditChange)).toContain('dragging')
-      expect(onRoadEditChange.mock.calls.map(call => call[0]).filter(payload => payload.phase === 'dragging').at(-1))
-        .toMatchObject({ id, length: 26, active: true, reason: null })
 
-      dispatchPointer('pointerup', { x: 20, y: 0, z: 0 })
+      dispatchPointer('pointerup', { x: 6, y: 0, z: 6 })
       expect(activeDomElement().hasPointerCapture(1)).toBe(false)
-      // 添加模型触发一次；合法道路提交只应再触发一次 replace 对应的模型列表回调。
-      expect(onModelsChange.mock.calls.length).toBe(2)
-      expect(onRoadEditChange.mock.calls.map(call => call[0]).at(-1)).toMatchObject({
-        phase: 'committed', id, length: 26, active: false, reason: null,
-      })
+      expect(onRoadEditChange.mock.calls.map(call => call[0]).at(-1)).toMatchObject({ phase: 'committed', id })
 
       const replaced = engine.getSandboxModel(id)
       expect(replaced).not.toBe(road)
-      expect(road.parent).toBeNull()
-      expect(replaced.userData.proceduralRoad).toMatchObject({ length: 26, width: 6 })
-      expect(replaced.position.toArray()).toEqual([7, 0.04, 0])
-      expect(replaced.rotation.toArray().slice(0, 3)).toEqual([0, 0, 0])
-      expect(replaced.scale.toArray()).toEqual([1, 1, 1])
-      replaced.updateMatrixWorld(true)
-      const endpoints = getRoadEndpoints(replaced)
-      expect(endpoints[0].toArray()).toEqual([-6, 0.04, 0])
-      expect(endpoints[1].toArray()).toEqual([20, 0.04, 0])
-
-      const sceneGeometries = new Set()
-      editor.parent.traverse(object => {
-        if (object.isMesh && object.geometry) sceneGeometries.add(object.geometry.uuid)
-      })
-      expect(originalGeometries.every(geometryId => !sceneGeometries.has(geometryId))).toBe(true)
-      expect(JSON.stringify(engine.serializeSandboxModel(id))).not.toContain('_sandboxRoadEditor')
-      expect(editor.parent).not.toBeNull()
-      expect(getEditorHandles(editor).map(handle => handle.userData.endpointIndex)).toEqual([0, 1])
+      expect(replaced.userData.proceduralRoad.width).toBeCloseTo(9, 1)
+      // 对面边缘 (6,-3) 固定：控制点中心被拉到 (6, 1.5)
+      const stations = getRoadStations(replaced)
+      expect(stations[0].x).toBeCloseTo(-6, 1)
+      expect(stations[1].x).toBeCloseTo(6, 1)
+      expect(stations[1].z).toBeCloseTo(1.5, 1)
+      expect(stations[1].hw).toBeCloseTo(4.5, 1)
+      const freshEditor = enterRoadEndpointMode().editor
+      expect(getEditorHandles(freshEditor)).toHaveLength(4)
     } finally {
       callbackEngine.dispose()
       engine = null
     }
   })
 
-  it('与其他模型重叠时代理标红，松手不会替换正式道路', () => {
+  it('拖动中心手柄整体移动控制截面，宽度保持不变', () => {
+    const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
+    const road = engine.getSandboxModel(roadId)
+    const { editor } = enterRoadEndpointMode()
+    const center = getCenterHandle(editor, 1)
+    expect(center).toBeTruthy()
+    const start = center.getWorldPosition(new THREE.Vector3())
+    expect(start.x).toBeCloseTo(6, 5)
+    expect(start.z).toBeCloseTo(0, 5)
+
+    dispatchPointer('pointerdown', start)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 4 })
+    dispatchPointer('pointerup', { x: 6, y: 0, z: 4 })
+
+    const replaced = engine.getSandboxModel(roadId)
+    expect(replaced).not.toBe(road)
+    const edges = getRoadEdgeStations(replaced)
+    expect(edges[0].left.z).toBeCloseTo(3, 5)
+    expect(edges[0].right.z).toBeCloseTo(-3, 5)
+    expect(edges[1].left.z).toBeCloseTo(7, 5)
+    expect(edges[1].right.z).toBeCloseTo(1, 5)
+    expect(getRoadStations(replaced)[1].hw).toBeCloseTo(3, 5)
+  })
+
+  it('开始加断点后点击道路上的位置，只插入一个断点在点击处', () => {
+    const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
+    const { editor } = enterRoadEndpointMode()
+    expect(engine.beginSandboxRoadBreakpointPick()).toBe(true)
+    dispatchPointer('pointerdown', { x: 2, y: 0, z: 0 })
+
+    const replaced = engine.getSandboxModel(roadId)
+    const stations = getRoadStations(replaced)
+    expect(stations).toHaveLength(3)
+    expect(stations[1].x).toBeCloseTo(2, 0)
+    expect(stations[1].hw).toBeCloseTo(3, 5)
+    expect(editPhases(onRoadEditChange)).toContain('breakpoint-added')
+    expect(editor.parent).toBeNull()
+    const freshEditor = enterRoadEndpointMode().editor
+    expect(freshEditor.parent).not.toBeNull()
+  })
+
+  it('折线道路的端点预览按曲线细分，与正式道路包围盒一致（所见即所得）', () => {
+    engine.beginSandboxRoadDrawing('asphalt-road')
+    engine.addSandboxRoadDrawingPoint(0, 0)
+    engine.addSandboxRoadDrawingPoint(12, 0)
+    engine.addSandboxRoadDrawingPoint(12, 12)
+    engine.finishSandboxRoadDrawing()
+    const roadId = engine.getSandboxModels()[0].id
+    const road = engine.getSandboxModel(roadId)
+    const roadBounds = new THREE.Box3().setFromObject(road)
+
+    const { editor } = enterRoadEndpointMode()
+    expect(getEditorHandles(editor)).toHaveLength(6)
+    expect(findEditorChild(editor, 'road-edit-guides')).toBeTruthy()
+    const proxy = findEditorChild(editor, 'road-edit-proxy')
+    // 两段控制边，每段细分 ROAD_CURVE_SUBDIVISIONS 段，每段 6 个顶点
+    expect(proxy.geometry.attributes.position.count / 6).toBe(2 * ROAD_CURVE_SUBDIVISIONS)
+    proxy.updateMatrixWorld(true)
+    const previewBounds = new THREE.Box3().setFromObject(proxy)
+    expect(previewBounds.min.x).toBeCloseTo(roadBounds.min.x, 1)
+    expect(previewBounds.max.x).toBeCloseTo(roadBounds.max.x, 1)
+    expect(previewBounds.min.z).toBeCloseTo(roadBounds.min.z, 1)
+    expect(previewBounds.max.z).toBeCloseTo(roadBounds.max.z, 1)
+  })
+
+  it('两点道路的拉伸提交保持预览形状，边缘点不按中心线重算', () => {
+    const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
+    const { editor } = enterRoadEndpointMode()
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
+
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 6 })
+    const proxy = findEditorChild(editor, 'road-edit-proxy')
+    proxy.updateMatrixWorld(true)
+    const previewBounds = new THREE.Box3().setFromObject(proxy).clone()
+    dispatchPointer('pointerup', { x: 6, y: 0, z: 6 })
+
+    const replaced = engine.getSandboxModel(roadId)
+    const edges = getRoadEdgeStations(replaced)
+    // 拖动过的左缘角点停在 (6,6)，对面边缘 (6,-3) 与起点两端保持不动
+    expect(edges[1].left.x).toBeCloseTo(6, 5)
+    expect(edges[1].left.z).toBeCloseTo(6, 5)
+    expect(edges[1].right.x).toBeCloseTo(6, 5)
+    expect(edges[1].right.z).toBeCloseTo(-3, 5)
+    expect(edges[0].left.z).toBeCloseTo(3, 5)
+    expect(edges[0].right.z).toBeCloseTo(-3, 5)
+    // 提交后的包围盒与预览一致
+    replaced.updateMatrixWorld(true)
+    const committedBounds = new THREE.Box3().setFromObject(replaced)
+    expect(committedBounds.min.z).toBeCloseTo(previewBounds.min.z, 1)
+    expect(committedBounds.max.z).toBeCloseTo(previewBounds.max.z, 1)
+  })
+
+  it('附近有模型也允许拉伸：重叠不再阻止提交，松手后形状生效', () => {
     const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     engine.addSandboxModel(createBatchableReplacement(), { position: { x: 10, y: 0.5, z: 0 } })
     const road = engine.getSandboxModel(roadId)
     engine.selectSandboxModel(roadId)
     const { editor } = enterRoadEndpointMode()
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 10, y: 0, z: 8 })
     const proxy = findEditorChild(editor, 'road-edit-proxy')
-    const blocked = onRoadEditChange.mock.calls.map(call => call[0]).find(payload => payload.phase === 'blocked')
+    expect(proxy.material.color.getHexString()).toBe('8bd5a5')
+    expect(editPhases(onRoadEditChange)).not.toContain('blocked')
 
-    expect(blocked).toMatchObject({ id: roadId, active: true })
-    expect(blocked.reason).toBeTruthy()
-    expect(proxy.material.color.getHexString()).toBe('e66b68')
-
-    dispatchPointer('pointerup', { x: 20, y: 0, z: 0 })
-    expect(engine.getSandboxModel(roadId)).toBe(road)
-    expect(road.visible).toBe(true)
-    expect(road.userData.proceduralRoad.length).toBe(12)
-    expect(editPhases(onRoadEditChange)).not.toContain('committed')
-    expect(editor.parent).not.toBeNull()
+    dispatchPointer('pointerup', { x: 10, y: 0, z: 8 })
+    expect(editPhases(onRoadEditChange)).toContain('committed')
+    const replaced = engine.getSandboxModel(roadId)
+    expect(replaced).not.toBe(road)
+    expect(replaced.userData.proceduralRoad.width).toBeGreaterThan(10)
+    expect(replaced.visible).toBe(true)
+    const freshEditor = enterRoadEndpointMode().editor
+    expect(freshEditor.parent).not.toBeNull()
   })
 
-  it('超出世界边界或覆盖已回收区块时拒绝提交', () => {
+  it('超出世界边界时拒绝提交', () => {
     const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     const { editor } = enterRoadEndpointMode()
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 100, y: 0, z: 0 })
-    dispatchPointer('pointerup', { x: 100, y: 0, z: 0 })
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 400, y: 0, z: 0 })
+    dispatchPointer('pointerup', { x: 400, y: 0, z: 0 })
 
     expect(editPhases(onRoadEditChange)).toContain('blocked')
     expect(editPhases(onRoadEditChange)).not.toContain('committed')
@@ -944,55 +1542,40 @@ describe('道路端点编辑器', () => {
     expect(editor.parent).not.toBeNull()
   })
 
-  it('长路跨越已回收的内部区块时返回 occupied 原因且不保存', () => {
-    expect(engine.expandSandboxWorld('east', 2)).toBe(true)
-    expect(engine.removeSandboxWorldChunk(1, 0).ok).toBe(true)
+  it('拖进已回收地块时返回 occupied 原因且不保存', () => {
+    expect(engine.expandSandboxWorld('south', 2)).toBe(true)
+    expect(engine.removeSandboxWorldChunk(0, 1).ok).toBe(true)
     const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     const { editor } = enterRoadEndpointMode()
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 100, y: 0, z: 0 })
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 80 })
 
     const blocked = onRoadEditChange.mock.calls.map(call => call[0]).find(payload => payload.phase === 'blocked')
     expect(blocked.reason).toBe('该位置包含已回收的地块')
-    dispatchPointer('pointerup', { x: 100, y: 0, z: 0 })
-    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.length).toBe(12)
-    expect(editor.parent).not.toBeNull()
+    dispatchPointer('pointerup', { x: 6, y: 0, z: 80 })
+    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.width).toBe(6)
   })
 
-  it('端面相接允许，面积搭接和斜向保守 AABB 重叠均拒绝', () => {
+  it('端面相接允许提交到另一条路', () => {
     const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     engine.addSandboxModel(createRoad(12), { position: { x: 24, y: 0.04, z: 0 } })
     engine.selectSandboxModel(roadId)
-    let entry = enterRoadEndpointMode()
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 18, y: 0, z: 0 })
-    dispatchPointer('pointerup', { x: 18, y: 0, z: 0 })
-    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.length).toBe(24)
-    expect(entry.editor.parent).not.toBeNull()
-    engine.setSandboxTransformMode('browse')
+    const { editor } = enterRoadEndpointMode()
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-    engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 10 } })
-    engine.selectSandboxModel(roadId)
-    entry = enterRoadEndpointMode()
-    dispatchPointer('pointerdown', { x: -6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 0, y: 0, z: 20 })
-    dispatchPointer('pointerup', { x: 0, y: 0, z: 20 })
-    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.length).toBe(24)
-    expect(entry.editor.parent).not.toBeNull()
-    engine.setSandboxTransformMode('browse')
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 18, y: 0, z: 3 })
+    dispatchPointer('pointerup', { x: 18, y: 0, z: 3 })
 
-    const diagonalId = engine.addSandboxModel(createRoad(12), { position: { x: 26, y: 0.04, z: 6 } })
-    const diagonal = engine.getSandboxModel(diagonalId)
-    diagonal.rotation.y = Math.PI / 4
-    diagonal.updateMatrixWorld(true)
-    engine.selectSandboxModel(roadId)
-    entry = enterRoadEndpointMode()
-    dispatchPointer('pointerdown', { x: 18, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
-    dispatchPointer('pointerup', { x: 20, y: 0, z: 0 })
-    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.length).toBe(24)
-    expect(entry.editor.parent).not.toBeNull()
+    expect(editPhases(onRoadEditChange)).toContain('committed')
+    const stations = getRoadStations(engine.getSandboxModel(roadId))
+    expect(stations).toHaveLength(2)
+    expect(stations[1].x).toBeCloseTo(12, 1)
+    expect(stations[1].hw).toBeGreaterThan(4)
+    const freshEditor = enterRoadEndpointMode().editor
+    expect(freshEditor.parent).not.toBeNull()
   })
 
   it.each(['escape', 'pointercancel', 'lostpointercapture'])('%s 取消拖动并恢复正式道路，不产生提交', (cancelType) => {
@@ -1000,19 +1583,21 @@ describe('道路端点编辑器', () => {
     const road = engine.getSandboxModel(roadId)
     const { editor } = enterRoadEndpointMode()
     const proxy = findEditorChild(editor, 'road-edit-proxy')
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
 
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 8 })
     expect(activeDomElement().hasPointerCapture(1)).toBe(true)
 
     if (cancelType === 'escape') {
       globalThis.window.dispatchEvent({ type: 'keydown', key: 'Escape' })
     } else {
-      dispatchPointer(cancelType, { x: 20, y: 0, z: 0 })
+      dispatchPointer(cancelType, { x: 6, y: 0, z: 8 })
     }
 
     expect(road.visible).toBe(true)
     expect(road.userData.proceduralRoad.length).toBe(12)
+    expect(road.userData.proceduralRoad.width).toBe(6)
     expect(activeDomElement().hasPointerCapture(1)).toBe(false)
     expect(proxy.visible).toBe(false)
     expect(editPhases(onRoadEditChange)).not.toContain('committed')
@@ -1034,50 +1619,23 @@ describe('道路端点编辑器', () => {
   it('射线与地面无交点时保留最后一个有效预览，并可按该预览提交', () => {
     const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
     const { editor } = enterRoadEndpointMode()
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
+    const handle = getEdgeHandle(editor, 1, 'left').getWorldPosition(new THREE.Vector3())
+
+    dispatchPointer('pointerdown', handle)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 6 })
     const proxy = findEditorChild(editor, 'road-edit-proxy')
     proxy.updateMatrixWorld(true)
     const lastBounds = new THREE.Box3().setFromObject(proxy).clone()
 
     orientCameraHorizontal()
-    dispatchPointer('pointermove', { x: 25, y: 0, z: 0 })
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 10 })
     proxy.updateMatrixWorld(true)
     expect(new THREE.Box3().setFromObject(proxy).equals(lastBounds)).toBe(true)
     expect(Number.isFinite(proxy.position.x)).toBe(true)
 
     orientCameraTopDown()
-    dispatchPointer('pointerup', { x: 20, y: 0, z: 0 })
-    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.length).toBe(26)
-  })
-
-  it('道路通用 gizmo 拒绝 scale，translate 仅 XZ，rotate 仅 Y；普通模型恢复三轴', () => {
-    const roadId = engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
-
-    expect(engine.setSandboxTransformMode('scale')).toBe(false)
-    expect(TransformControls.active.mode).not.toBe('scale')
-
-    expect(engine.setSandboxTransformMode('translate')).toBe(true)
-    expect(TransformControls.active.mode).toBe('translate')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, false, true])
-
-    expect(engine.setSandboxTransformMode('rotate')).toBe(true)
-    expect(TransformControls.active.mode).toBe('rotate')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([false, true, false])
-
-    engine.setSandboxTransformMode('browse')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
-    engine.selectSandboxModel(null)
-
-    const buildingId = engine.addSandboxModel(createZhiyuanModel())
-    expect(engine.getSandboxModel(buildingId)).toBeTruthy()
-    engine.setSandboxTransformMode('translate')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
-    engine.setSandboxTransformMode('rotate')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
-    engine.setSandboxTransformMode('scale')
-    expect(TransformControls.active.mode).toBe('scale')
-    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
+    dispatchPointer('pointerup', { x: 6, y: 0, z: 6 })
+    expect(engine.getSandboxModel(roadId).userData.proceduralRoad.width).toBeCloseTo(9, 1)
   })
 
   it('模式切换、切换选中、删除和 dispose 清理编辑器监听器、手柄、代理和指针捕获', () => {
@@ -1105,8 +1663,9 @@ describe('道路端点编辑器', () => {
     expect(thirdEntry.ok).toBe(false)
     engine.selectSandboxModel(roadId)
     const third = enterRoadEndpointMode().editor
-    dispatchPointer('pointerdown', { x: 6, y: 0.1, z: 0 })
-    dispatchPointer('pointermove', { x: 20, y: 0, z: 0 })
+    const thirdHandle = getEdgeHandle(third, 1, 'left').getWorldPosition(new THREE.Vector3())
+    dispatchPointer('pointerdown', thirdHandle)
+    dispatchPointer('pointermove', { x: 6, y: 0, z: 8 })
     expect(dom.hasPointerCapture(1)).toBe(true)
     expect(engine.removeSandboxModel(roadId)).toBe(true)
     expect(dom.hasPointerCapture(1)).toBe(false)
@@ -1122,5 +1681,35 @@ describe('道路端点编辑器', () => {
     expect(fourth.parent).toBeNull()
     pointerTypes.forEach(type => expect(dom.listenerCount(type)).toBe(0))
     expect(globalThis.window.listenerCount('keydown')).toBe(0)
+  })
+})
+
+describe('道路通用 gizmo 轴限制', () => {
+  it('道路拒绝 scale，translate 仅 XZ，rotate 仅 Y；普通模型恢复三轴', () => {
+    engine.addSandboxModel(createRoad(12), { position: { x: 0, y: 0.04, z: 0 } })
+
+    expect(engine.setSandboxTransformMode('scale')).toBe(false)
+    expect(TransformControls.active.mode).not.toBe('scale')
+
+    expect(engine.setSandboxTransformMode('translate')).toBe(true)
+    expect(TransformControls.active.mode).toBe('translate')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, false, true])
+
+    expect(engine.setSandboxTransformMode('rotate')).toBe(true)
+    expect(TransformControls.active.mode).toBe('rotate')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([false, true, false])
+
+    engine.setSandboxTransformMode('browse')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
+    engine.selectSandboxModel(null)
+
+    engine.addSandboxModel(createZhiyuanModel())
+    engine.setSandboxTransformMode('translate')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
+    engine.setSandboxTransformMode('rotate')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
+    engine.setSandboxTransformMode('scale')
+    expect(TransformControls.active.mode).toBe('scale')
+    expect([TransformControls.active.showX, TransformControls.active.showY, TransformControls.active.showZ]).toEqual([true, true, true])
   })
 })

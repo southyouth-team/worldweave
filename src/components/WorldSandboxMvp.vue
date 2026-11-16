@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef } from 'vue'
 import * as THREE from 'three'
 import { createCampusEngine } from '../three/engine/createCampusEngine.js'
 import { executeProceduralModel } from '../three/sandbox/executeProceduralModel.js'
@@ -15,10 +15,18 @@ import {
   createRoadEditPersistence,
   getSelectedModelState,
   groupBuiltinAssetsByCategory,
-  isStretchableRoadModel,
   listBuiltinAssets,
 } from './sandbox/assetLibraryUi.js'
 import ProceduralModelEditor from './ProceduralModelEditor.vue'
+import { WEATHER_MODES } from '../three/engine/weatherRuntime.js'
+import { analyzeHumanoidModel, buildHumanoidRetryPrompt } from '../three/sandbox/humanoidValidation.js'
+import { captureModelViews } from '../three/sandbox/visualQcCapture.js'
+import { buildComparisonSheet } from '../three/sandbox/comparisonSheet.js'
+import { applyTextPlates, getPartTextSpec, updateTextPlate } from '../three/sandbox/textPlateRuntime.js'
+import { PLAYER_PRESETS } from '../three/characters/playerPresets.js'
+import { isAnyStretchableRoadModel, isPolylineRoadModel } from '../three/sandbox/roadEndpointMath.js'
+import { localizePolygon, polygonBounds } from '../three/sandbox/footprintPolygon.js'
+import { buildFootprintPromptSuffix } from './sandbox/footprintPrompt.js'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api/v1'
 const DEV_USER_ID = import.meta.env.VITE_DEV_USER_ID || 'map-editor-local'
@@ -28,6 +36,7 @@ const selectedName = ref('')
 const selectedEditable = ref(false)
 const selectedCanArchive = ref(false)
 const selectedIsRoad = ref(false)
+const selectedIsPolylineRoad = ref(false)
 const precisionModeActive = ref(false)
 const objects = ref([])
 const command = ref('')
@@ -35,6 +44,15 @@ const aiPrompt = ref('')
 const referenceImageDataUrl = ref('')
 const referenceImageName = ref('')
 const aiBusy = ref(false)
+// 生成模型前在地块上勾绘的占地：none / area（底面贴合）/ space（空间占据）
+const footprintRegionMode = ref('none')
+const footprintPoints = ref([])
+const footprintSelfIntersecting = ref(false)
+const footprintSizeLabel = computed(() => {
+  if (footprintPoints.value.length < 3) return ''
+  const bounds = polygonBounds(footprintPoints.value)
+  return `${bounds.width.toFixed(1)} × ${bounds.depth.toFixed(1)} m`
+})
 const characterPrompt = ref('一名完整的现代风格 3D 游戏角色，人体比例自然，包含头部、躯干、双臂、双腿、手掌和鞋子，适合第三人称视角观察')
 const characterBusy = ref(false)
 // Three.js Object3D must remain raw; deep Vue proxies violate Three.js property invariants.
@@ -45,6 +63,8 @@ const isDraftModel = ref(false)
 const generationProgress = ref([])
 const editBusy = ref(false)
 const editError = ref('')
+// AI 建模对话记录：跟着模型的 userData 走，随沙盒存档保存
+const modelChatMessages = ref([])
 const editHistory = ref([])
 const message = ref('正在初始化空白沙盒…')
 const playerWaterState = ref(null)
@@ -66,11 +86,24 @@ function selectSandboxViewMode(mode) {
   sandboxViewMode.value = mode
 }
 const STORAGE_KEY = 'world-sandbox-mvp:workspace:v1'
+// 人物模型独立存档：与沙盒场景分开，可单独保存/恢复/删除，不随沙盒一起被覆盖。
+const PLAYER_STORAGE_KEY = 'world-sandbox-mvp:player-character:v1'
 const time = ref(14)
 const timeEnabled = ref(true)
 const weather = ref('clear')
 const weatherEnabled = ref(true)
-const rainEnabled = ref(true)
+const weatherModes = WEATHER_MODES
+// 天气强度（0–100）：晴天=阳光强度、多云=云量、阴天=暗度、下雨=雨量、下雪=雪量、大雾=浓度
+const weatherIntensity = ref(50)
+const weatherIntensityLabel = computed(
+  () => WEATHER_MODES[weather.value]?.intensityLabel || '强度',
+)
+// 天气模式只切换天气本身（降水/云/雪/雾/光照修正），不改时间与风力。
+// 下雨模式进入即自动下雨，强度滑杆控制雨量。
+function applyWeatherMode() {
+  engine?.setWeatherMode?.(weather.value, Number(weatherIntensity.value) / 100)
+  message.value = '天气模式已切换为「' + (WEATHER_MODES[weather.value]?.label || weather.value) + '」'
+}
 const wind = ref(20)
 const windEnabled = ref(true)
 let sandboxWindDirection = { x: 1, z: 0 }
@@ -108,7 +141,8 @@ function syncObjects() {
   const selectionState = getSelectedModelState(selected)
   selectedEditable.value = selectionState.editable
   selectedCanArchive.value = selectionState.canArchive
-  selectedIsRoad.value = isStretchableRoadModel(selected)
+  selectedIsRoad.value = isAnyStretchableRoadModel(selected)
+  selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
 }
 function handleModelSelected(payload) {
   selected = payload?.id ? engine?.getSandboxModel?.(payload.id) || null : null
@@ -117,7 +151,8 @@ function handleModelSelected(payload) {
   const selectionState = getSelectedModelState(selected)
   selectedEditable.value = selectionState.editable
   selectedCanArchive.value = selectionState.canArchive
-  selectedIsRoad.value = isStretchableRoadModel(selected)
+  selectedIsRoad.value = isAnyStretchableRoadModel(selected)
+  selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
   precisionModeActive.value = false
 }
 function registerModel(root, name, position = null) {
@@ -310,9 +345,84 @@ function deleteSelected() {
   objectsById.delete(id)
   selected = null
   selectedIsRoad.value = false
+  selectedIsPolylineRoad.value = false
   precisionModeActive.value = false
   syncObjects()
   message.value = '已删除模型组'
+}
+
+// ---- 生成模型前划定占地：矩形起步，拖角点/加断点改形状（和道路端点编辑同一套手感） ----
+function handleFootprintDrawingChange(payload) {
+  footprintPoints.value = Array.isArray(payload?.points) ? payload.points : []
+  footprintSelfIntersecting.value = payload?.selfIntersecting === true
+}
+
+function startFootprintDrawing() {
+  if (footprintRegionMode.value === 'none') {
+    footprintRegionMode.value = 'area'
+  }
+  if (engine?.beginSandboxFootprintDrawing?.()) {
+    footprintPoints.value = engine.getSandboxFootprintDrawingState?.().points || []
+    message.value = '已创建矩形占地：拖黄色角点改形状，拖蓝色中心整体移动；「添加断点」可拖出凹凸'
+  } else {
+    message.value = '无法创建占地：请先关闭选址或精细调整'
+  }
+}
+
+function addFootprintBreakpoint() {
+  if (engine?.addSandboxFootprintBreakpoint?.()) {
+    message.value = '已在最长边上加断点：拖动新出现的黄色点做出凹凸'
+  }
+}
+
+function removeFootprintBreakpoint() {
+  if (engine?.removeSandboxFootprintBreakpoint?.()) {
+    message.value = '已删除最近的断点'
+  } else {
+    message.value = '至少保留三个点，不能再删'
+  }
+}
+
+function clearFootprint() {
+  engine?.clearSandboxFootprintRegion?.()
+  footprintPoints.value = []
+  footprintSelfIntersecting.value = false
+}
+
+// ---- 道路断点：点击道路上的位置加一个断点；中心手柄整段平移，角手柄调宽度 ----
+function addSelectedRoadPoint() {
+  const id = selected?.userData?.sandboxModelId
+  if (!id) return
+  if (engine?.beginSandboxRoadBreakpointPick?.()) {
+    message.value = '点击道路上要加断点的位置（一次只加一个点）；Esc 取消'
+    return
+  }
+  // 不在端点模式时退回自动插入（最长段中点）
+  const ok = engine?.addSandboxRoadPoint?.(id)
+  if (ok) {
+    selected = engine.getSandboxModel(id)
+    selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
+    message.value = '已添加断点：拖动任意控制点调整道路形状'
+    saveSandbox()
+    syncObjects()
+  } else {
+    message.value = '添加断点失败'
+  }
+}
+
+function removeSelectedRoadPoint() {
+  const id = selected?.userData?.sandboxModelId
+  if (!id) return
+  const ok = engine?.removeSandboxRoadPoint?.(id)
+  if (ok) {
+    selected = engine.getSandboxModel(id)
+    selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
+    message.value = '已删除最后一个断点'
+    saveSandbox()
+    syncObjects()
+  } else {
+    message.value = '删除断点失败'
+  }
 }
 function duplicateSelected() {
   if (!selected) return
@@ -365,7 +475,7 @@ function updateGenerationProgress(event) {
   generationProgress.value = next
 }
 
-async function runModelVisualQualityControl(originalPrompt) {
+async function runModelVisualQualityControl(originalPrompt, options = {}) {
   updateGenerationProgress({
     stage: 'visual-inspection',
     label: 'AI 多视角视觉质量检测',
@@ -378,6 +488,39 @@ async function runModelVisualQualityControl(originalPrompt) {
     if (!Array.isArray(screenshots) || screenshots.length < 3) {
       throw new Error('无法从模型预览采集足够的多视角截图')
     }
+    // 复检基线：修改前那一版的截图。首次质检没有基线，才把用户参考图当目标。
+    let baselineScreenshots = Array.isArray(options?.baselineScreenshots) && options.baselineScreenshots.length
+      ? options.baselineScreenshots.map(shot => ({ ...shot }))
+      : null
+    let includeReferenceImage = options?.includeReferenceImage !== false && !baselineScreenshots
+    // 编辑请求可携带临时参考图（粘贴/选择），优先于创建时的参考图
+    const reviewReferenceImage = options?.referenceImageDataUrl || referenceImageDataUrl.value || ''
+    // 单张对比表评审：参考图 + 多个渲染视角合成一张带标签的图；画布不可用时退回多张截图
+    const buildReviewPayload = async () => {
+      try {
+        const sheet = await buildComparisonSheet(screenshots, {
+          referenceImageDataUrl: includeReferenceImage ? reviewReferenceImage : '',
+          title: includeReferenceImage ? '视觉质检：参考图 + 渲染视角' : '视觉质检：渲染视角',
+        })
+        if (sheet) return { screenshots: [{ label: 'comparison-sheet', imageDataUrl: sheet }], reference: undefined }
+      } catch {
+        // 退回多张截图
+      }
+      return {
+        screenshots,
+        reference: includeReferenceImage ? (reviewReferenceImage || undefined) : undefined,
+      }
+    }
+    const buildBaselinePayload = async () => {
+      if (!baselineScreenshots) return undefined
+      try {
+        const sheet = await buildComparisonSheet(baselineScreenshots, { title: '修改前基线' })
+        if (sheet) return [{ label: 'baseline-comparison-sheet', imageDataUrl: sheet }]
+      } catch {
+        // 退回原基线截图
+      }
+      return baselineScreenshots
+    }
     let latestReport = null
     for (let round = 0; round <= 2; round += 1) {
       const current = editingModel.value
@@ -385,24 +528,34 @@ async function runModelVisualQualityControl(originalPrompt) {
       updateGenerationProgress({
         stage: 'visual-inspection',
         label: round === 0 ? 'AI 视觉质量检测' : `第 ${round} 轮修正后复检`,
-        detail: `正在分析 ${screenshots.length} 个实际渲染视角`,
+        detail: `正在分析 ${screenshots.length} 个实际渲染视角${baselineScreenshots ? '，并与修改前的基线对比' : ''}`,
         status: 'active',
       })
+      const reviewPayload = await buildReviewPayload()
+      const baselinePayload = await buildBaselinePayload()
       const inspectResponse = await fetch(API_BASE + '/assets/ai-image/inspect-procedural-object', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
         body: JSON.stringify({
           prompt: originalPrompt,
           objectType: current.userData.proceduralModelConfig?.objectType || '独立 3D 模型',
-          referenceImageDataUrl: referenceImageDataUrl.value || undefined,
-          screenshots,
+          referenceImageDataUrl: reviewPayload.reference,
+          screenshots: reviewPayload.screenshots,
           geometryDiagnostics: current.userData.proceduralModelGeometryDiagnostics || null,
+          footprint: current.userData.sandboxFootprintPolygon
+            ? {
+                mode: current.userData.sandboxFootprintPolygon.mode,
+                points: current.userData.sandboxFootprintPolygon.points,
+              }
+            : undefined,
+          baselineScreenshots: baselinePayload,
         }),
       })
       const inspectBody = await inspectResponse.json().catch(() => ({}))
       if (!inspectResponse.ok) throw new Error(inspectBody.message || 'AI 视觉质量检测失败：HTTP ' + inspectResponse.status)
       latestReport = inspectBody.data || inspectBody.result || inspectBody
       current.userData.proceduralModelVisualQuality = latestReport
+      appendModelChat('assistant', '', { type: 'visual-qc', round, report: latestReport })
       if (latestReport.passed === true) {
         updateGenerationProgress({
           stage: 'visual-inspection',
@@ -430,6 +583,7 @@ async function runModelVisualQualityControl(originalPrompt) {
         detail: actionable.map(item => item.issue).join('；').slice(0, 500),
         status: 'active',
       })
+      appendModelChat('assistant', `自动修正（第 ${round + 1} 轮）：` + actionable.map(item => item.issue).join('；').slice(0, 500), { type: 'repair', round: round + 1 })
       const instruction = [
         '这是自动视觉质检后的定向修复。请根据以下可观察问题做最小必要修改，不要整体重建模型，不要修改无关部件，保留模型身份、现有稳定 componentId、参数、能力声明和交互结构。',
         ...actionable.map((item, index) => `${index + 1}. [${item.componentId || '整体模型'}] ${item.issue}。修复要求：${item.repairInstruction}`),
@@ -467,6 +621,9 @@ async function runModelVisualQualityControl(originalPrompt) {
       await nextTick()
       const refreshed = await proceduralModelEditorRef.value?.captureVisualViews?.()
       if (!Array.isArray(refreshed) || refreshed.length < 3) throw new Error('自动修正后无法重新采集视觉截图')
+      // 下一轮复检以“修正前”的这一版截图为基线，并且不再依赖用户参考图
+      baselineScreenshots = screenshots.map(shot => ({ ...shot }))
+      includeReferenceImage = false
       screenshots.splice(0, screenshots.length, ...refreshed)
     }
     if (editingModel.value && latestReport) editingModel.value.userData.proceduralModelVisualQuality = latestReport
@@ -478,6 +635,7 @@ async function runModelVisualQualityControl(originalPrompt) {
       detail: error?.message || '视觉检测服务异常',
       status: 'failed',
     })
+    appendModelChat('assistant', '视觉质检未完成：' + (error?.message || '视觉检测服务异常'), { type: 'stage' })
     return null
   }
 }
@@ -543,9 +701,394 @@ async function runModelCollisionQualityControl() {
   return false
 }
 
+// ---- 分阶段生成（借鉴 img2threejs）：体块 → 结构 → 材质，每阶段一次视觉门禁 ----
+const stagedGenerationEnabled = ref(true)
+const STAGED_MODEL_OBJECT_TYPE = '独立 3D 模型'
+
+async function requestProceduralModel({ prompt, objectType, imageDataUrl, stage }) {
+  const response = await fetch(API_BASE + '/assets/ai-image/generate-procedural-object-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+    body: JSON.stringify({
+      prompt,
+      objectType,
+      visualStyle: 'stylized',
+      imageDataUrl: imageDataUrl || undefined,
+      stage: stage || undefined,
+    }),
+  })
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => ({}))
+    throw new Error(payload.message || '模型生成失败：HTTP ' + response.status)
+  }
+  let buffer = ''
+  let result = null
+  let completed = false
+  const decoder = new TextDecoder()
+  const processEvent = event => {
+    if (!event || typeof event.type !== 'string') return
+    if (event.type === 'stage') {
+      updateGenerationProgress({
+        stage: event.stage,
+        label: event.label || event.stage,
+        detail: event.detail || '',
+        status: event.status || 'active',
+      })
+    } else if (event.type === 'single') {
+      result = event.result
+    } else if (event.type === 'error') {
+      throw new Error(event.message || '模型生成失败')
+    } else if (event.type === 'complete') {
+      completed = true
+    }
+  }
+  const reader = response.body.getReader()
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (line) processEvent(JSON.parse(line))
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) processEvent(JSON.parse(buffer.trim()))
+  if (!completed || !result?.generatedCode) throw new Error('模型生成事件流提前结束，未收到完整模型源码')
+  return result
+}
+
+async function requestProceduralModification({ source, instruction, objectType, parameters = [], parameterValues = {}, parts = [], environmentBindings = [], modelCapabilityManifest = null, referenceImageDataUrl = '' }) {
+  const response = await fetch(API_BASE + '/assets/ai-image/modify-procedural-object', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+    body: JSON.stringify({
+      source,
+      parameters,
+      parameterValues,
+      parts,
+      environmentBindings,
+      modelCapabilityManifest,
+      geometryDiagnostics: null,
+      selectedPartId: '',
+      instruction,
+      objectType,
+      referenceImageDataUrl: referenceImageDataUrl || undefined,
+    }),
+  })
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(body.message || 'AI 修改失败：HTTP ' + response.status)
+  const result = body.data || body.result || body
+  if (!result?.generatedCode) throw new Error('AI 修改没有返回完整源码')
+  return result
+}
+
+async function inspectStagedModel({ model, stageLabel, stageRubric, originalPrompt, footprint }) {
+  const screenshots = await captureModelViews(THREE, model)
+  let reviewScreenshots = screenshots
+  try {
+    const sheet = await buildComparisonSheet(screenshots, {
+      referenceImageDataUrl: referenceImageDataUrl.value || '',
+      title: '阶段质检：' + stageLabel,
+    })
+    if (sheet) reviewScreenshots = [{ label: 'comparison-sheet', imageDataUrl: sheet }]
+  } catch {
+    // 退回多张截图
+  }
+  const response = await fetch(API_BASE + '/assets/ai-image/inspect-procedural-object', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+    body: JSON.stringify({
+      prompt: '【阶段：' + stageLabel + '】' + stageRubric + String.fromCharCode(10) + '原始需求：' + (originalPrompt || ''),
+      objectType: STAGED_MODEL_OBJECT_TYPE,
+      screenshots: reviewScreenshots,
+      footprint: footprint || undefined,
+    }),
+  })
+  const body = await response.json().catch(() => ({}))
+  if (!response.ok) throw new Error(body.message || '阶段视觉质检失败：HTTP ' + response.status)
+  return { report: body.data || body.result || body, screenshots }
+}
+
+async function repairStagedModel({ source, report, stageLabel, objectType, extraInstruction }) {
+  const actionable = (report?.issues || []).filter(item =>
+    ['critical', 'major'].includes(item.severity) && item.repairInstruction,
+  )
+  if (!actionable.length && !extraInstruction) return null
+  const instruction = [
+    '这是' + stageLabel + '阶段的视觉质检定向修复。只做最小必要修改，不要整体重建模型，不要修改无关部件，保持现有部件 id 与结构。',
+    ...actionable.map((item, index) => `${index + 1}. [${item.componentId || '整体模型'}] ${item.issue}。修复要求：${item.repairInstruction}`),
+    extraInstruction ? ('补充硬性修复要求：' + extraInstruction) : '',
+  ].filter(Boolean).join(String.fromCharCode(10))
+  const result = await requestProceduralModification({ source, instruction, objectType })
+  return result.generatedCode
+}
+
+// 确定性几何门禁：拦“零厚度平面充当建筑”这类视觉质检已经多次发现的问题
+function describeGeometryProblem(model) {
+  const box = new THREE.Box3().setFromObject(model)
+  const size = box.getSize(new THREE.Vector3())
+  if (![size.x, size.y, size.z].every(Number.isFinite) || size.lengthSq() === 0) {
+    return '模型没有可见几何'
+  }
+  const horizontal = [size.x, size.z].filter(value => value > 0)
+  if (horizontal.length < 2) return '模型缺少水平方向的体量'
+  const minHorizontal = Math.min(...horizontal)
+  const maxHorizontal = Math.max(...horizontal)
+  if (minHorizontal < 0.3 || minHorizontal / maxHorizontal < 0.08) {
+    return `模型平面进深过薄（${minHorizontal.toFixed(2)} m），是零厚度平面而不是有体量的建筑；必须用闭合实体体块，保证两个水平方向都有足够进深，禁止用薄板或单面充当墙体`
+  }
+  return null
+}
+
+// 从需求里提取需要渲染的文字（引号内文字或“XX楼/院/馆/门”这类命名）
+function extractRequestedText(prompt) {
+  const found = new Set()
+  const quoted = prompt.match(/[「『“"']([^「」『』“”"']{1,20})[」』”"']/g) || []
+  for (const item of quoted) found.add(item.replace(/^[「『“"']|[」』”"']$/g, ''))
+  const named = prompt.match(/[一-龥]{2,8}(?=楼|院|馆|门|堂|阁|塔|校)/g) || []
+  for (const item of named) found.add(item)
+  return [...found].filter(Boolean).slice(0, 5)
+}
+
+async function runStagedModelGeneration({ prompt, generationPrompt, objectType, useFootprint, footprintLocal }) {
+  const footprint = useFootprint ? { mode: footprintRegionMode.value, points: footprintLocal.points.map(point => ({ ...point })) } : undefined
+  const requestedTexts = extractRequestedText(prompt)
+  const attachFootprint = model => {
+    if (footprint) model.userData.sandboxFootprintPolygon = { mode: footprint.mode, points: footprint.points.map(point => ({ ...point })) }
+  }
+  let stageIndex = 0
+  const reviewStage = async (model, label, rubric) => {
+    try {
+      updateGenerationProgress({ stage: 'stage-review', label: label + '：视觉质检', detail: '采集 4 视角并送视觉模型', status: 'active' })
+      const { report } = await inspectStagedModel({ model, stageLabel: label, stageRubric: rubric, originalPrompt: prompt, footprint })
+      appendModelChat('assistant', '', { type: 'visual-qc', round: stageIndex, report, stageLabel: label })
+      updateGenerationProgress({
+        stage: 'stage-review',
+        label: label + '：视觉质检' + (report?.passed ? '通过' : '未通过'),
+        detail: `评分 ${report?.score}/100${report?.summary ? '：' + report.summary : ''}`.slice(0, 400),
+        status: report?.passed ? 'done' : 'failed',
+      })
+      return report
+    } catch (error) {
+      updateGenerationProgress({
+        stage: 'stage-review',
+        label: label + '：视觉质检未完成',
+        detail: (error?.message || '视觉质检服务异常').slice(0, 300),
+        status: 'failed',
+      })
+      appendModelChat('assistant', label + '视觉质检未完成：' + (error?.message || '服务异常'), { type: 'stage' })
+      return null
+    }
+  }
+
+  // 阶段 1/3：体块
+  updateGenerationProgress({ stage: 'blockout', label: '阶段 1/3：生成体块', detail: '只生成体块与占地，先过视觉门禁', status: 'active' })
+  const blockout = await requestProceduralModel({
+    prompt: generationPrompt,
+    objectType,
+    imageDataUrl: referenceImageDataUrl.value || undefined,
+    stage: 'blockout',
+  })
+  let source = blockout.generatedCode
+  const draftSpec = blockout.draftSpec || null
+  let model = await executeProceduralModel(source, { timeoutMs: 60000 })
+  attachFootprint(model)
+  if (draftSpec) {
+    appendModelChat('assistant', `结构规划：${draftSpec.parts?.length || 0} 个部件，尺寸 ${draftSpec.dimensions?.width}×${draftSpec.dimensions?.height}×${draftSpec.dimensions?.depth} m`, { type: 'stage' })
+  }
+  // 确定性几何门禁：零厚度平面直接触发定向修复，不再只靠视觉模型判断
+  const geometryProblem = describeGeometryProblem(model)
+  if (geometryProblem) {
+    updateGenerationProgress({ stage: 'blockout', label: '体块几何门禁未通过', detail: geometryProblem.slice(0, 200), status: 'failed' })
+    appendModelChat('assistant', '体块几何门禁未通过：' + geometryProblem, { type: 'stage' })
+    const repaired = await repairStagedModel({
+      source,
+      report: null,
+      stageLabel: '体块',
+      objectType,
+      extraInstruction: geometryProblem + '。体块必须是闭合实体（Box/ExtrudeGeometry 等），两个水平方向都要有真实尺寸。',
+    })
+    if (repaired) {
+      source = repaired
+      model = await executeProceduralModel(source, { timeoutMs: 60000 })
+      attachFootprint(model)
+    }
+  }
+  let report = await reviewStage(model, '体块', '评估体块轮廓、比例、占地是否与描述一致；忽略材质细节和线脚。')
+  if (report?.passed !== true) {
+    const repaired = await repairStagedModel({ source, report, stageLabel: '体块', objectType })
+    if (repaired) {
+      source = repaired
+      model = await executeProceduralModel(source, { timeoutMs: 60000 })
+      attachFootprint(model)
+      report = await reviewStage(model, '体块复检', '评估体块轮廓、比例、占地是否与描述一致；忽略材质细节和线脚。')
+    }
+  }
+
+  // 阶段 2/3：结构
+  stageIndex = 1
+  updateGenerationProgress({ stage: 'structure', label: '阶段 2/3：补充结构', detail: '保持体块不变，补齐墙体、窗带、屋顶和入口', status: 'active' })
+  const partList = draftSpec?.parts?.length
+    ? draftSpec.parts.map(part => part.id + '(' + part.role + ')').join('、')
+    : '墙体、横向窗带、屋顶女儿墙、入口雨棚与台阶'
+  const textInstruction = requestedTexts.length
+    ? '需求中的文字 ' + requestedTexts.map(text => `「${text}」`).join('、')
+      + ' 必须出现在入口标牌上：在标牌部件设置 userData.textSpec（text 为对应中文），禁止自己画字形或 Canvas 文字。'
+    : ''
+  const structureResult = await requestProceduralModification({
+    source,
+    objectType,
+    instruction: '在保持体块尺寸、位置和部件 id 不变的前提下补充结构细节。按结构规划实现：' + partList
+      + '。不要修改材质颜色和表面细节，不要新增规划之外的部件，不要改变整体占地。' + textInstruction,
+  })
+  source = structureResult.generatedCode
+  model = await executeProceduralModel(source, { timeoutMs: 60000 })
+  attachFootprint(model)
+  report = await reviewStage(model, '结构', '评估结构细节是否补齐（墙体、窗带、屋顶、入口等）；忽略材质颜色。')
+  if (report?.passed !== true) {
+    const repaired = await repairStagedModel({ source, report, stageLabel: '结构', objectType })
+    if (repaired) {
+      source = repaired
+      model = await executeProceduralModel(source, { timeoutMs: 60000 })
+      attachFootprint(model)
+      report = await reviewStage(model, '结构复检', '评估结构细节是否补齐（墙体、窗带、屋顶、入口等）；忽略材质颜色。')
+    }
+  }
+
+  // 阶段 3/3：材质与收尾
+  stageIndex = 2
+  updateGenerationProgress({ stage: 'material', label: '阶段 3/3：材质与收尾', detail: '保持几何不变，应用材质与表面细节', status: 'active' })
+  const materialList = draftSpec?.materials?.length ? draftSpec.materials.map(material => material.name).join('、') : ''
+  const materialResult = await requestProceduralModification({
+    source,
+    objectType,
+    instruction: '在保持几何结构不变的前提下应用材质与表面细节' + (materialList ? '（材质清单：' + materialList + '）' : '')
+      + '：颜色、粗糙度、线条、污渍等。不要改结构，不要新增规划之外的部件。'
+      + (requestedTexts.length ? '确认入口标牌 ' + requestedTexts.map(text => `「${text}」`).join('、') + ' 通过 userData.textSpec 声明，文字内容不能丢失。' : ''),
+  })
+  source = materialResult.generatedCode
+  model = await executeProceduralModel(source, { timeoutMs: 60000 })
+  attachFootprint(model)
+  report = await reviewStage(model, '材质', '评估最终外观（材质、颜色、表面细节），并检查穿模、悬空、断开的部件。')
+  if (report?.passed !== true) {
+    const repaired = await repairStagedModel({ source, report, stageLabel: '材质', objectType })
+    if (repaired) {
+      source = repaired
+      model = await executeProceduralModel(source, { timeoutMs: 60000 })
+      attachFootprint(model)
+      report = await reviewStage(model, '最终复检', '评估最终外观（材质、颜色、表面细节），并检查穿模、悬空、断开的部件。')
+    }
+  }
+
+  return { model, source, draftSpec, report }
+}
+
+async function generateAiModelStaged({ prompt, generationPrompt, objectType, useFootprint, footprintLocal }) {
+  aiBusy.value = true
+  editorOpen.value = true
+  editorMode.value = 'create'
+  isDraftModel.value = true
+  editingModel.value = null
+  editHistory.value = []
+  editError.value = ''
+  modelChatMessages.value = []
+  appendModelChat('user', prompt || '（使用参考图生成模型）', {
+    referenceImage: Boolean(referenceImageDataUrl.value),
+    footprint: useFootprint ? { mode: footprintRegionMode.value, points: footprintLocal.points.map(point => ({ ...point })) } : null,
+  })
+  generationProgress.value = [{
+    stage: 'staged',
+    label: '分阶段生成：体块 → 结构 → 材质',
+    detail: '每个阶段生成后会做一次视觉质检，不通过则自动修正一次',
+    status: 'active',
+  }]
+  message.value = '正在分阶段生成模型（体块 → 结构 → 材质），耗时会比单次生成长…'
+  try {
+    const staged = await runStagedModelGeneration({ prompt, generationPrompt, objectType, useFootprint, footprintLocal })
+    const group = staged.model
+    group.userData.proceduralModelParameterValues = modelParameterDefaults(group.userData.proceduralModelParameters || [])
+    group.userData.proceduralModelParts = Array.isArray(group.userData.proceduralModelParts) ? group.userData.proceduralModelParts : []
+    group.userData.proceduralModelEnvironmentBindings = Array.isArray(group.userData.proceduralModelEnvironmentBindings)
+      ? group.userData.proceduralModelEnvironmentBindings : []
+    group.userData.proceduralModelCapabilityManifest = group.userData.proceduralModelCapabilityManifest
+      && typeof group.userData.proceduralModelCapabilityManifest === 'object'
+      ? group.userData.proceduralModelCapabilityManifest
+      : { version: 1, parameters: group.userData.proceduralModelParameters, capabilities: {} }
+    group.userData.proceduralModelConfig = {
+      protocol: 'threejs-procedural-v1',
+      generator: 'img2threejs-procedural-staged',
+      objectType,
+      visualStyle: 'stylized',
+      prompt,
+      generatedAt: new Date().toISOString(),
+      staged: true,
+      footprint: useFootprint ? { mode: footprintRegionMode.value, points: footprintLocal.points.map(point => ({ ...point })) } : null,
+    }
+    group.userData.proceduralModelSource = staged.source
+    group.name = group.userData.assetName || 'AI 程序化模型'
+    if (staged.draftSpec) group.userData.proceduralModelDraftSpec = staged.draftSpec
+    if (staged.report) group.userData.proceduralModelVisualQuality = staged.report
+    if (useFootprint) {
+      group.userData.sandboxFootprintPolygon = {
+        mode: footprintRegionMode.value,
+        points: footprintLocal.points.map(point => ({ ...point })),
+      }
+    }
+    editingModel.value = group
+    persistModelChatHistory(group)
+    const collisionReady = await runModelCollisionQualityControl()
+    if (!collisionReady) throw new Error('模型碰撞完整性检查未通过，已阻止模型进入沙盒；请继续修复未解决部件。')
+    generationProgress.value = generationProgress.value.map(item => (
+      item.status === 'active' || item.status === 'failed' ? { ...item, status: item.status === 'failed' ? item.status : 'done' } : item
+    ))
+    generationProgress.value.push({
+      stage: 'preview-ready',
+      label: '模型预览已就绪',
+      detail: '分阶段生成与质检完成；可以继续对话调整或保存加入沙盒',
+      status: 'done',
+    })
+    message.value = '分阶段生成完成（体块 → 结构 → 材质，每阶段已过视觉质检），可继续对话调整或保存。'
+    appendModelChat('assistant', '模型预览已就绪，可以继续对话调整，或保存后加入沙盒。', { type: 'stage' })
+  } catch (error) {
+    const next = [...generationProgress.value]
+    const activeIndex = next.findIndex(item => item.status === 'active')
+    if (activeIndex >= 0) next[activeIndex] = { ...next[activeIndex], status: 'failed', detail: error?.message || '未知错误' }
+    else next.push({ stage: 'failed', label: '分阶段生成失败', detail: error?.message || '未知错误', status: 'failed' })
+    generationProgress.value = next
+    editError.value = error?.message || '未知错误'
+    message.value = 'AI 分阶段建模失败：' + editError.value
+    appendModelChat('assistant', '分阶段生成失败：' + editError.value, { type: 'stage' })
+  } finally {
+    aiBusy.value = false
+  }
+}
+
 async function generateAiModel() {
   const prompt = aiPrompt.value.trim()
   if ((!prompt && !referenceImageDataUrl.value) || aiBusy.value) return
+  const footprintMode = footprintRegionMode.value
+  const useFootprint = footprintMode !== 'none' && footprintPoints.value.length >= 3
+  if (useFootprint && footprintSelfIntersecting.value) {
+    message.value = '占地区域轮廓有交叉（红色边），请先拖动黄色顶点调整或重画'
+    return
+  }
+  const footprintLocal = useFootprint ? localizePolygon(footprintPoints.value) : null
+  const generationPrompt = useFootprint
+    ? prompt + buildFootprintPromptSuffix(footprintMode, footprintLocal.points)
+    : prompt
+  if (stagedGenerationEnabled.value) {
+    await generateAiModelStaged({
+      prompt,
+      generationPrompt,
+      objectType: STAGED_MODEL_OBJECT_TYPE,
+      useFootprint,
+      footprintLocal,
+    })
+    return
+  }
 
   aiBusy.value = true
   editorOpen.value = true
@@ -554,6 +1097,11 @@ async function generateAiModel() {
   editingModel.value = null
   editHistory.value = []
   editError.value = ''
+  modelChatMessages.value = []
+  appendModelChat('user', prompt || '（使用参考图生成模型）', {
+    referenceImage: Boolean(referenceImageDataUrl.value),
+    footprint: useFootprint ? { mode: footprintMode, points: footprintLocal.points.map(point => ({ ...point })) } : null,
+  })
   generationProgress.value = [{
     stage: 'request',
     label: '提交完整模型生成请求',
@@ -567,7 +1115,7 @@ async function generateAiModel() {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
       body: JSON.stringify({
-        prompt,
+        prompt: generationPrompt,
         objectType: '独立 3D 模型',
         visualStyle: 'stylized',
         imageDataUrl: referenceImageDataUrl.value || undefined,
@@ -642,10 +1190,26 @@ async function generateAiModel() {
       hasReferenceImage: Boolean(referenceImageDataUrl.value),
       generatedAt: result.generatedAt || new Date().toISOString(),
       generationMetrics: result.generationMetrics || null,
+      footprint: useFootprint
+        ? { mode: footprintMode, points: footprintLocal.points.map(point => ({ x: point.x, z: point.z })) }
+        : null,
     }
     group.userData.proceduralModelSource = result.generatedCode
+    if (useFootprint) {
+      group.userData.sandboxFootprintPolygon = {
+        mode: footprintMode,
+        points: footprintLocal.points.map(point => ({ x: point.x, z: point.z })),
+      }
+    }
     group.userData.interactionRadius = Number(group.userData.interactionRadius) || 4.5
     editingModel.value = group
+    persistModelChatHistory(group)
+    if (result.draftSpec) {
+      group.userData.proceduralModelDraftSpec = result.draftSpec
+      const draftDimensions = result.draftSpec.dimensions || {}
+      appendModelChat('assistant', `结构规划：${result.draftSpec.parts?.length || 0} 个部件，尺寸 ${draftDimensions.width}×${draftDimensions.height}×${draftDimensions.depth} m`, { type: 'stage' })
+    }
+    appendModelChat('assistant', '模型源码已构建完成，开始碰撞检查与视觉质检。', { type: 'stage' })
 
     const model = editingModel.value
     if (!model) throw new Error('构建完成但没有可预览的模型')
@@ -671,7 +1235,10 @@ async function generateAiModel() {
       detail: '完整模型已构建；可以继续调整参数或通过 AI 对话编辑，保存后才会加入沙盒',
       status: 'done',
     })
-    message.value = '模型生成完成，可继续调整参数或通过 AI 对话编辑；保存后才会加入沙盒。'
+    message.value = useFootprint
+      ? '模型生成完成，已带上勾绘占地约束；保存后在场景里按这块区域落位。'
+      : '模型生成完成，可继续调整参数或通过 AI 对话编辑；保存后才会加入沙盒。'
+    appendModelChat('assistant', '模型预览已就绪，可以继续对话调整，或保存后加入沙盒。', { type: 'stage' })
   } catch (error) {
     const next = [...generationProgress.value]
     const activeIndex = next.findIndex(item => item.status === 'active')
@@ -686,6 +1253,51 @@ async function generateAiModel() {
 }
 
 
+const HUMANOID_PROMPT_SUFFIX = '。必须生成一个标准人形角色（humanoid）：头部、脖子、躯干、左右上臂与前臂、双手、左右大腿与小腿、双脚齐全；比例约 7 头身，肩宽约身高 1/4，双脚落在 y=0 基准面，正面朝向 +Z。各身体部位请使用独立命名的子网格或子分组：head、torso、left-arm、right-arm、left-leg、right-leg、left-foot、right-foot（命名用于绑定行走/跳跃动作）。使用 Three.js 几何体与材质，颜色分明，避免全黑或全反射材质；不要生成地面、底座、场景、文字或相机。'
+
+// 请求一次角色生成源码；流式事件与原有实现保持一致。
+async function requestGeneratedCharacterCode(promptText) {
+  const response = await fetch(API_BASE + '/assets/ai-image/generate-procedural-object-stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+    body: JSON.stringify({
+      prompt: promptText,
+      objectType: '第三人称玩家角色',
+      visualStyle: 'stylized',
+    }),
+  })
+  if (!response.ok || !response.body) {
+    const payload = await response.json().catch(() => ({}))
+    throw new Error(payload.message || 'AI 角色生成失败：HTTP ' + response.status)
+  }
+  let buffer = ''
+  let result = null
+  let completed = false
+  const decoder = new TextDecoder()
+  const processEvent = event => {
+    if (!event || typeof event.type !== 'string') return
+    if (event.type === 'single') result = event.result
+    else if (event.type === 'error') throw new Error(event.message || 'AI 角色生成失败')
+    else if (event.type === 'complete') completed = true
+  }
+  const reader = response.body.getReader()
+  while (true) {
+    const { value, done } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+    let newline
+    while ((newline = buffer.indexOf('\n')) >= 0) {
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (line) processEvent(JSON.parse(line))
+    }
+  }
+  buffer += decoder.decode()
+  if (buffer.trim()) processEvent(JSON.parse(buffer.trim()))
+  if (!completed || !result?.generatedCode) throw new Error('AI 角色生成事件流提前结束，未收到完整模型源码')
+  return result.generatedCode
+}
+
 async function generateAiPlayerCharacter() {
   const prompt = characterPrompt.value.trim()
   if (!prompt || characterBusy.value) return
@@ -696,47 +1308,109 @@ async function generateAiPlayerCharacter() {
   characterBusy.value = true
   message.value = '正在通过 AI 生成角色模型…'
   try {
-    const response = await fetch(API_BASE + '/assets/ai-image/generate-procedural-object-stream', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
-      body: JSON.stringify({
-        prompt: prompt + '。请生成一个完整、居中、Y 轴向上的可渲染人形角色模型，双脚落在模型底部基准面，正面朝向 +Z。使用适度细节的 Three.js 几何体和材质构建完整身体，不要生成地面、底座、场景或文字。模型必须是单一完整角色层级，便于作为玩家外观替换。',
-        objectType: '第三人称玩家角色',
-        visualStyle: 'stylized',
-      }),
-    })
-    if (!response.ok || !response.body) {
-      const payload = await response.json().catch(() => ({}))
-      throw new Error(payload.message || 'AI 角色生成失败：HTTP ' + response.status)
+    let model = null
+    let analysis = null
+    let characterSource = ''
+    // 最多两次：首轮失败后把具体失败指标作为纠正提示再生成一次。
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      if (attempt > 0) message.value = '生成结果不像人形（' + analysis.reasons.join('；') + '），正在自动重试…'
+      const promptText = attempt === 0
+        ? prompt + HUMANOID_PROMPT_SUFFIX
+        : prompt + HUMANOID_PROMPT_SUFFIX + buildHumanoidRetryPrompt(analysis)
+      const generatedCode = await requestGeneratedCharacterCode(promptText)
+      message.value = 'AI 已返回模型源码，正在隔离 Worker 中构建…'
+      model = await executeProceduralModel(generatedCode, { timeoutMs: 60000 })
+      characterSource = generatedCode
+      analysis = analyzeHumanoidModel(THREE, model)
+      if (analysis.humanoid) break
     }
-    let buffer = ''
-    let result = null
-    let completed = false
-    const decoder = new TextDecoder()
-    const processEvent = event => {
-      if (!event || typeof event.type !== 'string') return
-      if (event.type === 'single') result = event.result
-      else if (event.type === 'error') throw new Error(event.message || 'AI 角色生成失败')
-      else if (event.type === 'complete') completed = true
+    if (!analysis?.humanoid) {
+      message.value = '两次生成的结果都不像人形（' + (analysis?.reasons?.join('；') || '未知原因') + '），已取消应用。请换一种描述再试，例如“一个站立的人形角色，身高约 2 米，穿蓝色上衣”。'
+      return
     }
-    const reader = response.body.getReader()
-    while (true) {
-      const { value, done } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      let newline
-      while ((newline = buffer.indexOf('\n')) >= 0) {
-        const line = buffer.slice(0, newline).trim()
-        buffer = buffer.slice(newline + 1)
-        if (line) processEvent(JSON.parse(line))
+    // 角色视觉质检 + 自动修正（最多两轮）；复检以修改前的截图为基线
+    let characterVisualReport = null
+    let characterBaseline = null
+    let characterRepairRounds = 0
+    for (let round = 0; round <= 2; round += 1) {
+      let screenshots
+      try {
+        message.value = round === 0 ? '正在对本角色做视觉质检…' : `正在复检修正后的角色（第 ${round} 轮）…`
+        screenshots = await captureModelViews(THREE, model)
+        let reviewScreenshots = screenshots
+        try {
+          const sheet = await buildComparisonSheet(screenshots, { title: '角色视觉质检' })
+          if (sheet) reviewScreenshots = [{ label: 'comparison-sheet', imageDataUrl: sheet }]
+        } catch {
+          // 退回多张截图
+        }
+        let baselinePayload = characterBaseline
+        if (characterBaseline) {
+          try {
+            const baselineSheet = await buildComparisonSheet(characterBaseline, { title: '角色修改前基线' })
+            if (baselineSheet) baselinePayload = [{ label: 'baseline-comparison-sheet', imageDataUrl: baselineSheet }]
+          } catch {
+            // 退回原基线截图
+          }
+        }
+        const inspectResponse = await fetch(API_BASE + '/assets/ai-image/inspect-procedural-object', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+          body: JSON.stringify({
+            prompt,
+            objectType: '第三人称玩家角色',
+            screenshots: reviewScreenshots,
+            baselineScreenshots: baselinePayload || undefined,
+          }),
+        })
+        const inspectBody = await inspectResponse.json().catch(() => ({}))
+        if (!inspectResponse.ok) break
+        characterVisualReport = inspectBody.data || inspectBody.result || inspectBody
+      } catch {
+        break
+      }
+      if (characterVisualReport.passed === true) break
+      const actionable = (characterVisualReport.issues || []).filter(item =>
+        ['critical', 'major'].includes(item.severity) && item.repairInstruction,
+      )
+      if (round === 2 || !actionable.length) break
+      message.value = `视觉质检发现 ${actionable.length} 个问题，正在自动修正角色（${round + 1}/2）…`
+      try {
+        const instruction = [
+          '这是角色视觉质检后的定向修复。请根据以下可观察问题做最小必要修改，不要整体重建模型，不要修改无关部件，保留模型身份、现有稳定 componentId、参数、能力声明和交互结构。',
+          ...actionable.map((item, index) => `${index + 1}. [${item.componentId || '整体模型'}] ${item.issue}。修复要求：${item.repairInstruction}`),
+        ].join('\n')
+        const repairResponse = await fetch(API_BASE + '/assets/ai-image/modify-procedural-object', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
+          body: JSON.stringify({
+            source: characterSource,
+            parameters: [],
+            parameterValues: {},
+            parts: [],
+            environmentBindings: [],
+            modelCapabilityManifest: null,
+            geometryDiagnostics: null,
+            selectedPartId: '',
+            instruction,
+            objectType: '第三人称玩家角色',
+          }),
+        })
+        const repairBody = await repairResponse.json().catch(() => ({}))
+        if (!repairResponse.ok) break
+        const repairResult = repairBody.data || repairBody.result || repairBody
+        if (!repairResult?.generatedCode) break
+        const repaired = await executeProceduralModel(repairResult.generatedCode, { timeoutMs: 60000 })
+        const repairedAnalysis = analyzeHumanoidModel(THREE, repaired)
+        if (!repairedAnalysis.humanoid) break
+        characterBaseline = screenshots
+        characterSource = repairResult.generatedCode
+        model = repaired
+        characterRepairRounds += 1
+      } catch {
+        break
       }
     }
-    buffer += decoder.decode()
-    if (buffer.trim()) processEvent(JSON.parse(buffer.trim()))
-    if (!completed || !result?.generatedCode) throw new Error('AI 角色生成事件流提前结束，未收到完整模型源码')
-
-    message.value = 'AI 已返回角色模型，正在隔离 Worker 中构建…'
-    const model = await executeProceduralModel(result.generatedCode, { timeoutMs: 60000 })
     model.name = 'AI 玩家角色'
     const info = engine.setPlayerCharacterModel(model, [], {
       assetId: 'ai-character-' + Date.now().toString(36),
@@ -744,7 +1418,13 @@ async function generateAiPlayerCharacter() {
       source: 'ai-procedural',
       prompt,
     })
-    message.value = `AI 角色已加载：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。当前模型未提供动作剪辑时使用基础移动表现。`
+    savePlayerCharacterToStorage({ silent: true })
+    const visualNote = characterVisualReport
+      ? (characterVisualReport.passed === true
+        ? `视觉质检通过${characterRepairRounds ? '（自动修正 ' + characterRepairRounds + ' 轮后）' : ''}`
+        : `视觉质检仍有问题：${characterVisualReport.summary || '存在待调整项'}`)
+      : ''
+    message.value = `AI 角色已加载并通过人形检查：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。已单独保存人物模型，刷新后自动恢复${visualNote ? '；' + visualNote : ''}。`
   } catch (error) {
     message.value = 'AI 角色生成失败：' + (error?.message || '未知错误')
   } finally {
@@ -764,7 +1444,8 @@ async function importPlayerCharacter(event) {
   const objectUrl = URL.createObjectURL(file)
   try {
     const info = await engine.loadPlayerCharacter(objectUrl, { assetId: 'glb:' + file.name, source: 'glb' })
-    message.value = `GLB 角色已加载：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。`
+    savePlayerCharacterToStorage({ silent: true })
+    message.value = `GLB 角色已加载：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。已单独保存人物模型，刷新后自动恢复。`
   } catch (error) {
     message.value = 'GLB 角色导入失败：' + (error?.message || '未知错误')
   } finally {
@@ -807,6 +1488,32 @@ function handleCapabilityChange(payload) {
   saveStatus.value = '能力已调整，记得保存沙盒'
 }
 
+function loadModelChatHistory(model) {
+  const history = Array.isArray(model?.userData?.proceduralModelChatHistory)
+    ? model.userData.proceduralModelChatHistory : []
+  modelChatMessages.value = history.map(item => ({ ...item }))
+}
+
+function persistModelChatHistory(model = editingModel.value) {
+  if (!model) return
+  model.userData.proceduralModelChatHistory = modelChatMessages.value.map(item => ({ ...item }))
+}
+
+function appendModelChat(role, text, meta = {}) {
+  const entry = {
+    id: 'msg_' + Date.now().toString(36) + '_' + modelChatMessages.value.length,
+    role,
+    text,
+    at: new Date().toISOString(),
+    ...meta,
+  }
+  modelChatMessages.value = [...modelChatMessages.value, entry]
+  if (modelChatMessages.value.length > 200) {
+    modelChatMessages.value = modelChatMessages.value.slice(-200)
+  }
+  persistModelChatHistory()
+}
+
 function openModelEditor(payload) {
   const model = payload?.id ? engine?.getSandboxModel(payload.id) : selected
   if (!model?.userData?.proceduralModelSource) {
@@ -814,6 +1521,10 @@ function openModelEditor(payload) {
     return
   }
   editingModel.value = model
+  loadModelChatHistory(model)
+  if (!modelChatMessages.value.length) {
+    appendModelChat('assistant', '已打开模型编辑，可以继续对话调整，或修改左侧参数与组件结构。', { type: 'stage' })
+  }
   editorOpen.value = true
   editorMode.value = 'edit'
   isDraftModel.value = false
@@ -946,6 +1657,9 @@ async function replaceEditedModel(source, values, definitions, parts, summary = 
     environmentOverrides: { ...(current.userData.environmentOverrides || {}) },
     proceduralModelConfig: { ...(current.userData.proceduralModelConfig || {}), updatedAt: new Date().toISOString() },
     interactionRadius: Number(current.userData.interactionRadius) || 4.5,
+    proceduralModelChatHistory: modelChatMessages.value.map(item => ({ ...item })),
+    sandboxFootprintPolygon: current.userData.sandboxFootprintPolygon || replacement.userData.sandboxFootprintPolygon || null,
+    proceduralModelDraftSpec: current.userData.proceduralModelDraftSpec || replacement.userData.proceduralModelDraftSpec || null,
   }
   replacement.name = current.name
   if (isDraftModel.value) {
@@ -983,6 +1697,18 @@ async function handleModelEdit(payload) {
   const values = { ...(current.userData.proceduralModelParameterValues || {}), ...(payload?.parameterValues || {}) }
   editBusy.value = true
   editError.value = ''
+  appendModelChat('user', payload?.instruction || '（参数调整）', {
+    selectedPartId: payload?.selectedPartId || '',
+    selectedPartName: payload?.selectedPartName || '',
+    referenceImage: Boolean(payload?.referenceImageDataUrl),
+  })
+  // 修改前的截图作为复检基线：判断“问题是否修好、有没有引入新问题”
+  let baselineScreenshots = null
+  try {
+    baselineScreenshots = await proceduralModelEditorRef.value?.captureVisualViews?.()
+  } catch {
+    baselineScreenshots = null
+  }
   try {
     const response = await fetch(API_BASE + '/assets/ai-image/modify-procedural-object', {
       method: 'POST',
@@ -998,6 +1724,7 @@ async function handleModelEdit(payload) {
         selectedPartId: payload?.selectedPartId || '',
         instruction: payload?.instruction || '',
         objectType: current.userData.proceduralModelConfig?.objectType || '独立 3D 模型',
+        referenceImageDataUrl: payload?.referenceImageDataUrl || undefined,
       }),
     })
     const body = await response.json().catch(() => ({}))
@@ -1006,8 +1733,15 @@ async function handleModelEdit(payload) {
     const definitions = Array.isArray(result.parameters) ? result.parameters : (Array.isArray(result.modelParameters) ? result.modelParameters : [])
     const parts = Array.isArray(result.parts) ? result.parts : (Array.isArray(result.modelParts) ? result.modelParts : [])
     await replaceEditedModel(result.generatedCode, values, definitions, parts, result.changeSummary || 'AI 已完成模型调整', true, result.environmentBindings, result.modelCapabilityManifest)
+    appendModelChat('assistant', result.changeSummary || 'AI 已完成模型调整', { type: 'edit-result' })
+    // 所有 AI 修改后的模型都做一次视觉质检；复检以修改前的截图为基线
+    await runModelVisualQualityControl(
+      current.userData.proceduralModelConfig?.prompt || payload?.instruction || '',
+      { baselineScreenshots, referenceImageDataUrl: payload?.referenceImageDataUrl || '' },
+    )
   } catch (error) {
     editError.value = error?.message || '模型调整失败'
+    appendModelChat('assistant', '调整失败：' + editError.value, { type: 'stage' })
   } finally {
     editBusy.value = false
   }
@@ -1210,7 +1944,13 @@ async function confirmDeleteAsset(item) {
 }
 
 function setManagementMode(mode) {
-  const nextMode = mode === 'chunks' ? 'chunks' : mode === 'model' ? 'model' : 'sandbox'
+  const nextMode = mode === 'chunks'
+    ? 'chunks'
+    : mode === 'model'
+      ? 'model'
+      : mode === 'environment'
+        ? 'environment'
+        : 'sandbox'
   if (managementMode.value === 'chunks' && nextMode !== 'chunks') {
     engine?.setSandboxChunkManagement?.(false)
     selectedChunkKeys.value = []
@@ -1298,8 +2038,10 @@ function saveSandbox() {
         time: Number(time.value),
         timeEnabled: timeEnabled.value,
         weather: weather.value,
+        weatherIntensity: Number(weatherIntensity.value),
         weatherEnabled: weatherEnabled.value,
-        rainEnabled: rainEnabled.value,
+        // rainEnabled 是旧存档的遗留字段，仅为向下兼容保留写入
+        rainEnabled: weather.value === 'rain',
         wind: Number(wind.value),
         windEnabled: windEnabled.value,
         windDirection: { ...sandboxWindDirection },
@@ -1323,7 +2065,114 @@ function saveSandbox() {
 
 const persistRoadEdit = createRoadEditPersistence({ save: saveSandbox, sync: syncObjects })
 
+// ---- 人物模型独立存档 ----
+const PLAYER_CHARACTER_SAVE_LIMIT = 2_000_000
+// 两个内置人物：默认角色（男）/（女），选择即切换。
+const playerPresetOptions = computed(() => Object.entries(PLAYER_PRESETS).map(([presetId, preset]) => ({
+  value: `preset:${presetId}`,
+  label: preset.label,
+})))
+const characterSelection = ref('preset:male')
+const hasSavedCharacter = ref(false)
+
+function refreshSavedCharacterFlag() {
+  try {
+    hasSavedCharacter.value = Boolean(localStorage.getItem(PLAYER_STORAGE_KEY))
+  } catch {
+    hasSavedCharacter.value = false
+  }
+}
+
+function applyCharacterSelection() {
+  const selection = characterSelection.value
+  if (selection === 'saved') {
+    if (restorePlayerCharacterFromStorage()) characterSelection.value = 'saved'
+    return
+  }
+  // 形如 preset:<presetId>，性别由预设自身携带
+  const parts = selection.split(':')
+  if (parts[0] === 'preset' && parts[1]) {
+    const presetId = parts[1]
+    const info = engine?.setPlayerCharacterPreset?.(presetId)
+    const preset = PLAYER_PRESETS[presetId]
+    if (info && preset) message.value = '已切换人物：' + preset.label
+  }
+}
+
+function savePlayerCharacterToStorage({ silent = false } = {}) {
+  try {
+    const character = engine?.serializePlayerCharacter?.() || null
+    if (!character) {
+      if (!silent) message.value = '当前是默认角色，没有可保存的人物模型'
+      return false
+    }
+    const payload = { ...character, savedAt: new Date().toISOString() }
+    if (JSON.stringify(payload).length > PLAYER_CHARACTER_SAVE_LIMIT) {
+      message.value = '人物模型过大（超过 2MB），无法保存到浏览器存储'
+      return false
+    }
+    localStorage.setItem(PLAYER_STORAGE_KEY, JSON.stringify(payload))
+    hasSavedCharacter.value = true
+    if (!silent) message.value = '人物模型已单独保存，刷新后自动恢复'
+    return true
+  } catch (error) {
+    const reason = error?.name === 'QuotaExceededError' ? '浏览器本地存储空间不足' : (error?.message || '未知错误')
+    message.value = '人物模型保存失败：' + reason
+    return false
+  }
+}
+
+function restorePlayerCharacterFromStorage({ silent = false } = {}) {
+  try {
+    const raw = localStorage.getItem(PLAYER_STORAGE_KEY)
+    if (!raw) return false
+    const payload = JSON.parse(raw)
+    const info = engine?.restorePlayerCharacterFromSnapshot?.(payload)
+    if (!info) return false
+    hasSavedCharacter.value = true
+    characterSelection.value = 'saved'
+    if (!silent) message.value = '已恢复上次保存的人物模型'
+    return true
+  } catch (error) {
+    console.warn('[WorldSandbox] 人物存档恢复失败', error)
+    if (!silent) message.value = '人物模型恢复失败：' + (error?.message || '存档可能已损坏')
+    return false
+  }
+}
+
+function clearSavedPlayerCharacter() {
+  try {
+    localStorage.removeItem(PLAYER_STORAGE_KEY)
+    hasSavedCharacter.value = false
+    if (characterSelection.value === 'saved') characterSelection.value = 'preset:male'
+    message.value = '已删除人物存档；当前角色不受影响'
+  } catch (error) {
+    message.value = '删除人物存档失败：' + (error?.message || '未知错误')
+  }
+}
+
 function handleSandboxRoadEditChange(payload) {
+  if (payload?.phase === 'breakpoint-pick') {
+    message.value = '点击道路上要加断点的位置（一次只加一个点）；Esc 取消'
+    return
+  }
+  if (payload?.phase === 'breakpoint-cancelled') {
+    message.value = '已取消添加断点'
+    return
+  }
+  if (payload?.phase === 'breakpoint-added') {
+    const id = payload?.id || selected?.userData?.sandboxModelId
+    selected = (id ? engine.getSandboxModel?.(id) : null) || selected
+    selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
+    syncObjects()
+    saveSandbox()
+    message.value = '已在该位置添加断点：拖它拐弯，或拖蓝色中心手柄整段平移'
+    return
+  }
+  if (payload?.phase === 'breakpoint-failed') {
+    message.value = payload.reason || '添加断点失败'
+    return
+  }
   if (payload?.phase === 'blocked') {
     message.value = `道路调整未生效：${payload.reason || '当前位置存在冲突'}`
     return
@@ -1359,6 +2208,7 @@ async function restoreSandbox() {
       .map(item => {
         const model = loader.parse(item.object)
         model.name = item.name || model.name || '已保存模型'
+        applyTextPlates(THREE, model)
         model.userData = {
           ...(model.userData || {}),
           proceduralModelCapabilityControlDocument: model.userData?.proceduralModelCapabilityControlDocument
@@ -1388,9 +2238,13 @@ async function restoreSandbox() {
     if (snapshot.environment) {
       time.value = Number.isFinite(Number(snapshot.environment.time)) ? Number(snapshot.environment.time) : 14
       timeEnabled.value = snapshot.environment.timeEnabled !== false
-      weather.value = snapshot.environment.weather === 'rain' ? 'rain' : 'clear'
+      // 老存档只有 clear/rain；新模式（多云/阴/雪/雾）按已注册模式恢复，未知回退晴天
+      const storedWeather = String(snapshot.environment.weather || 'clear')
+      weather.value = Object.prototype.hasOwnProperty.call(WEATHER_MODES, storedWeather) ? storedWeather : 'clear'
       weatherEnabled.value = snapshot.environment.weatherEnabled !== false
-      rainEnabled.value = snapshot.environment.rainEnabled !== false
+      weatherIntensity.value = Number.isFinite(Number(snapshot.environment.weatherIntensity))
+        ? Math.min(100, Math.max(0, Number(snapshot.environment.weatherIntensity)))
+        : 50
       wind.value = Number.isFinite(Number(snapshot.environment.wind)) ? Number(snapshot.environment.wind) : 20
       windEnabled.value = snapshot.environment.windEnabled !== false
       sandboxWindDirection = {
@@ -1399,6 +2253,7 @@ async function restoreSandbox() {
       }
       artificialLightingEnabled.value = snapshot.environment.artificialLightingEnabled !== false
       updateEnvironment()
+      engine?.setWeatherMode?.(weather.value, Number(weatherIntensity.value) / 100)
     }
     if (snapshot.selectedModelId && objectsById.has(snapshot.selectedModelId)) {
       selected = objectsById.get(snapshot.selectedModelId)
@@ -1421,7 +2276,8 @@ function buildRawEnvironment() {
   // 主场景与编辑器预览共用这一份 raw 配置，由各自 Runtime 归一化，避免两套天气状态。
   return {
     time: Number(time.value),
-    weather: weatherEnabled.value && rainEnabled.value && weather.value === 'rain' ? 'rain' : 'clear',
+    // 雨天由天气模式决定（进入下雨模式即自动下雨，不再有独立降雨开关）
+    weather: weatherEnabled.value && weather.value === 'rain' ? 'rain' : 'clear',
     wind: windEnabled.value ? Number(wind.value) / 100 : 0,
     windDirection: { ...sandboxWindDirection },
     artificialLightingEnabled: artificialLightingEnabled.value,
@@ -1431,6 +2287,12 @@ function updateEnvironment() {
   if (!engine) return
   const nextEnvironment = engine.setEnvironment(buildRawEnvironment())
   if (nextEnvironment?.windDirection) sandboxWindDirection = { ...nextEnvironment.windDirection }
+  // setEnvironment 会按时间重算光照；随后重新应用天气模式与强度，
+  // 避免拖动时间滑杆后天气光照/云雪雾被重置回默认。
+  engine.setWeatherMode?.(
+    weatherEnabled.value ? weather.value : 'clear',
+    Number(weatherIntensity.value) / 100,
+  )
 }
 const previewEnvironment = computed(() => buildRawEnvironment())
 function executeTask() {
@@ -1494,6 +2356,7 @@ onMounted(async () => {
       },
       onSandboxModelInteract: handleSandboxModelInteract,
       onSandboxRoadEditChange: handleSandboxRoadEditChange,
+      onSandboxFootprintDrawingChange: handleFootprintDrawingChange,
       onPlayerWaterStateChange: state => { playerWaterState.value = state ? { ...state } : null },
     }, {
       // MVP 使用独立空白沙盒：只创建地面与世界边界，不加载任何写死的校园内容。
@@ -1518,6 +2381,14 @@ onMounted(async () => {
     if (!restored) {
       updateEnvironment()
       syncObjects()
+    }
+    // 人物模型独立存档：无论沙盒是否恢复成功都尝试还原上次保存的角色。
+    refreshSavedCharacterFlag()
+    const restoredCharacter = restorePlayerCharacterFromStorage({ silent: true })
+    // 没有人物存档时默认男性角色
+    if (!restoredCharacter) {
+      characterSelection.value = 'preset:male'
+      engine?.setPlayerCharacterPreset?.('male')
     }
     // 资产库加载失败只提示不阻断，loadMyAssets 内部已兜底
     loadMyAssets()
@@ -1557,7 +2428,7 @@ onBeforeUnmount(() => {
     </div>
     <header class="world-mvp__header">
       <div class="world-mvp__brand"><strong>WORLD SANDBOX</strong><span>空白世界 · AI 模型构建与交互</span></div>
-      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">沙盒管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a href="/">返回地图</a></div>
+      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">世界空间</button><button :class="{ active: managementMode === 'environment' }" @click="setManagementMode('environment')">环境管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a href="/">返回地图</a></div>
     </header>
 
     <section v-if="managementMode === 'chunks' && !placement.active" class="world-mvp__chunk-manager">
@@ -1574,6 +2445,15 @@ onBeforeUnmount(() => {
         <b>当前选择</b>
         <span v-for="chunk in selectedChunks.slice(0, 8)" :key="chunk.x + ':' + chunk.z">({{ chunk.x }}, {{ chunk.z }}){{ chunk.x === 0 && chunk.z === 0 ? ' · 锚点' : '' }}</span>
         <small v-if="selectedChunks.length > 8">另有 {{ selectedChunks.length - 8 }} 块已选</small>
+      </div>
+      <div class="world-mvp__chunk-manager-expand">
+        <div class="world-mvp__chunk-manager-size">
+          <span>当前世界尺寸</span>
+          <strong>{{ worldState?.bounds ? (worldState.bounds.maxX - worldState.bounds.minX).toFixed(0) + ' × ' + (worldState.bounds.maxZ - worldState.bounds.minZ).toFixed(0) : '54 × 42' }}</strong>
+        </div>
+        <div class="world-mvp__chunk-manager-expand-actions">
+          <span>点击地块边缘的 + 即可朝该方向扩建（只增加空间，不移动已有模型）</span>
+        </div>
       </div>
       <div v-if="reclaimFeedback" class="world-mvp__reclaim-feedback" :class="reclaimFeedback.type" role="status" aria-live="polite">
         <b>{{ reclaimFeedback.title }}</b><p>{{ reclaimFeedback.message }}</p>
@@ -1617,8 +2497,10 @@ onBeforeUnmount(() => {
           <div class="world-mvp__list"><button v-for="item in objects" :key="item.id" :class="{ active: selectedName === item.name }" @click="selectModel(item)">{{ item.name }}</button></div>
           <strong class="world-mvp__operation-name">{{ selectedName }}</strong>
           <template v-if="precisionModeActive && transformMode === 'road-endpoints'">
-            <p class="world-mvp__message">拖动道路任一端点调整长度和朝向；拖动中按 Esc 取消本次拖拽，未拖动时按 Esc 退出端点模式。</p>
+            <p class="world-mvp__message">蓝色中心手柄拖动整段截面（两侧路缘一起走，宽度不变）适合拐弯/挪段；黄色角手柄只调这一侧路缘的宽度。「添加断点」后点击道路上要加点的位置，一次只加一个断点，拖它就能拉出弧度。</p>
             <div class="world-mvp__tools world-mvp__transform-actions">
+              <button @click="addSelectedRoadPoint">添加断点</button>
+              <button :disabled="!selectedIsPolylineRoad" @click="removeSelectedRoadPoint">删除断点</button>
               <button @click="setMode('browse')">完成</button>
             </div>
           </template>
@@ -1658,25 +2540,63 @@ onBeforeUnmount(() => {
             <div class="world-mvp__command" style="margin-top:7px">
               <input type="file" accept="image/png,image/jpeg,image/webp" @change="onReferenceImageChange">
             </div>
+            <label class="world-mvp__toggle" style="margin-top:7px"><input v-model="stagedGenerationEnabled" type="checkbox"><span>分阶段生成（体块 → 结构 → 材质，更准但更慢）</span></label>
+            <div class="world-mvp__command" style="margin-top:7px">
+              <select v-model="footprintRegionMode">
+                <option value="none">不限定占地</option>
+                <option value="area">占地区域（底面贴合轮廓）</option>
+                <option value="space">空间占据（划定占用范围）</option>
+              </select>
+            </div>
+            <div class="world-mvp__tools world-mvp__secondary-actions" style="margin-top:7px">
+              <button v-if="!footprintPoints.length" @click="startFootprintDrawing">创建占地区域</button>
+              <template v-else>
+                <button @click="startFootprintDrawing">重新创建</button>
+                <button @click="addFootprintBreakpoint">添加断点</button>
+                <button @click="removeFootprintBreakpoint">删除断点</button>
+                <button @click="clearFootprint">清除区域</button>
+              </template>
+            </div>
+            <small v-if="footprintPoints.length" class="world-mvp__message">
+              已创建占地区域（{{ footprintPoints.length }} 个点）：拖黄色角点改形状，拖蓝色中心整体移动
+              <template v-if="footprintSizeLabel">（约 {{ footprintSizeLabel }}）</template>
+            </small>
+            <small v-if="footprintSelfIntersecting" class="world-mvp__message">轮廓有交叉（红色边），请拖动顶点调整或清除重画</small>
           </section>
         </section>
       </template>
       <template v-else>
+        <section v-if="managementMode === 'environment'">
+          <h2>环境</h2>
+          <label class="world-mvp__toggle"><input v-model="timeEnabled" type="checkbox" @change="updateEnvironment"><span>时间系统</span><b>{{ timeEnabled ? '开启' : '关闭' }}</b></label>
+          <label class="world-mvp__field"><span>当前时间 <b>{{ String(Math.floor(time)).padStart(2, '0') }}:{{ String(Math.round((time % 1) * 60)).padStart(2, '0') }}</b></span>
+            <input v-model.number="time" type="range" min="0" max="24" step="0.25" :disabled="!timeEnabled" @input="updateEnvironment">
+          </label>
+          <label class="world-mvp__toggle"><input v-model="weatherEnabled" type="checkbox" @change="updateEnvironment"><span>天气总开关</span><b>{{ weatherEnabled ? '开启' : '关闭' }}</b></label>
+          <label class="world-mvp__field"><span>天气模式</span>
+            <select v-model="weather" :disabled="!weatherEnabled" @change="applyWeatherMode">
+              <option v-for="(mode, key) in weatherModes" :key="key" :value="key">{{ mode.label }}</option>
+            </select>
+          </label>
+          <label class="world-mvp__field"><span>{{ weatherIntensityLabel }} <b>{{ weatherIntensity }}%</b></span>
+            <input v-model.number="weatherIntensity" type="range" min="0" max="100" step="5" :disabled="!weatherEnabled" @input="applyWeatherMode">
+          </label>
+          <label class="world-mvp__toggle"><input v-model="artificialLightingEnabled" type="checkbox" @change="updateEnvironment"><span>人工灯光总开关</span><b>{{ artificialLightingEnabled ? '开启' : '关闭' }}</b></label>
+          <label class="world-mvp__toggle"><input v-model="windEnabled" type="checkbox" @change="updateEnvironment"><span>风力系统</span><b>{{ windEnabled ? '开启' : '关闭' }}</b></label>
+          <label class="world-mvp__field"><span>风速 <b>{{ wind }}%</b></span>
+            <input v-model.number="wind" type="range" min="0" max="100" step="5" :disabled="!windEnabled" @input="updateEnvironment">
+          </label>
+        </section>
         <section v-if="managementMode === 'sandbox'" class="world-mvp__world-panel">
           <h2>世界空间</h2>
-          <p class="world-mvp__message">当前世界可向四周扩建。扩建只增加空间，不移动已有模型；区域分组是可选管理功能，不影响自由建造。</p>
           <div class="world-mvp__world-size">
             <span>当前世界尺寸</span>
             <strong>{{ worldState?.bounds ? (worldState.bounds.maxX - worldState.bounds.minX).toFixed(0) + ' × ' + (worldState.bounds.maxZ - worldState.bounds.minZ).toFixed(0) : '54 × 42' }}</strong>
           </div>
-          <div class="world-mvp__expand-grid">
-            <span></span><button :disabled="placement.active" @click="expandWorld('north')">向北扩建</button><span></span>
-            <button :disabled="placement.active" @click="expandWorld('west')">向西扩建</button>
-            <span class="world-mvp__world-center">当前世界</span>
-            <button :disabled="placement.active" @click="expandWorld('east')">向东扩建</button>
-            <span></span><button :disabled="placement.active" @click="expandWorld('south')">向南扩建</button><span></span>
+          <div class="world-mvp__world-size">
+            <span>地块数量</span>
+            <strong>{{ worldState?.chunks?.length || 1 }} 块</strong>
           </div>
-          <button class="world-mvp__open-chunk-manager" @click="toggleChunkManagement">在沙盒场景中管理地块 <span>{{ worldState?.chunks?.length || 0 }} 个地块 · 场景物体保持可见</span></button>
         </section>
         <section v-if="managementMode === 'model'">
           <h2>内置素材</h2>
@@ -1760,6 +2680,12 @@ onBeforeUnmount(() => {
 
         <section v-if="managementMode === 'sandbox'">
           <h2>玩家角色</h2>
+          <label class="world-mvp__field"><span>人物选择</span>
+            <select v-model="characterSelection" :disabled="characterBusy" @change="applyCharacterSelection">
+              <option v-for="option in playerPresetOptions" :key="option.value" :value="option.value">{{ option.label }}</option>
+              <option v-if="hasSavedCharacter" value="saved">已保存的人物</option>
+            </select>
+          </label>
           <div class="world-mvp__command">
             <input v-model="characterPrompt" :disabled="characterBusy" placeholder="描述要生成的玩家角色" @keydown.enter="generateAiPlayerCharacter">
             <button :disabled="characterBusy || !characterPrompt.trim()" @click="generateAiPlayerCharacter">{{ characterBusy ? '生成中' : 'AI 生成角色' }}</button>
@@ -1768,28 +2694,12 @@ onBeforeUnmount(() => {
             <input type="file" accept=".glb,model/gltf-binary" :disabled="characterBusy" @change="importPlayerCharacter">
           </div>
           <div class="world-mvp__tools">
+            <button :disabled="characterBusy" @click="savePlayerCharacterToStorage()">保存人物</button>
+            <button :disabled="characterBusy" @click="restorePlayerCharacterFromStorage()">恢复已保存人物</button>
             <button :disabled="characterBusy" @click="engine?.restorePlayerCharacterFallback?.()">恢复默认角色</button>
+            <button :disabled="characterBusy" @click="clearSavedPlayerCharacter">删除人物存档</button>
           </div>
-          <p class="world-mvp__message">支持 AI 程序化生成与单文件 GLB 导入。角色外观、碰撞半径和视点高度由同一运行时适配；无动画资源时保留基础移动。</p>
-        </section>
-        <section v-if="managementMode === 'sandbox'">
-          <h2>环境</h2>
-          <label class="world-mvp__toggle"><input v-model="timeEnabled" type="checkbox" @change="updateEnvironment"><span>时间系统</span><b>{{ timeEnabled ? '开启' : '关闭' }}</b></label>
-          <label class="world-mvp__field"><span>当前时间 <b>{{ String(Math.floor(time)).padStart(2, '0') }}:{{ String(Math.round((time % 1) * 60)).padStart(2, '0') }}</b></span>
-            <input v-model.number="time" type="range" min="0" max="24" step="0.25" :disabled="!timeEnabled" @input="updateEnvironment">
-          </label>
-          <label class="world-mvp__toggle"><input v-model="weatherEnabled" type="checkbox" @change="updateEnvironment"><span>天气总开关</span><b>{{ weatherEnabled ? '开启' : '关闭' }}</b></label>
-          <label class="world-mvp__field"><span>天气模式</span>
-            <select v-model="weather" :disabled="!weatherEnabled" @change="updateEnvironment">
-              <option value="clear">晴天</option><option value="rain">下雨</option>
-            </select>
-          </label>
-          <label class="world-mvp__toggle"><input v-model="rainEnabled" type="checkbox" :disabled="!weatherEnabled" @change="updateEnvironment"><span>降雨效果</span><b>{{ rainEnabled ? '开启' : '关闭' }}</b></label>
-          <label class="world-mvp__toggle"><input v-model="artificialLightingEnabled" type="checkbox" @change="updateEnvironment"><span>人工灯光总开关</span><b>{{ artificialLightingEnabled ? '开启' : '关闭' }}</b></label>
-          <label class="world-mvp__toggle"><input v-model="windEnabled" type="checkbox" @change="updateEnvironment"><span>风力系统</span><b>{{ windEnabled ? '开启' : '关闭' }}</b></label>
-          <label class="world-mvp__field"><span>风速 <b>{{ wind }}%</b></span>
-            <input v-model.number="wind" type="range" min="0" max="100" step="5" :disabled="!windEnabled" @input="updateEnvironment">
-          </label>
+          <p class="world-mvp__message">人物模型单独存档：保存/恢复/删除不影响沙盒场景；生成或导入的角色会自动保存。</p>
         </section>
         <section v-if="managementMode === 'model'">
           <h2>快捷操作</h2>
@@ -1814,6 +2724,7 @@ onBeforeUnmount(() => {
       :environment="previewEnvironment"
       :mode="editorMode"
       :progress="generationProgress"
+      :messages="modelChatMessages"
       :busy="aiBusy || editBusy"
       :error="editError"
       :can-undo="editHistory.length > 0"
@@ -1857,6 +2768,11 @@ onBeforeUnmount(() => {
 .world-mvp__chunk-manager-selected b { color:#dce8df; }
 .world-mvp__chunk-manager-selected span { padding:3px 6px; border:1px solid rgba(165,201,177,.25); border-radius:5px; background:rgba(165,201,177,.08); }
 .world-mvp__chunk-manager-selected small { color:#9eafad; }
+.world-mvp__chunk-manager-expand { margin-top:9px; padding-top:8px; border-top:1px solid rgba(255,255,255,.09); display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.world-mvp__chunk-manager-size { display:flex; align-items:baseline; gap:6px; color:#b7c9bf; font-size:10px; }
+.world-mvp__chunk-manager-size strong { color:#dce8df; font-size:12px; }
+.world-mvp__chunk-manager-expand-actions { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+.world-mvp__chunk-manager-expand-actions span { color:#9eafad; font-size:10px; }
 .world-mvp__open-chunk-manager { width:100%; margin-top:12px; padding:13px!important; border-color:rgba(165,201,177,.42)!important; text-align:left; color:#d5eadb!important; background:rgba(165,201,177,.08)!important; }
 .world-mvp__open-chunk-manager span { display:block; margin-top:5px; color:#9eafad; font-size:10px; }
 .world-mvp__map-toolbar { display:flex; align-items:center; justify-content:space-between; margin:9px 0 6px; color:#9eafae; font-size:10px; }

@@ -137,6 +137,13 @@ export class CameraRig {
     }
   }
 
+  // 总览相机选择：自由视角使用透视投影（近大远小），2.5D 使用正交投影（地图编辑）。
+  getOverviewCamera() {
+    return this.freeOverviewActive || this.viewMode === '3d'
+      ? this.perspectiveCamera
+      : this.overviewCamera
+  }
+
   activateCamera(camera) {
     this.camera = camera
     this.createOrbitControls(camera)
@@ -159,7 +166,7 @@ export class CameraRig {
     this.orbit.enabled = false
 
     if (mode === 'overview') {
-      this.activateCamera(this.viewMode === '2.5d' ? this.overviewCamera : this.perspectiveCamera)
+      this.activateCamera(this.getOverviewCamera())
       if (this.viewMode === '2.5d') this.resetOverviewZoom()
       this.transitioningToOverview = true
       const overviewTarget = this.overviewTargets[this.viewMode] || new this.THREE.Vector3()
@@ -235,7 +242,7 @@ export class CameraRig {
     this.viewMode = viewMode
     this.freeOverviewActive = this.freeOverviewAvailable && freeOverviewActive
     // 第一人称始终保持透视投影；2.5D/3D 切换只影响总览与跟随模式。
-    const targetCamera = this.mode === 'firstPerson' || viewMode === '3d'
+    const targetCamera = this.mode === 'firstPerson' || viewMode === '3d' || freeOverviewActive
       ? this.perspectiveCamera
       : this.overviewCamera
 
@@ -243,7 +250,7 @@ export class CameraRig {
       // 正交与透视相机使用不同的缩放机制。按垂直视场高度换算，
       // 但 2.5D 必须使用独立的固定方位，不能继承 3D 总览最后一次旋转/俯仰。
       let visibleHeight
-      if (viewMode === '2.5d') {
+      if (viewMode === '2.5d' && !freeOverviewActive) {
         visibleHeight = previousCamera.isOrthographicCamera
           ? (previousCamera.top - previousCamera.bottom) / previousCamera.zoom
           : 2 * previousDistance * Math.tan(this.THREE.MathUtils.degToRad(previousCamera.fov) / 2)
@@ -427,7 +434,7 @@ export class CameraRig {
     this.overviewCamera.bottom = -span / 2
     this.resetOverviewZoom()
     this.mode = 'overview'
-    this.activateCamera(this.viewMode === '2.5d' ? this.overviewCamera : this.perspectiveCamera)
+    this.activateCamera(this.getOverviewCamera())
     this.desiredTarget.set(targetX, 0, targetZ)
     this.desiredPosition.set(targetX, span * 0.78, targetZ + span * 0.78)
     // 首次按校园内容包络聚焦时，同步初始化两套视角中心；后续用户平移互不覆盖。
@@ -449,7 +456,7 @@ export class CameraRig {
 
   focusCampus() {
     this.mode = 'overview'
-    this.activateCamera(this.viewMode === '2.5d' ? this.overviewCamera : this.perspectiveCamera)
+    this.activateCamera(this.getOverviewCamera())
     if (this.viewMode === '2.5d') this.resetOverviewZoom()
     this.transitioningToOverview = true
     this.overviewTargets['2.5d'].set(0, 0, 0)

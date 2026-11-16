@@ -1,8 +1,10 @@
-// 程序化天空层：渐变穹顶 + 太阳/月亮圆盘 + 上半球星空。
+// 程序化天空层：渐变穹顶 + 太阳/月亮实体球 + 上半球星空。
 // 所有视觉参数来自 skyVisualState 的纯数据，本模块只负责 three 对象装配与生命周期。
 import {
   SKY_DOME_RADIUS,
   CELESTIAL_ORBIT_RADIUS,
+  SUN_DISK_RADIUS,
+  MOON_DISK_RADIUS,
   STAR_COUNT,
   STAR_SHELL_RADIUS,
 } from './skyVisualState.js'
@@ -27,42 +29,67 @@ const DOME_FRAGMENT_SHADER = /* glsl */ `
   }
 `
 
-const CELESTIAL_VERTEX_SHADER = /* glsl */ `
+// 天体显示仰角压缩：真实太阳 14 点仰角约 60°，总览俯瞰视角够不到画面。
+// 只压缩「显示位置」的 y 分量（球体无朝向，不影响光照方向与透明度计算），
+// 让太阳/月亮稳定出现在随视角可见的天空带里。
+const CELESTIAL_HEIGHT_SQUASH = 0.42
+
+// 球体天体通用顶点着色器：球面法线 + 视线方向，用于体积明暗
+const BODY_VERTEX_SHADER = /* glsl */ `
   varying vec2 vUv;
+  varying vec3 vNormalView;
+  varying vec3 vViewDirection;
   void main() {
     vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    vNormalView = normalize(normalMatrix * normal);
+    vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+    vViewDirection = -mvPosition.xyz;
+    gl_Position = projectionMatrix * mvPosition;
   }
 `
 
-// 太阳：白炽核心 + 双层暖色辉光，加性混合模拟发光体。
-const SUN_FRAGMENT_SHADER = /* glsl */ `
+// 太阳球体：核心炽白、边缘暖黄，facing 决定体积明暗
+const SUN_BODY_FRAGMENT_SHADER = /* glsl */ `
   uniform float uOpacity;
+  uniform vec3 uCoreColor;
+  uniform vec3 uEdgeColor;
   varying vec2 vUv;
+  varying vec3 vNormalView;
+  varying vec3 vViewDirection;
   void main() {
-    vec2 p = vUv * 2.0 - 1.0;
-    float d = length(p);
-    float core = 1.0 - smoothstep(0.28, 0.32, d);
-    float innerGlow = (1.0 - smoothstep(0.32, 0.62, d)) * 0.55;
-    float outerGlow = pow(clamp(1.0 - d, 0.0, 1.0), 2.2) * 0.35;
-    vec3 coreColor = vec3(1.0, 0.96, 0.82);
-    vec3 glowColor = vec3(1.0, 0.72, 0.35);
-    vec3 color = coreColor * core + glowColor * (innerGlow + outerGlow);
-    float alpha = clamp(core + innerGlow + outerGlow, 0.0, 1.0) * uOpacity;
-    gl_FragColor = vec4(color * alpha, alpha);
+    float facing = clamp(dot(normalize(vNormalView), normalize(vViewDirection)), 0.0, 1.0);
+    vec3 color = mix(uEdgeColor, uCoreColor, pow(facing, 1.5));
+    gl_FragColor = vec4(color, uOpacity);
     #include <colorspace_fragment>
   }
 `
 
-// 月亮：柔边圆盘 + 程序化 fbm 月海暗斑 + 淡蓝光辉光，普通透明混合。
-const MOON_FRAGMENT_SHADER = /* glsl */ `
+// 太阳辉光球：中心亮、边缘 alpha 渐隐到 0，避免露出球体轮廓（加性混合）。
+const SUN_HALO_FRAGMENT_SHADER = /* glsl */ `
+  uniform float uOpacity;
+  uniform float uPeak;
+  uniform vec3 uColor;
+  varying vec2 vUv;
+  varying vec3 vNormalView;
+  varying vec3 vViewDirection;
+  void main() {
+    float facing = clamp(dot(normalize(vNormalView), normalize(vViewDirection)), 0.0, 1.0);
+    float alpha = uPeak * pow(facing, 2.4) * uOpacity;
+    gl_FragColor = vec4(uColor * alpha, alpha);
+    #include <colorspace_fragment>
+  }
+`
+
+// 月亮球体：球面 fbm 画月海，边缘做球体明暗，不再是平面贴片
+const MOON_BODY_FRAGMENT_SHADER = /* glsl */ `
   uniform float uOpacity;
   varying vec2 vUv;
+  varying vec3 vNormalView;
+  varying vec3 vViewDirection;
 
   float hash21(vec2 p) {
     return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
   }
-
   float valueNoise(vec2 p) {
     vec2 i = floor(p);
     vec2 f = fract(p);
@@ -73,7 +100,6 @@ const MOON_FRAGMENT_SHADER = /* glsl */ `
     float e = hash21(i + vec2(1.0, 1.0));
     return mix(mix(a, b, u.x), mix(c, e, u.x), u.y);
   }
-
   float fbm(vec2 p) {
     float value = 0.0;
     float amplitude = 0.5;
@@ -85,27 +111,30 @@ const MOON_FRAGMENT_SHADER = /* glsl */ `
     return value;
   }
 
+  // 环形山：网格化随机圆坑，坑内略暗、坑缘略亮（月面典型地貌）
+  float craterField(vec2 p) {
+    vec2 cell = floor(p * 7.0);
+    vec2 f = fract(p * 7.0) - 0.5;
+    float r = hash21(cell) * 0.26 + 0.08;
+    vec2 offset = (vec2(hash21(cell + 3.1), hash21(cell + 7.7)) - 0.5) * 0.55;
+    float d = length(f - offset);
+    float bowl = 1.0 - smoothstep(r * 0.65, r, d);
+    float rim = smoothstep(r, r * 1.12, d) * (1.0 - smoothstep(r * 1.12, r * 1.3, d));
+    return bowl - rim * 0.7;
+  }
+
   void main() {
-    vec2 p = vUv * 2.0 - 1.0;
-    float d = length(p);
-    float disk = 1.0 - smoothstep(0.46, 0.5, d);
-    float maria = smoothstep(0.52, 0.72, fbm(p * 3.0 + 5.0));
+    float maria = smoothstep(0.52, 0.74, fbm(vUv * 4.0 + 5.0));
     vec3 surface = mix(vec3(0.91, 0.94, 1.0), vec3(0.6, 0.66, 0.79), maria * 0.85);
-    float limbShading = 1.0 - smoothstep(0.25, 0.5, d) * 0.25;
-    // 辉光覆盖 d∈(0.5,0.9) 的环带，discard 必须在 alpha 算出之后，否则辉光是死代码。
-    float halo = (1.0 - smoothstep(0.5, 0.9, d)) * 0.18;
-    vec3 haloColor = vec3(0.78, 0.85, 1.0);
-    vec3 color = mix(haloColor, surface * limbShading, disk);
-    float alpha = clamp(disk + halo * (1.0 - disk), 0.0, 1.0) * uOpacity;
-    if (alpha <= 0.001) discard;
-    gl_FragColor = vec4(color, alpha);
+    // 环形山明暗（坑暗、缘亮），频率与月海错开
+    float craters = craterField(vUv * 1.35 + 2.7);
+    surface *= 1.0 - clamp(craters, -0.12, 0.22);
+    float facing = clamp(dot(normalize(vNormalView), normalize(vViewDirection)), 0.0, 1.0);
+    float limb = mix(0.55, 1.0, pow(facing, 0.55));
+    gl_FragColor = vec4(surface * limb, uOpacity);
     #include <colorspace_fragment>
   }
 `
-
-// 平面边长为可见主体半径（skyVisualState 的 SUN/MOON_DISK_RADIUS）的约 3.4/4.4 倍，给辉光预留空间。
-const SUN_PLANE_SIZE = 96
-const MOON_PLANE_SIZE = 44
 
 function createDome(THREE) {
   const geometry = new THREE.SphereGeometry(SKY_DOME_RADIUS, 32, 16)
@@ -127,19 +156,69 @@ function createDome(THREE) {
   return { dome, material }
 }
 
-function createGlowBody(THREE, name, planeSize, fragmentShader, blending) {
-  const geometry = new THREE.PlaneGeometry(planeSize, planeSize)
-  const material = new THREE.ShaderMaterial({
-    uniforms: { uOpacity: { value: 0 } },
-    vertexShader: CELESTIAL_VERTEX_SHADER,
-    fragmentShader,
+// 太阳：高亮核心 + 两层递增范围的加性辉光。真实太阳是刺眼光核被大面积柔光包围，
+// 清晰的实体球边缘会显得像"挂了个球"，因此核心缩小、辉光层放大。
+function createSunBody(THREE) {
+  const group = new THREE.Group()
+  group.name = 'sky-sun'
+  const coreMaterial = new THREE.ShaderMaterial({
+    uniforms: {
+      uOpacity: { value: 0 },
+      uCoreColor: { value: new THREE.Color(0xffffff) },
+      uEdgeColor: { value: new THREE.Color(0xffeec0) },
+    },
+    vertexShader: BODY_VERTEX_SHADER,
+    fragmentShader: SUN_BODY_FRAGMENT_SHADER,
     transparent: true,
     depthWrite: false,
     fog: false,
-    blending,
   })
-  const body = new THREE.Mesh(geometry, material)
-  body.name = name
+  const core = new THREE.Mesh(new THREE.SphereGeometry(SUN_DISK_RADIUS * 0.55, 24, 18), coreMaterial)
+  core.name = 'sky-sun-core'
+  core.castShadow = false
+  core.receiveShadow = false
+
+  function makeHalo(name, radius, color, peakOpacity) {
+    const material = new THREE.ShaderMaterial({
+      uniforms: {
+        uOpacity: { value: 0 },
+        uPeak: { value: peakOpacity },
+        uColor: { value: new THREE.Color(color) },
+      },
+      vertexShader: BODY_VERTEX_SHADER,
+      fragmentShader: SUN_HALO_FRAGMENT_SHADER,
+      transparent: true,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+      fog: false,
+    })
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 20, 14), material)
+    mesh.name = name
+    mesh.castShadow = false
+    mesh.receiveShadow = false
+    return mesh
+  }
+  const halo = makeHalo('sky-sun-halo', SUN_DISK_RADIUS * 1.7, 0xffe9b0, 0.34)
+  const glow = makeHalo('sky-sun-glow', SUN_DISK_RADIUS * 3.6, 0xffd98c, 0.11)
+
+  group.add(core, halo, glow)
+  group.userData.coreMaterial = coreMaterial
+  group.userData.halos = [halo, glow]
+  return group
+}
+
+// 月亮：实体球，球面 fbm 月海 + 球体明暗。
+function createMoonBody(THREE) {
+  const material = new THREE.ShaderMaterial({
+    uniforms: { uOpacity: { value: 0 } },
+    vertexShader: BODY_VERTEX_SHADER,
+    fragmentShader: MOON_BODY_FRAGMENT_SHADER,
+    transparent: true,
+    depthWrite: false,
+    fog: false,
+  })
+  const body = new THREE.Mesh(new THREE.SphereGeometry(MOON_DISK_RADIUS, 24, 18), material)
+  body.name = 'sky-moon'
   body.castShadow = false
   body.receiveShadow = false
   return body
@@ -183,24 +262,28 @@ function createStars(THREE) {
 export function createSkyRuntime(THREE) {
   const group = new THREE.Group()
   const { dome, material: domeMaterial } = createDome(THREE)
-  const sun = createGlowBody(THREE, 'sky-sun', SUN_PLANE_SIZE, SUN_FRAGMENT_SHADER, THREE.AdditiveBlending)
-  const moon = createGlowBody(THREE, 'sky-moon', MOON_PLANE_SIZE, MOON_FRAGMENT_SHADER, THREE.NormalBlending)
+  const sun = createSunBody(THREE)
+  const moon = createMoonBody(THREE)
   const stars = createStars(THREE)
   group.add(dome, sun, moon, stars)
+  const sunCoreMaterial = sun.userData.coreMaterial
+  const sunHalos = sun.userData.halos
 
-  const localOrigin = new THREE.Vector3(0, 0, 0)
-  const localUp = new THREE.Vector3(0, 1, 0)
-  const lookMatrix = new THREE.Matrix4()
+  // 显示方向：压缩 y 分量后重新归一化，让天体落在俯瞰视角可见的天空带里。
+  function displayDirection(direction) {
+    const y = Math.max(0.06, direction[1] * CELESTIAL_HEIGHT_SQUASH)
+    const horizontal = Math.sqrt(Math.max(0, 1 - y * y))
+    const length = Math.hypot(direction[0], direction[2])
+    if (length < 1e-6) return new THREE.Vector3(0, y, horizontal)
+    return new THREE.Vector3(
+      (direction[0] / length) * horizontal,
+      y,
+      (direction[2] / length) * horizontal,
+    )
+  }
 
   function placeBody(body, direction) {
-    body.position
-      .set(direction[0], direction[1], direction[2])
-      .multiplyScalar(CELESTIAL_ORBIT_RADIUS)
-    // 圆盘正面恒朝局部球心（group 每帧跟随相机，相机恒在球心）。
-    // 不能用 Object3D.lookAt：它的入参是世界坐标，group 平移后圆盘会朝世界原点，
-    // 远离原点时正面背对相机被背面剔除。Matrix4.lookAt 只吃局部坐标。
-    lookMatrix.lookAt(localOrigin, body.position, localUp)
-    body.quaternion.setFromRotationMatrix(lookMatrix)
+    body.position.copy(displayDirection(direction)).multiplyScalar(CELESTIAL_ORBIT_RADIUS)
   }
 
   function update(state) {
@@ -212,8 +295,13 @@ export function createSkyRuntime(THREE) {
     )
     placeBody(sun, state.sun.direction)
     placeBody(moon, state.moon.direction)
-    sun.material.uniforms.uOpacity.value = state.sun.opacity
+    sunCoreMaterial.uniforms.uOpacity.value = state.sun.opacity
+    for (const halo of sunHalos) {
+      halo.material.uniforms.uOpacity.value = state.sun.opacity
+    }
+    sun.visible = state.sun.opacity > 0.001
     moon.material.uniforms.uOpacity.value = state.moon.opacity
+    moon.visible = state.moon.opacity > 0.001
     stars.material.opacity = state.starsOpacity
   }
 

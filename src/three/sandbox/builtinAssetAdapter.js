@@ -8,6 +8,7 @@
  */
 
 import { createEastGate, createSportsField, createZhiyuanBuilding } from '../world/campus/ncgxyLandmarkGenerators.js'
+import { createZhiyuanRealistic, createZhiyuanStylized } from '../world/campus/zhiyuanStyleVariants.js'
 import { refineBuiltinAssetVisuals } from './builtinAssetRealism.js'
 import { ROAD_DEFINITIONS, createProceduralRoadModel } from './proceduralRoadGenerator.js'
 
@@ -38,6 +39,8 @@ export const BUILTIN_ASSET_CATALOG = Object.freeze([
   { category: 'campus', objectType: 'east-gate', label: '南工东大门', note: '古典三重檐门楼，中央拱门可穿行' },
   { category: 'campus', objectType: 'sports-field', label: '天工体育场（操场）', note: '真实 400m 操场，占地约 186×100 米，需先扩地再放置' },
   { category: 'campus', objectType: 'zhiyuan-building', label: '致远楼（教学楼）', note: '一楼可进入，含 3 间教室，灯光受人工灯光总开关控制' },
+  { category: 'campus', objectType: 'zhiyuan-stylized', label: '致远楼 · 风格化（对比）', note: '风格试点：圆角形体+遮阳鳍片，仅外观' },
+  { category: 'campus', objectType: 'zhiyuan-realistic', label: '致远楼 · 写实（对比）', note: '风格试点：砖纹贴图+逐窗构件，仅外观' },
   ...ROAD_DEFINITIONS.map(definition => ({
     category: 'road',
     objectType: definition.objectType,
@@ -51,6 +54,8 @@ const CAMPUS_GENERATORS = Object.freeze({
   'east-gate': createEastGate,
   'sports-field': createSportsField,
   'zhiyuan-building': createZhiyuanBuilding,
+  'zhiyuan-stylized': createZhiyuanStylized,
+  'zhiyuan-realistic': createZhiyuanRealistic,
 })
 
 export const BUILTIN_ASSET_LABELS = Object.freeze(
@@ -83,6 +88,8 @@ export const BUILTIN_ASSET_DIMENSIONS = Object.freeze({
   'campus:east-gate': { width: 36, height: 13, depth: 8 },
   'campus:sports-field': { width: 186, height: 12, depth: 100 },
   'campus:zhiyuan-building': { width: 80, height: 21, depth: 16 },
+  'campus:zhiyuan-stylized': { width: 80, height: 21, depth: 16 },
+  'campus:zhiyuan-realistic': { width: 80, height: 21, depth: 16 },
   ...Object.fromEntries(ROAD_DEFINITIONS.map(definition => [
     `road:${definition.objectType}`,
     { width: definition.defaultLength, height: 0.1, depth: definition.width },
@@ -113,6 +120,14 @@ const COLLISION_RULES = Object.freeze({
   'campus:zhiyuan-building': {
     required: ['wing', 'colonnade', 'wall', 'partition', 'solid', 'upper', 'desk', 'chair', 'podium'],
     none: ['glass-canopy', 'blackboard', 'window-glass', 'lamptube', 'floor', 'route', 'canopy'],
+  },
+  'campus:zhiyuan-stylized': {
+    required: ['wing', 'colonnade', 'wall', 'solid', 'upper'],
+    none: ['glass', 'floor', 'canopy', 'trim', 'frame', 'sill', 'fin', 'step', 'coping', 'plinth', 'mullion', 'band', 'pipe', 'door'],
+  },
+  'campus:zhiyuan-realistic': {
+    required: ['wing', 'colonnade', 'wall', 'solid', 'upper'],
+    none: ['glass', 'floor', 'canopy', 'trim', 'frame', 'sill', 'fin', 'step', 'coping', 'plinth', 'mullion', 'band', 'pipe', 'door'],
   },
   ...Object.fromEntries(ROAD_DEFINITIONS.map(definition => [`road:${definition.objectType}`, { noneAll: true }])),
 })
