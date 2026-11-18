@@ -1,19 +1,26 @@
 {
-  "name": "ncgxy-campus-map",
+  "name": "worldweave",
   "private": true,
   "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",
     "build": "vite build",
-    "preview": "vite preview --host 0.0.0.0"
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "vitest run"
   },
   "dependencies": {
     "three": "^0.180.0",
-    "vue": "^3.5.13"
+    "vue": "^3.5.13",
+    "polygon-clipping": "^0.15.7",
+    "@dimforge/rapier3d-compat": "0.21.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.2.1",
-    "vite": "^6.0.7"
-  }
+    "vite": "^6.0.7",
+    "vitest": "^2.1.8"
+  },
+  "description": "Worldweave（织界）— 源码公开的 AI 三维世界沙盒",
+  "license": "CC-BY-NC-SA-4.0",
+  "author": "Worldweave contributors"
 }

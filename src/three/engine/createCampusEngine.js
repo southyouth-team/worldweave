@@ -1,111 +1,5651 @@
 import * as THREE from 'three'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
 import { createCampusScene } from '../world/campus/createCampusScene.js'
+import { ShadowSystem } from './ShadowSystem.js'
+import { MotionProbe, extractMotionStalls } from '../diagnostics/MotionProbe.js'
+import { advanceFrameTiming } from './FrameTiming.js'
+import { createCampusSceneRenderData, auditCampusSceneFeatureCoverage, validateCampusBuildingModels, auditCampusBuildingModelGeometry, createCampusBuildingAssetInventory } from '../world/campus/campusSceneData.js'
+import { createRpgSampleScene } from '../world/campus/createRpgSampleScene.js'
+import { createBlankSandboxScene } from '../world/campus/createBlankSandboxScene.js'
 import { CameraRig } from '../camera/CameraRig.js'
+import { TransformControls } from 'three/addons/controls/TransformControls.js'
 import { InputController } from '../controls/InputController.js'
-import { loadCampusBuildingModels } from '../world/buildings/loadCampusBuildingModels.js'
+import { PlayerCharacterRuntime } from '../characters/PlayerCharacterRuntime.js'
+import { createPlayerPresetModel, getPlayerPreset } from '../characters/playerPresets.js'
+import { snapPlacementCenter } from '../sandbox/placementSnap.js'
+import { CollisionWorld } from '../physics/CollisionWorld.js'
+import { PhysicsRuntime } from '../physics/PhysicsRuntime.js'
+import { getVirtualSunState } from './solarPosition.js'
+import { getSkyVisualState } from './skyVisualState.js'
+import { createSkyRuntime } from './skyRuntime.js'
+import { createRainFieldRuntime } from './rainFieldRuntime.js'
+import {
+  createCloudLayerRuntime, createSnowFieldRuntime, getCloudTint, resolveWeatherMode,
+} from './weatherRuntime.js'
+import { applyEnvironmentBindings, applyWorldStateBindings } from './worldStateRuntime.js'
+import { applySandboxLightingState } from './sandboxLightingRuntime.js'
+import { refreshModelPhysicsRegistration, refreshModelSpatialRegistration } from './modelSpatialRuntime.js'
+import {
+  collectModelWaterVolumes,
+  samplePlayerWaterState,
+} from './waterVolumeRuntime.js'
+import {
+  createModelAnimationRuntime,
+  createSandboxEnvironmentSnapshot,
+} from './modelAnimationRuntime.js'
+import { createSandboxInteractionIndex } from './sandboxInteractionRuntime.js'
+import { executeSandboxInteractionAction } from './sandboxActionRuntime.js'
+import { resolveSandboxInteriorEntryPoint } from './sandboxInteriorRuntime.js'
+import { clonePlacedSandboxModel, disposeSandboxMaterial } from './sandboxModelLifecycle.js'
+import { batchStaticModel, explainBatching, resolveStaticBatchPartId } from '../sandbox/staticModelBatcher.js'
+import { createIndoorFloor, getStairTraversalPoints, getStairStepHeight, isAtStairLanding, getIndoorInteractionPrompt, planIndoorFloorRoute } from '../indoor/indoorScene.js'
+import { indoorBuildingDefinitions, validateIndoorBuilding, createIndoorBuildingFromFootprint, transformIndoorFootprint } from '../indoor/indoorBuildingDefinitions.js'
+import { CAMPUS_PLAYER_SPAWN_PIXEL, mapPixelToWorld } from '../../data/campus/campusLayout.js'
+import { roadNetworkToMultiPolygon } from '../../editor/campusEditorDocument.js'
+import { fromCampusFeatureCollection, toCampusFeatureCollection } from '../../editor/campusFeatureCollection.js'
+import { mapEditorPointToCalibratedWorld } from '../../editor/campusMapCalibration.js'
+import { createCampusMaterials, createPixelBuilding, validateBuildingFootprint } from '../world/campus/campusAssetLibrary.js'
+import { disposeOwnedGeometry } from '../world/proceduralGeometry.js'
+import { createBuiltinSandboxModel } from '../sandbox/builtinAssetAdapter.js'
+import {
+  ROAD_OBJECT_TYPES,
+  areRoadPointsValid,
+  getRoadEndpoints,
+  getRoadEdgeStations,
+  getRoadFootprint,
+  getRoadStations,
+  insertRoadBreakpointAt,
+  insertRoadBreakpoints,
+  isAnyStretchableRoadModel,
+  isPolylineRoadModel,
+  mergeRoadPointSequences,
+  pointsTotalLength,
+  removeRoadPoint,
+  snapRoadPointToExisting,
+} from '../sandbox/roadEndpointMath.js'
+import { ROAD_DEFINITIONS, createPolylineRoadModel, createProceduralRoadModel, createRoadSurfaceMaterial } from '../sandbox/proceduralRoadGenerator.js'
+import { buildRoadJunctionPatches } from '../sandbox/roadJunctionBuilder.js'
+import {
+  buildFootprintProbes,
+  polygonBounds as footprintPolygonBounds,
+  polygonCentroid,
+  polygonSelfIntersects,
+  triangulatePolygon,
+} from '../sandbox/footprintPolygon.js'
+import { createSandboxRoadEditor } from './sandboxRoadEditor.js'
 
-export function createCampusEngine(container, callbacks = {}) {
+function getObjectLocalBounds(THREE, root) {
+  root.updateWorldMatrix(true, true)
+  const inverseRoot = new THREE.Matrix4().copy(root.matrixWorld).invert()
+  const bounds = new THREE.Box3()
+  let hasGeometry = false
+  root.traverse(object => {
+    if (!object.isMesh || !object.geometry) return
+    if (!object.geometry.boundingBox) object.geometry.computeBoundingBox()
+    if (!object.geometry.boundingBox) return
+    const relativeMatrix = new THREE.Matrix4().multiplyMatrices(inverseRoot, object.matrixWorld)
+    const localGeometryBounds = object.geometry.boundingBox.clone().applyMatrix4(relativeMatrix)
+    bounds.union(localGeometryBounds)
+    hasGeometry = true
+  })
+  if (!hasGeometry) {
+    const worldBounds = new THREE.Box3().setFromObject(root)
+    const corners = []
+    for (const x of [worldBounds.min.x, worldBounds.max.x]) {
+      for (const y of [worldBounds.min.y, worldBounds.max.y]) {
+        for (const z of [worldBounds.min.z, worldBounds.max.z]) {
+          corners.push(root.worldToLocal(new THREE.Vector3(x, y, z)))
+        }
+      }
+    }
+    corners.forEach(point => bounds.expandByPoint(point))
+  }
+  return bounds
+}
+
+export function createCampusEngine(container, callbacks = {}, options = {}) {
+  const isBlankSandbox = options.sceneType === 'blank-sandbox'
+  const isRpgSample = options.sceneType === 'rpg-sample' || isBlankSandbox
   let renderer
   let scene
+  let campus
+  let lastPlayerX = 0
+  let lastPlayerZ = 24
+  let lastPlayerY = 0
+  let lastPlayerVisibility = null
+  let shadowSystem = null
   let cameraRig
   let input
+  let collisionWorld
+  let physicsRuntime = null
+  let outdoorCollisionWorld = null
+  let indoorGroup = null
+  let indoorBuilding = null
+  let indoorOutdoorTarget = null
+  let indoorOutdoorBase = null
+  let currentIndoorFloor = null
+  let stairInteractionActive = false
+  let nearIndoorRoom = null
+  let nearIndoorExit = false
+  let indoorPromptKey = ''
+  let activeIndoorRoom = null
+  let roomReturnPosition = null
+  let pendingRoomTransition = null
+  let stairTransition = null
+  let outdoorState = null
+  let nearOutdoorEntrance = false
+  let nearOutdoorBuildingId = null
+  let sampleTeachingBuilding = null
+  let sampleTeachingEntranceLocal = null
+  let sampleTeachingEntranceWorld = null
+  let sampleTeachingEntranceRadius = 0
+  let nearSandboxModelId = null
+  let nearSandboxInteractionTarget = null
+  let nearSandboxInteractionKey = null
+  // 建筑入口在场景初始化时索引；玩家未移动时不重复遍历整个校园场景树。
+  let outdoorEntranceObjects = []
+  let lastEntranceCheckPosition = null
   let frameId = 0
+  let playerSpriteObject = null
+  let playerCharacterRuntime = null
   let resizeObserver
-  let previousTime = 0
+  let previousTime = null
+  let simulationTimeSeconds = 0
+  let lastFrameTiming = null
+  let lastPhysicsStepResult = null
   let initialized = false
-
-  async function init() {
-    if (!container) throw new Error('未找到三维场景容器')
-
-    scene = new THREE.Scene()
-    scene.background = new THREE.Color('#aebfbd')
-    scene.fog = new THREE.Fog('#aebfbd', 90, 260)
-
-    renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false })
-    // 关闭抗锯齿并限制渲染倍率，保持像素边缘清晰并控制 GPU 开销。\n    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.5))
-    renderer.setSize(container.clientWidth, container.clientHeight)
-    renderer.shadowMap.enabled = true
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap
-    renderer.outputColorSpace = THREE.SRGBColorSpace
-    renderer.toneMapping = THREE.ACESFilmicToneMapping
-    renderer.toneMappingExposure = 1.15
-    container.appendChild(renderer.domElement)
-
-    const campus = createCampusScene(THREE)
-    scene.add(campus)
-    loadCampusBuildingModels(scene)
-      .then((result) => callbacks.onAssetsLoaded?.(result))
-      .catch((error) => callbacks.onAssetError?.(error))
-    cameraRig = new CameraRig(THREE, renderer.domElement)
-    input = new InputController(THREE, renderer.domElement, cameraRig, campus.userData.walkableBounds)
-    input.attach()
-
-    const hemi = new THREE.HemisphereLight(0xe8f0e8, 0x64735e, 2.0)
-    scene.add(hemi)
-    const sun = new THREE.DirectionalLight(0xffedcf, 3.0)
-    sun.position.set(-55, 90, 45)
-    sun.castShadow = true
-    sun.shadow.mapSize.set(2048, 2048)
-    sun.shadow.camera.left = -100
-    sun.shadow.camera.right = 100
-    sun.shadow.camera.top = 100
-    sun.shadow.camera.bottom = -100
-    sun.shadow.bias = -0.0002
-    scene.add(sun)
-
-    resizeObserver = new ResizeObserver(resize)
-    resizeObserver.observe(container)
-    window.addEventListener('keydown', onKeyDown)
-    initialized = true
-    callbacks.onReady?.()
-    animate(0)
+  let selectedFeatureObject = null
+  let selectedIndoorObject = null
+  let rpgPreviewGroup = null
+  // 远景地面跟随当前相机的水平位置，避免低俯仰角下有限平面边缘进入视野。
+  let activeHorizonGround = null
+  let editorPreviewActive = false
+  let loadedBuildingModels = []
+  let buildingModelsLoadPromise = null
+  let cameraObstacleRoots = []
+  let disposed = false
+  const outdoorBuildingBaselines = new WeakMap()
+  const raycaster = new THREE.Raycaster()
+  const pointerNdc = new THREE.Vector2()
+  let pointerStart = null
+  let generatedAssetsGroup = null
+  const generatedAssets = new Map()
+  const sandboxModels = new Map()
+  const sandboxInteractionIndex = createSandboxInteractionIndex(THREE)
+  const sandboxWaterVolumes = new Map()
+  const modelAnimationRuntime = createModelAnimationRuntime({
+    onError(error, detail) {
+      console.warn('[SandboxModelAnimation] ' + detail.phase + ': ' + detail.modelId, error)
+      callbacks.onSandboxModelAnimationError?.(error, detail)
+    },
+    onActiveChange(active) {
+      if (active) requestFrame()
+    },
+  })
+  let lastPlayerWaterStateKey = null
+  let sandboxModelSequence = 0
+  let activeSandboxInterior = null
+  let sandboxSelectedModel = null
+  let sandboxSelectionHelper = null
+  let sandboxTransform = null
+  let sandboxRoadEditor = null
+  let sandboxRoadJunctionGroup = null
+  const sandboxRoadJunctionMaterials = new Map()
+  let placementState = null
+  // AI 沙盒模型采用分层选址；与旧 generatedAssets 的 placementState 完全隔离。
+  let sandboxPlacementState = null
+  let sandboxPlacementFootprint = null
+  let sandboxPlacementFootprintOutline = null
+  let chunkManagementActive = false
+  let chunkManagementPreviousCameraMode = null
+  let selectedSandboxChunkKeys = new Set()
+  let selectedGeneratedAsset = null
+  let generatedAssetSequence = 0
+  let navigationVisualGroup = null
+  let navigationWasActive = false
+  let pendingIndoorFloorTarget = null
+  // 同时兼容普通查询参数与 Vue Router Hash 路由中的查询参数。
+  // 例如 /?render-debug=1 和 /#/map?render-debug=1 都应启用诊断。
+  const renderDebugEnabled = (() => {
+    const searchParams = new URLSearchParams(window.location.search)
+    const hashQueryIndex = window.location.hash.indexOf('?')
+    const hashQuery = hashQueryIndex >= 0 ? window.location.hash.slice(hashQueryIndex + 1) : ''
+    const hashParams = new URLSearchParams(hashQuery)
+    return searchParams.has('render-debug') || hashParams.has('render-debug')
+  })()
+  // A/B 诊断模式：保留静态世界阴影，暂时排除动态 ShadowMap 刷新及角色投影成本。
+  const staticShadowTestEnabled = (() => {
+    const searchParams = new URLSearchParams(window.location.search)
+    const hashQueryIndex = window.location.hash.indexOf('?')
+    const hashQuery = hashQueryIndex >= 0 ? window.location.hash.slice(hashQueryIndex + 1) : ''
+    const hashParams = new URLSearchParams(hashQuery)
+    return searchParams.get('shadow-static-test') === '1' || hashParams.get('shadow-static-test') === '1'
+  })()
+  // 走动平滑度探针：记录每帧渲染锚点位移/物理步数/帧调度，定位 trace 帧时序无法反映的体感卡顿。
+  const motionProbeEnabled = (() => {
+    const searchParams = new URLSearchParams(window.location.search)
+    const hashQueryIndex = window.location.hash.indexOf('?')
+    const hashQuery = hashQueryIndex >= 0 ? window.location.hash.slice(hashQueryIndex + 1) : ''
+    const hashParams = new URLSearchParams(hashQuery)
+    return searchParams.get('motion-probe') === '1' || hashParams.get('motion-probe') === '1'
+  })()
+  let renderDebugFrame = 0
+  let lastRenderCostMs = 0
+  const motionProbe = motionProbeEnabled ? new MotionProbe() : null
+  let motionProbeLastPlayer = null
+  let motionProbeFrameCount = 0
+  const framePerformanceSamples = []
+  const longTaskSamples = []
+  const gpuTimeSamples = []
+  const pendingGpuTimeQueries = []
+  let frameSequence = 0
+  let gpuTimerExtension = null
+  let gpuTimerUnavailableReason = 'not-initialized'
+  let activeGpuTimeQuery = null
+  let longTaskObserver = null
+  let longTaskCount = 0
+  let longTaskTotalDurationMs = 0
+  let longTaskMaxDurationMs = 0
+  if (renderDebugEnabled && typeof PerformanceObserver !== 'undefined'
+    && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+    longTaskObserver = new PerformanceObserver(list => {
+      for (const entry of list.getEntries()) {
+        longTaskCount += 1
+        longTaskTotalDurationMs += entry.duration
+        longTaskMaxDurationMs = Math.max(longTaskMaxDurationMs, entry.duration)
+        longTaskSamples.push({
+          startTimeMs: Number(entry.startTime.toFixed(2)),
+          endTimeMs: Number((entry.startTime + entry.duration).toFixed(2)),
+          durationMs: Number(entry.duration.toFixed(2)),
+          attribution: Array.from(entry.attribution || []).slice(0, 4).map(item => ({
+            name: item.name || null,
+            containerType: item.containerType || null,
+            containerName: item.containerName || null,
+            containerId: item.containerId || null,
+          })),
+        })
+        if (longTaskSamples.length > 30) longTaskSamples.shift()
+      }
+    })
+    longTaskObserver.observe({ type: 'longtask', buffered: true })
+  }
+  function initializeGpuTimerDiagnostics() {
+    if (!renderDebugEnabled || !renderer) return
+    const gl = renderer.getContext()
+    if (typeof gl.createQuery !== 'function' || typeof gl.beginQuery !== 'function') {
+      gpuTimerUnavailableReason = 'webgl2-query-api-unavailable'
+      return
+    }
+    gpuTimerExtension = gl.getExtension('EXT_disjoint_timer_query_webgl2')
+    gpuTimerUnavailableReason = gpuTimerExtension ? null : 'EXT_disjoint_timer_query_webgl2-unavailable'
   }
 
+  function collectGpuTimerResults() {
+    if (!gpuTimerExtension || !renderer) return
+    const gl = renderer.getContext()
+    const disjoint = gl.getParameter(gpuTimerExtension.GPU_DISJOINT_EXT)
+    if (disjoint) {
+      for (const pending of pendingGpuTimeQueries.splice(0)) gl.deleteQuery(pending.query)
+      gpuTimeSamples.length = 0
+      return
+    }
+    for (let index = pendingGpuTimeQueries.length - 1; index >= 0; index -= 1) {
+      const pending = pendingGpuTimeQueries[index]
+      if (!gl.getQueryParameter(pending.query, gl.QUERY_RESULT_AVAILABLE)) continue
+      const elapsedNanoseconds = gl.getQueryParameter(pending.query, gl.QUERY_RESULT)
+      gl.deleteQuery(pending.query)
+      pendingGpuTimeQueries.splice(index, 1)
+      if (Number.isFinite(elapsedNanoseconds) && elapsedNanoseconds >= 0) {
+        gpuTimeSamples.push({
+          frame: pending.frame,
+          startedAtMs: pending.startedAtMs,
+          completedAtMs: performance.now(),
+          durationMs: elapsedNanoseconds / 1e6,
+        })
+        if (gpuTimeSamples.length > 120) gpuTimeSamples.shift()
+      }
+    }
+  }
+
+  function beginGpuTimeQuery() {
+    if (!gpuTimerExtension || !renderer || activeGpuTimeQuery || pendingGpuTimeQueries.length >= 16) return
+    const gl = renderer.getContext()
+    const query = gl.createQuery()
+    if (!query) return
+    try {
+      gl.beginQuery(gpuTimerExtension.TIME_ELAPSED_EXT, query)
+      activeGpuTimeQuery = { query, frame: frameSequence + 1, startedAtMs: performance.now() }
+    } catch (error) {
+      gl.deleteQuery(query)
+      gpuTimerUnavailableReason = 'gpu-timer-query-begin-failed: ' + String(error?.message || error)
+      gpuTimerExtension = null
+    }
+  }
+
+  function endGpuTimeQuery() {
+    if (!activeGpuTimeQuery || !renderer || !gpuTimerExtension) return
+    const gl = renderer.getContext()
+    try {
+      gl.endQuery(gpuTimerExtension.TIME_ELAPSED_EXT)
+      pendingGpuTimeQueries.push(activeGpuTimeQuery)
+      activeGpuTimeQuery = null
+    } catch (error) {
+      gl.deleteQuery(activeGpuTimeQuery.query)
+      activeGpuTimeQuery = null
+      gpuTimerUnavailableReason = 'gpu-timer-query-end-failed: ' + String(error?.message || error)
+      gpuTimerExtension = null
+    }
+  }
+
+  function disposeGpuTimerDiagnostics() {
+    if (!renderer) return
+    const gl = renderer.getContext()
+    if (activeGpuTimeQuery) {
+      try { gl.endQuery(gpuTimerExtension?.TIME_ELAPSED_EXT) } catch {}
+      gl.deleteQuery(activeGpuTimeQuery.query)
+      activeGpuTimeQuery = null
+    }
+    for (const pending of pendingGpuTimeQueries.splice(0)) gl.deleteQuery(pending.query)
+    gpuTimeSamples.length = 0
+    gpuTimerExtension = null
+  }
+
+  function getFramePerformanceDiagnostics() {
+    if (!framePerformanceSamples.length) return null
+    const summarize = key => {
+      const values = framePerformanceSamples.map(sample => sample[key]).sort((a, b) => a - b)
+      const percentile = ratio => Number(values[Math.min(values.length - 1, Math.ceil(values.length * ratio) - 1)].toFixed(2))
+      const total = values.reduce((sum, value) => sum + value, 0)
+      return {
+        avg: Number((total / values.length).toFixed(2)),
+        p50: percentile(0.5),
+        p90: percentile(0.9),
+        p95: percentile(0.95),
+        p99: percentile(0.99),
+        max: Number(values[values.length - 1].toFixed(2)),
+      }
+    }
+    const rafIntervals = framePerformanceSamples.map(sample => sample.rafIntervalMs)
+    return {
+      sampleCount: framePerformanceSamples.length,
+      window: 'last up to 120 rendered frames',
+      rafIntervalMs: summarize('rafIntervalMs'),
+      rafFramesOver10ms: rafIntervals.filter(value => value > 10).length,
+      rafFramesOver12ms: rafIntervals.filter(value => value > 12).length,
+      rafFramesOver16_7ms: rafIntervals.filter(value => value > 16.7).length,
+      updateCpuMs: summarize('updateCpuMs'),
+      renderSubmitCpuMs: summarize('renderSubmitCpuMs'),
+      totalFrameCpuMs: summarize('totalFrameCpuMs'),
+      gpuTimeMs: gpuTimeSamples.length ? (() => {
+        const values = gpuTimeSamples.map(sample => sample.durationMs).sort((a, b) => a - b)
+        const percentile = ratio => Number(values[Math.min(values.length - 1, Math.ceil(values.length * ratio) - 1)].toFixed(2))
+        return {
+          sampleCount: values.length,
+          window: 'last up to 120 completed GPU timer queries',
+          avg: Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(2)),
+          p50: percentile(0.5),
+          p90: percentile(0.9),
+          p95: percentile(0.95),
+          max: Number(values[values.length - 1].toFixed(2)),
+          recentSlowSamples: gpuTimeSamples.filter(sample =>
+            sample.durationMs >= 8.33
+            && sample.startedAtMs >= framePerformanceSamples[0].startedAtMs
+            && sample.startedAtMs <= framePerformanceSamples[framePerformanceSamples.length - 1].endedAtMs
+          ).slice(-10).map(sample => ({
+            frame: sample.frame,
+            startedAtMs: Number(sample.startedAtMs.toFixed(2)),
+            completedAtMs: Number(sample.completedAtMs.toFixed(2)),
+            durationMs: Number(sample.durationMs.toFixed(2)),
+          })),
+          pendingQueries: pendingGpuTimeQueries.length + (activeGpuTimeQuery ? 1 : 0),
+        }
+      })() : {
+        supported: Boolean(gpuTimerExtension),
+        unavailableReason: gpuTimerUnavailableReason,
+        sampleCount: 0,
+        pendingQueries: pendingGpuTimeQueries.length + (activeGpuTimeQuery ? 1 : 0),
+      },
+      frameWindow: {
+        startedAtMs: Number(framePerformanceSamples[0].startedAtMs.toFixed(2)),
+        endedAtMs: Number(framePerformanceSamples[framePerformanceSamples.length - 1].endedAtMs.toFixed(2)),
+      },
+      frameStalls: framePerformanceSamples.filter(sample =>
+        sample.rafIntervalMs > 10 || sample.totalFrameCpuMs > 10 || sample.renderSubmitCpuMs > 8.33
+      ).slice(-12).map(sample => ({
+        frame: sample.frame,
+        startedAtMs: Number(sample.startedAtMs.toFixed(2)),
+        endedAtMs: Number(sample.endedAtMs.toFixed(2)),
+        rafIntervalMs: Number(sample.rafIntervalMs.toFixed(2)),
+        updateCpuMs: Number(sample.updateCpuMs.toFixed(2)),
+        renderSubmitCpuMs: Number(sample.renderSubmitCpuMs.toFixed(2)),
+        totalFrameCpuMs: Number(sample.totalFrameCpuMs.toFixed(2)),
+      })),
+      longTasks: {
+        supported: Boolean(longTaskObserver),
+        countSinceInitialization: longTaskCount,
+        totalDurationMs: Number(longTaskTotalDurationMs.toFixed(2)),
+        maxDurationMs: Number(longTaskMaxDurationMs.toFixed(2)),
+        thresholdMs: 50,
+        recent: longTaskSamples.filter(task =>
+          task.startTimeMs < framePerformanceSamples[framePerformanceSamples.length - 1].endedAtMs
+          && task.endTimeMs > framePerformanceSamples[0].startedAtMs
+        ).slice(-12).map(task => ({
+          ...task,
+          overlappingFrames: framePerformanceSamples.filter(frame =>
+            task.startTimeMs < frame.endedAtMs && task.endTimeMs > frame.startedAtMs
+          ).map(frame => frame.frame),
+        })),
+        outsideCurrentFrameWindowCount: longTaskSamples.filter(task =>
+          task.endTimeMs <= framePerformanceSamples[0].startedAtMs
+          || task.startTimeMs >= framePerformanceSamples[framePerformanceSamples.length - 1].endedAtMs
+        ).length,
+      },
+    }
+  }
+  let directionalLight = null
+  let hemisphereLight = null
+  let skyRuntime = null
+  let rainField = null
+  let cloudLayer = null
+  let snowField = null
+  let weatherModeName = 'clear'
+  let weatherModeIntensity = 0.5
+  let playerCharacterPresetId = null
+  let playerCharacterTargetHeight = 2.25
+  let playerCharacterGender = 'male'
+  let windSwayTargets = []
+  let environmentConfig = {
+    time: 14,
+    timeOfDay: 'day',
+    weather: 'clear',
+    wind: 0,
+    windDirection: { x: 1, z: 0 },
+    artificialLightingEnabled: true,
+  }
+  let initializationStage = 'created'
+
+  /**
+   * Generated asset definitions stay independent from the sandbox. This group stores
+   * only placed instances and their world-space transforms; the campus sample is untouched.
+   */
+  function getGeneratedAssetBounds(object) {
+    object.updateWorldMatrix(true, true)
+    return new THREE.Box3().setFromObject(object)
+  }
+
+  function updateGeneratedAssetObstacle(instance) {
+    if (!collisionWorld || !instance?.userData?.generatedAssetObstacle) return
+    const bounds = getGeneratedAssetBounds(instance)
+    const obstacle = instance.userData.generatedAssetObstacle
+    obstacle.minX = bounds.min.x
+    obstacle.maxX = bounds.max.x
+    obstacle.minZ = bounds.min.z
+    obstacle.maxZ = bounds.max.z
+  }
+
+  function beginGeneratedAssetPlacement(model, options = {}) {
+    if (sandboxPlacementState) throw new Error('请先完成或取消当前 AI 模型选址')
+    if (!isRpgSample || !campus || !generatedAssetsGroup) throw new Error('资产放置仅在沙盒场景中可用')
+    if (indoorGroup) throw new Error('请先退出室内空间，再放置资产')
+    const existing = options.instanceId ? generatedAssets.get(options.instanceId) : null
+    if (!existing && (!model?.isObject3D || model.parent)) throw new TypeError('生成资产必须是未挂载的 THREE.Object3D')
+    if (options.instanceId && !existing) throw new Error('待移动的资产实例不存在')
+    if (!existing) {
+      model.updateMatrixWorld(true)
+      const sourceBounds = new THREE.Box3().setFromObject(model)
+      const sourceSize = sourceBounds.getSize(new THREE.Vector3())
+      if (sourceBounds.isEmpty() || ![sourceSize.x, sourceSize.y, sourceSize.z].every(value => Number.isFinite(value) && value > 0.001)) {
+        throw new Error('生成资产几何尺寸无效')
+      }
+      const width = Number(options.width) || 14.8
+      const depth = Number(options.depth) || 8.5
+      const height = Number(options.height) || ((Number(options.floors) || 2) * (Number(options.floorHeight) || 4.2))
+      const holder = new THREE.Group()
+      holder.name = 'generated-asset-instance'
+      model.position.x -= (sourceBounds.min.x + sourceBounds.max.x) / 2
+      model.position.y -= sourceBounds.min.y
+      model.position.z -= (sourceBounds.min.z + sourceBounds.max.z) / 2
+      holder.add(model)
+      const fitScale = Math.min(width / sourceSize.x, height / sourceSize.y, depth / sourceSize.z)
+      if (!Number.isFinite(fitScale) || fitScale <= 0) throw new Error('无法计算资产等比缩放')
+      holder.scale.setScalar(fitScale)
+      const id = 'asset_' + (++generatedAssetSequence) + '_' + Date.now().toString(36)
+      holder.userData.generatedAssetId = id
+      holder.userData.assetType = options.assetType || 'building'
+      holder.userData.displayName = options.name || 'AI 生成资产'
+      holder.userData.assetDefinition = options.spec || null
+      holder.userData.floorCount = Number.isInteger(options.floors) ? options.floors : 2
+      holder.userData.floorHeight = Number(options.floorHeight) || 4.2
+      generatedAssets.set(id, holder)
+      generatedAssetsGroup.add(holder)
+      placementState = { instance: holder, isNew: true, originalPosition: holder.position.clone(), originalRotation: holder.rotation.clone() }
+    } else {
+      placementState = { instance: existing, isNew: false, originalPosition: existing.position.clone(), originalRotation: existing.rotation.clone() }
+    }
+    selectedGeneratedAsset = placementState.instance
+    selectedGeneratedAsset.userData.isPlacementPreview = true
+    cameraRig?.setMode('overview')
+    input?.setMode('overview')
+    input?.setMovementEnabled(false)
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    callbacks.onGeneratedAssetPlacementChange?.({ active: true, asset: serializeGeneratedAsset(selectedGeneratedAsset), isNew: placementState.isNew })
+    requestFrame()
+    return serializeGeneratedAsset(selectedGeneratedAsset)
+  }
+
+  function serializeGeneratedAsset(instance) {
+    if (!instance) return null
+    return {
+      id: instance.userData.generatedAssetId,
+      name: instance.userData.displayName,
+      position: { x: instance.position.x, y: instance.position.y, z: instance.position.z },
+      rotation: { x: instance.rotation.x, y: instance.rotation.y, z: instance.rotation.z },
+      scale: { x: instance.scale.x, y: instance.scale.y, z: instance.scale.z },
+      dimensions: (() => {
+        const b = getGeneratedAssetBounds(instance)
+        return { width: b.max.x - b.min.x, depth: b.max.z - b.min.z, height: b.max.y - b.min.y }
+      })(),
+    }
+  }
+
+  function getGeneratedAssets() {
+    return Array.from(generatedAssets.values()).map(serializeGeneratedAsset)
+  }
+
+  function updatePlacementFromPointer(event) {
+    if (!placementState || !renderer || !cameraRig) return
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const ground = new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.012)
+    const point = new THREE.Vector3()
+    if (!raycaster.ray.intersectPlane(ground, point)) return
+    // 沙盒样板有效地面约为 54 × 42；边界按场景空间限制，避免资产落到场景外。
+    point.x = THREE.MathUtils.clamp(point.x, -26 + 0.5, 26 - 0.5)
+    point.z = THREE.MathUtils.clamp(point.z, -20 + 0.5, 20 - 0.5)
+    placementState.instance.position.set(point.x, 0.012, point.z)
+    updateGeneratedAssetObstacle(placementState.instance)
+    requestFrame()
+  }
+
+  function confirmGeneratedAssetPlacement() {
+    if (!placementState) return false
+    const instance = placementState.instance
+    instance.userData.isPlacementPreview = false
+    const bounds = getGeneratedAssetBounds(instance)
+    if (!instance.userData.generatedAssetObstacle && collisionWorld) {
+      const obstacle = { minX: bounds.min.x, maxX: bounds.max.x, minZ: bounds.min.z, maxZ: bounds.max.z }
+      collisionWorld.obstacles.push(obstacle)
+      instance.userData.generatedAssetObstacle = obstacle
+    } else updateGeneratedAssetObstacle(instance)
+    placementState = null
+    input?.setMovementEnabled(true)
+    cameraRig?.setMode('thirdPerson')
+    input?.setMode('thirdPerson')
+    callbacks.onGeneratedAssetPlacementChange?.({ active: false, asset: serializeGeneratedAsset(instance) })
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    requestFrame()
+    return true
+  }
+
+  function cancelGeneratedAssetPlacement() {
+    if (!placementState) return false
+    const { instance, isNew, originalPosition, originalRotation } = placementState
+    if (isNew) {
+      generatedAssets.delete(instance.userData.generatedAssetId)
+      instance.parent?.remove(instance)
+      disposeObjectGroup(instance)
+    } else {
+      instance.position.copy(originalPosition)
+      instance.rotation.copy(originalRotation)
+      updateGeneratedAssetObstacle(instance)
+    }
+    placementState = null
+    selectedGeneratedAsset = null
+    input?.setMovementEnabled(true)
+    cameraRig?.setMode('thirdPerson')
+    input?.setMode('thirdPerson')
+    callbacks.onGeneratedAssetPlacementChange?.({ active: false, cancelled: true })
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    requestFrame()
+    return true
+  }
+
+  function moveGeneratedAsset(id) {
+    const instance = generatedAssets.get(String(id))
+    if (!instance) return false
+    return Boolean(beginGeneratedAssetPlacement(null, { instanceId: String(id) }))
+  }
+
+  function rotateGeneratedAsset(id, radians = Math.PI / 12) {
+    const instance = generatedAssets.get(String(id))
+    if (!instance) return false
+    instance.rotation.y += Number(radians) || Math.PI / 12
+    updateGeneratedAssetObstacle(instance)
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    requestFrame()
+    return true
+  }
+
+  function removeGeneratedAsset(id) {
+    const instance = generatedAssets.get(String(id))
+    if (!instance) return false
+    if (placementState?.instance === instance) placementState = null
+    if (instance.userData.generatedAssetObstacle && collisionWorld) {
+      const index = collisionWorld.obstacles.indexOf(instance.userData.generatedAssetObstacle)
+      if (index >= 0) collisionWorld.obstacles.splice(index, 1)
+    }
+    generatedAssets.delete(String(id))
+    instance.parent?.remove(instance)
+    disposeObjectGroup(instance)
+    if (selectedGeneratedAsset === instance) selectedGeneratedAsset = null
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    requestFrame()
+    return true
+  }
+
+  function selectGeneratedAsset(instance) {
+    if (!instance?.userData?.generatedAssetId) return false
+    selectedGeneratedAsset = instance
+    callbacks.onGeneratedAssetSelected?.(serializeGeneratedAsset(instance))
+    callbacks.onGeneratedAssetsChange?.(getGeneratedAssets())
+    return true
+  }
+
+  function getSandboxPlacementWorldBounds() {
+    const bounds = campus?.userData?.sampleBounds || campus?.userData?.contentBounds || {}
+    const width = Math.max(20, Number(bounds.width) || 54)
+    const depth = Math.max(20, Number(bounds.depth) || 42)
+    return {
+      width,
+      depth,
+      centerX: Number.isFinite(bounds.centerX) ? bounds.centerX : 0,
+      centerZ: Number.isFinite(bounds.centerZ) ? bounds.centerZ : 0,
+    }
+  }
+
+  function getSandboxWorldState() {
+    return isBlankSandbox ? campus?.userData?.getWorldState?.() || null : null
+  }
+
+  function getPhysicsDiagnostics() {
+    const characterState = physicsRuntime?.getKinematicCharacterState?.(input?.physicsCharacterId)
+    return {
+      active: Boolean(physicsRuntime && !physicsRuntime.disposed),
+      bodyCount: physicsRuntime?.bodies?.size || 0,
+      fixedTimeStep: physicsRuntime?.fixedTimeStep || null,
+      accumulator: physicsRuntime?.accumulator || 0,
+      stepCount: physicsRuntime?.stepCount || 0,
+      droppedTime: physicsRuntime?.droppedTime || 0,
+      movement: {
+        enabled: input?.movementEnabled === true,
+        mode: input?.mode || null,
+        keys: input ? Array.from(input.keys) : [],
+        requested: input?.hasMovementInput?.() === true,
+        grounded: characterState?.grounded ?? input?.grounded ?? null,
+        commandedVelocity: characterState?.commandedVelocity || characterState?.velocity || null,
+        actualVelocity: characterState?.actualVelocity || null,
+        lastStepMovement: characterState?.lastStepMovement || null,
+        physicsPosition: characterState?.translation || null,
+        physicsStepCount: characterState?.stepCount ?? null,
+        position: cameraRig?.player ? {
+          x: cameraRig.player.x, y: cameraRig.player.y, z: cameraRig.player.z,
+        } : null,
+      },
+    }
+  }
+
+  function getPlayerWaterState() {
+    const volumes = Array.from(sandboxWaterVolumes.values()).flat()
+    return samplePlayerWaterState(THREE, volumes, cameraRig?.player, input?.playerEyeHeight)
+  }
+
+  function focusSandboxOverview() {
+    if (!isBlankSandbox || !cameraRig) return false
+    const bounds = campus?.userData?.sampleBounds
+    if (!bounds) return false
+    const width = Math.max(20, Number(bounds.width) || 54)
+    const depth = Math.max(20, Number(bounds.depth) || 42)
+    const centerX = Number.isFinite(bounds.centerX) ? bounds.centerX : 0
+    const centerZ = Number.isFinite(bounds.centerZ) ? bounds.centerZ : 0
+    cameraRig.focusBounds(width, depth, centerX, centerZ, { immediate: true })
+    if (cameraRig.orbit) {
+      cameraRig.orbit.minDistance = 4
+      cameraRig.orbit.maxDistance = Math.max(1200, Math.max(width, depth) * 4)
+    }
+    return true
+  }
+
+  // ---- 地块管理：每个地块四邻空缺处一个「+」单块扩建标记（平铺地面） ----
+  let sandboxExpandMarkers = null
+
+  // 「+」标记轮廓：白色细实线完整网格。相邻空缺地块之间的共享边也要画，
+  // 用无向边去重保证每条边只画一次（不重叠加粗），所有可扩建格连成一片；
+  // 每格中心一个细线加号。
+  function buildExpandOutline(positions, specs, chunkWidth, chunkDepth, centerY) {
+    const halfW = chunkWidth / 2
+    const halfD = chunkDepth / 2
+    const plus = Math.min(chunkWidth, chunkDepth) * 0.14
+    const edgeSeen = new Set()
+    for (const spec of specs) {
+      const corners = [
+        [spec.x - halfW, spec.z - halfD],
+        [spec.x + halfW, spec.z - halfD],
+        [spec.x + halfW, spec.z + halfD],
+        [spec.x - halfW, spec.z + halfD],
+      ]
+      const edges = [[0, 1], [1, 2], [2, 3], [3, 0]]
+      for (const [a, b] of edges) {
+        const [ax, az] = corners[a]
+        const [bx, bz] = corners[b]
+        const key = (ax < bx || (ax === bx && az <= bz))
+          ? `${ax},${az}|${bx},${bz}`
+          : `${bx},${bz}|${ax},${az}`
+        if (edgeSeen.has(key)) continue
+        edgeSeen.add(key)
+        positions.push(ax, centerY, az, bx, centerY, bz)
+      }
+      positions.push(spec.x - plus, centerY, spec.z, spec.x + plus, centerY, spec.z)
+      positions.push(spec.x, centerY, spec.z - plus, spec.x, centerY, spec.z + plus)
+    }
+  }
+
+  function clearSandboxExpandMarkers() {
+    if (!sandboxExpandMarkers) return
+    scene?.remove(sandboxExpandMarkers)
+    sandboxExpandMarkers.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.map?.dispose?.()
+      object.material?.dispose?.()
+    })
+    sandboxExpandMarkers = null
+  }
+
+  function refreshSandboxExpandMarkers() {
+    clearSandboxExpandMarkers()
+    if (!chunkManagementActive || !scene || !isBlankSandbox) return
+    const state = getSandboxWorldState()
+    const chunkWidth = Number(state?.chunkSize?.width)
+    const chunkDepth = Number(state?.chunkSize?.depth)
+    const chunks = state?.chunks
+    if (!(chunkWidth > 0) || !(chunkDepth > 0) || !Array.isArray(chunks)) return
+    const existing = new Set(chunks.map(chunk => chunk.x + ':' + chunk.z))
+    // 每个已有地块的四邻空缺各生成一个「+」；同一空缺只保留一个标记
+    const specs = []
+    const seen = new Set()
+    const neighbors = [
+      [1, 0, 'east'], [-1, 0, 'west'], [0, 1, 'south'], [0, -1, 'north'],
+    ]
+    for (const chunk of chunks) {
+      for (const [dx, dz, direction] of neighbors) {
+        const chunkX = chunk.x + dx
+        const chunkZ = chunk.z + dz
+        const key = chunkX + ':' + chunkZ
+        if (existing.has(key) || seen.has(key)) continue
+        if (Math.abs(chunkX) > 50 || Math.abs(chunkZ) > 50) continue
+        seen.add(key)
+        specs.push({ chunkX, chunkZ, direction, x: chunkX * chunkWidth, z: chunkZ * chunkDepth })
+      }
+    }
+    if (!specs.length) return
+    sandboxExpandMarkers = new THREE.Group()
+    sandboxExpandMarkers.name = 'sandbox-expand-markers'
+    const centerY = 0.12
+    // 每个空缺块一个透明点击平面（覆盖整块，raycast 命中用）
+    for (const spec of specs) {
+      const hitPlane = new THREE.Mesh(
+        new THREE.PlaneGeometry(chunkWidth, chunkDepth),
+        new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, side: THREE.DoubleSide }),
+      )
+      hitPlane.name = 'sandbox-expand-hit-' + spec.chunkX + '-' + spec.chunkZ
+      hitPlane.rotation.x = -Math.PI / 2
+      hitPlane.position.set(spec.x, centerY, spec.z)
+      hitPlane.userData.expandDirection = spec.direction
+      hitPlane.userData.expandChunk = { x: spec.chunkX, z: spec.chunkZ }
+      sandboxExpandMarkers.add(hitPlane)
+    }
+    // 合并成一个 LineSegments：完整网格 + 每格中心加号
+    const positions = []
+    buildExpandOutline(positions, specs, chunkWidth, chunkDepth, centerY)
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    const outline = new THREE.LineSegments(
+      geometry,
+      new THREE.LineBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.95 }),
+    )
+    outline.name = 'sandbox-expand-outline'
+    outline.frustumCulled = false
+    sandboxExpandMarkers.add(outline)
+    scene.add(sandboxExpandMarkers)
+    requestFrame()
+  }
+
+  function tryExpandFromMarker(event) {
+    if (!sandboxExpandMarkers || !renderer || !cameraRig) return false
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return false
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const hits = raycaster.intersectObjects(sandboxExpandMarkers.children, false)
+    if (!hits.length) return false
+    const marker = hits[0].object
+    const target = marker.userData.expandChunk
+    if (!target || !addSandboxWorldChunk(target.x, target.z)) return false
+    callbacks.onSandboxChunkSelectionChange?.({
+      active: chunkManagementActive,
+      chunks: Array.from(selectedSandboxChunkKeys, key => {
+        const [x, z] = key.split(':').map(Number)
+        return { x, z }
+      }),
+      expanded: marker.userData.expandDirection,
+      addedChunk: { x: target.x, z: target.z },
+    })
+    return true
+  }
+
+  function setSandboxChunkManagement(enabled) {
+    if (!isBlankSandbox) return false
+    const nextEnabled = Boolean(enabled)
+    if (nextEnabled && !chunkManagementActive) {
+      chunkManagementPreviousCameraMode = cameraRig?.mode || 'thirdPerson'
+      cameraRig?.setMode('overview')
+      input?.setMode('overview')
+    }
+    chunkManagementActive = nextEnabled
+    if (!chunkManagementActive) selectedSandboxChunkKeys.clear()
+    if (chunkManagementActive) {
+      input?.setMovementEnabled(false)
+      sandboxTransform?.detach()
+      cameraRig?.setOrbitInteractionEnabled?.(true)
+      // 地块管理始终先展示当前全部地块；随后用户可自由平移、旋转和缩放。
+      focusSandboxOverview()
+    } else {
+      const restoreMode = chunkManagementPreviousCameraMode || 'thirdPerson'
+      if (cameraRig?.mode !== restoreMode) cameraRig?.setMode(restoreMode)
+      input?.setMode(restoreMode)
+      input?.setMovementEnabled(restoreMode !== 'overview' || isBlankSandbox)
+      chunkManagementPreviousCameraMode = null
+    }
+    campus?.userData?.setChunkManagementState?.(chunkManagementActive, Array.from(selectedSandboxChunkKeys))
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxChunkSelectionChange?.({
+      chunks: Array.from(selectedSandboxChunkKeys, key => {
+        const [x, z] = key.split(':').map(Number)
+        return { x, z }
+      }),
+      active: chunkManagementActive,
+    })
+    requestFrame()
+    return true
+  }
+
+  function setSandboxChunkSelection(chunks) {
+    if (!isBlankSandbox) return false
+    selectedSandboxChunkKeys = new Set((Array.isArray(chunks) ? chunks : []).map(item => {
+      if (typeof item === 'string') return item
+      return Number.isInteger(Number(item?.x)) && Number.isInteger(Number(item?.z)) ? Number(item.x) + ':' + Number(item.z) : ''
+    }).filter(Boolean))
+    campus?.userData?.setChunkManagementState?.(chunkManagementActive, Array.from(selectedSandboxChunkKeys))
+    requestFrame()
+    return true
+  }
+
+  function selectSandboxChunkFromPointer(event) {
+    const state = getSandboxWorldState()
+    const width = Number(state?.chunkSize?.width)
+    const depth = Number(state?.chunkSize?.depth)
+    if (!(width > 0) || !(depth > 0) || !renderer || !cameraRig) return false
+    // 优先命中四边「+」扩建标记：点它直接扩一格，不参与地块选择
+    if (tryExpandFromMarker(event)) return true
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return false
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const point = raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), 0), new THREE.Vector3())
+    if (!point) return false
+    const x = Math.round(point.x / width)
+    const z = Math.round(point.z / depth)
+    const key = x + ':' + z
+    if (!(state.chunks || []).some(chunk => chunk.x === x && chunk.z === z)) {
+      if (!event.ctrlKey && !event.metaKey && !event.shiftKey) selectedSandboxChunkKeys.clear()
+    } else if (event.ctrlKey || event.metaKey || event.shiftKey) {
+      if (selectedSandboxChunkKeys.has(key)) selectedSandboxChunkKeys.delete(key)
+      else selectedSandboxChunkKeys.add(key)
+    } else {
+      selectedSandboxChunkKeys = new Set([key])
+    }
+    campus?.userData?.setChunkManagementState?.(true, Array.from(selectedSandboxChunkKeys))
+    callbacks.onSandboxChunkSelectionChange?.({
+      active: true,
+      chunks: Array.from(selectedSandboxChunkKeys, item => {
+        const [chunkX, chunkZ] = item.split(':').map(Number)
+        return { x: chunkX, z: chunkZ }
+      }),
+      primary: { x, z },
+    })
+    requestFrame()
+    return true
+  }
+
+  function expandSandboxWorld(direction, count = 1) {
+    if (!isBlankSandbox || !campus?.userData?.expandWorld) return false
+    const expanded = campus.userData.expandWorld(direction, count)
+    if (!expanded) return false
+    syncSandboxWalkableChunks()
+    // walkableBounds is mutated in place, so CollisionWorld and InputController retain
+    // the same authoritative bounds object without replacing their references.
+    if (collisionWorld) collisionWorld.bounds = campus.userData.walkableBounds
+    if (input) {
+      input.bounds = campus.userData.walkableBounds
+      if (input.collisionWorld) input.collisionWorld.bounds = campus.userData.walkableBounds
+    }
+    const world = getSandboxPlacementWorldBounds()
+    if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
+    if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxWorldChange?.(getSandboxWorldState())
+    requestFrame()
+    return true
+  }
+
+  function syncSandboxPhysicsWorld() {
+    if (!isBlankSandbox || !physicsRuntime || !campus?.userData?.walkableBounds) return false
+    const ownerId = 'sandbox:world-ground'
+    physicsRuntime.removeOwner(ownerId)
+    const state = getSandboxWorldState()
+    const chunkWidth = Number(state?.chunkSize?.width)
+    const chunkDepth = Number(state?.chunkSize?.depth)
+    const bounds = campus.userData.walkableBounds
+    if (!(chunkWidth > 0) || !(chunkDepth > 0) || !Array.isArray(state?.chunks)) return false
+    try {
+      for (const chunk of state.chunks) {
+        const x = Number(chunk.x), z = Number(chunk.z)
+        if (!Number.isInteger(x) || !Number.isInteger(z)) continue
+        physicsRuntime.createStaticBox({
+          id: ownerId + ':floor:' + x + ':' + z,
+          ownerId,
+          translation: { x: x * chunkWidth, y: -0.12, z: z * chunkDepth },
+          halfExtents: { x: chunkWidth / 2, y: 0.12, z: chunkDepth / 2 },
+          friction: 0.9,
+        })
+      }
+      const minX = Number(bounds.minX), maxX = Number(bounds.maxX)
+      const minZ = Number(bounds.minZ), maxZ = Number(bounds.maxZ)
+      if (![minX, maxX, minZ, maxZ].every(Number.isFinite) || maxX <= minX || maxZ <= minZ) {
+        throw new TypeError('Sandbox world bounds are invalid')
+      }
+      const centerX = (minX + maxX) / 2
+      const centerZ = (minZ + maxZ) / 2
+      const width = maxX - minX
+      const depth = maxZ - minZ
+      const wallHeight = 12
+      const wallThickness = 0.5
+      const wall = (id, translation, halfExtents) => physicsRuntime.createStaticBox({
+        id: ownerId + ':boundary:' + id,
+        ownerId,
+        translation,
+        halfExtents,
+        friction: 0.8,
+      })
+      wall('west', { x: minX - wallThickness / 2, y: wallHeight / 2, z: centerZ }, { x: wallThickness / 2, y: wallHeight / 2, z: depth / 2 + wallThickness })
+      wall('east', { x: maxX + wallThickness / 2, y: wallHeight / 2, z: centerZ }, { x: wallThickness / 2, y: wallHeight / 2, z: depth / 2 + wallThickness })
+      wall('north', { x: centerX, y: wallHeight / 2, z: minZ - wallThickness / 2 }, { x: width / 2, y: wallHeight / 2, z: wallThickness / 2 })
+      wall('south', { x: centerX, y: wallHeight / 2, z: maxZ + wallThickness / 2 }, { x: width / 2, y: wallHeight / 2, z: wallThickness / 2 })
+    } catch (error) {
+      physicsRuntime.removeOwner(ownerId)
+      throw error
+    }
+    return true
+  }
+
+  function syncSandboxWalkableChunks() {
+    if (!isBlankSandbox || !collisionWorld) return
+    const state = getSandboxWorldState()
+    const width = Number(state?.chunkSize?.width)
+    const depth = Number(state?.chunkSize?.depth)
+    if (!(width > 0) || !(depth > 0)) return
+    collisionWorld.setWalkableRegions((state.chunks || []).map(chunk => ({
+      minX: chunk.x * width - width / 2,
+      maxX: chunk.x * width + width / 2,
+      minZ: chunk.z * depth - depth / 2,
+      maxZ: chunk.z * depth + depth / 2,
+    })))
+    syncSandboxPhysicsWorld()
+  }
+
+  // 单块扩建：只添加指定相邻地块（与四邻「+」标记对应），不整行/整列扩展。
+  function addSandboxWorldChunk(chunkX, chunkZ) {
+    if (!isBlankSandbox || !campus?.userData?.addWorldChunk) return false
+    if (!campus.userData.addWorldChunk(chunkX, chunkZ)) return false
+    syncSandboxWalkableChunks()
+    if (collisionWorld) collisionWorld.bounds = campus.userData.walkableBounds
+    if (input) {
+      input.bounds = campus.userData.walkableBounds
+      if (input.collisionWorld) input.collisionWorld.bounds = campus.userData.walkableBounds
+    }
+    const world = getSandboxPlacementWorldBounds()
+    if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxWorldChange?.(getSandboxWorldState())
+    requestFrame()
+    return true
+  }
+
+  function removeSandboxWorldChunk(chunkX, chunkZ) {
+    if (!isBlankSandbox || !campus?.userData?.removeWorldChunk) {
+      return { ok: false, reason: 'unsupported-world' }
+    }
+    const x = Number(chunkX), z = Number(chunkZ)
+    if (!Number.isInteger(x) || !Number.isInteger(z)) return { ok: false, reason: 'invalid-chunk' }
+    if (x === 0 && z === 0) return { ok: false, reason: 'origin-anchor', blockers: ['初始中心区块'] }
+    const worldState = getSandboxWorldState()
+    const chunk = worldState?.chunks?.find(item => item.x === x && item.z === z)
+    if (!chunk) return { ok: false, reason: 'chunk-not-found' }
+    const width = Number(worldState.chunkSize?.width)
+    const depth = Number(worldState.chunkSize?.depth)
+    const minWorldX = x * width - width / 2
+    const maxWorldX = x * width + width / 2
+    const minWorldZ = z * depth - depth / 2
+    const maxWorldZ = z * depth + depth / 2
+    const blockers = []
+    const player = getPlayerPosition()
+    const playerRadius = Number(collisionWorld?.radius) || 0.62
+    if (player && player.x + playerRadius > minWorldX && player.x - playerRadius < maxWorldX
+      && player.z + playerRadius > minWorldZ && player.z - playerRadius < maxWorldZ) blockers.push('玩家当前位置')
+    for (const [id, model] of sandboxModels) {
+      if (!model.visible) continue
+      model.updateWorldMatrix(true, true)
+      const modelBounds = new THREE.Box3().setFromObject(model)
+      if (!modelBounds.isEmpty() && modelBounds.min.x < maxWorldX && modelBounds.max.x > minWorldX
+        && modelBounds.min.z < maxWorldZ && modelBounds.max.z > minWorldZ) blockers.push(model.name || id)
+    }
+    for (const obstacle of collisionWorld?.obstacles || []) {
+      if (obstacle.maxX > minWorldX && obstacle.minX < maxWorldX
+        && obstacle.maxZ > minWorldZ && obstacle.minZ < maxWorldZ) {
+        const owner = obstacle.ownerId ? sandboxModels.get(String(obstacle.ownerId)) : null
+        blockers.push(owner?.name || '已登记的碰撞区域')
+      }
+    }
+    for (const surface of collisionWorld?.supportSurfaces || []) {
+      for (const mesh of surface.meshes || []) {
+        mesh.updateWorldMatrix?.(true, true)
+        const surfaceBounds = new THREE.Box3().setFromObject(mesh)
+        if (!surfaceBounds.isEmpty() && surfaceBounds.min.x < maxWorldX && surfaceBounds.max.x > minWorldX
+          && surfaceBounds.min.z < maxWorldZ && surfaceBounds.max.z > minWorldZ) {
+          const owner = sandboxModels.get(String(surface.ownerId))
+          blockers.push(owner?.name || '已登记的可站立表面')
+          break
+        }
+      }
+    }
+    const uniqueBlockers = [...new Set(blockers)]
+    if (uniqueBlockers.length) return { ok: false, reason: 'occupied', blockers: uniqueBlockers }
+    if (!campus.userData.removeWorldChunk(x, z)) return { ok: false, reason: 'cannot-remove-chunk' }
+    syncSandboxWalkableChunks()
+    if (collisionWorld) collisionWorld.bounds = campus.userData.walkableBounds
+    if (input) {
+      input.bounds = campus.userData.walkableBounds
+      if (input.collisionWorld) input.collisionWorld.bounds = campus.userData.walkableBounds
+    }
+    const world = getSandboxPlacementWorldBounds()
+    if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
+    if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxWorldChange?.(getSandboxWorldState())
+    requestFrame()
+    return { ok: true, world: getSandboxWorldState() }
+  }
+
+  function restoreSandboxWorld(state) {
+    if (!isBlankSandbox || !campus?.userData?.restoreWorldState || !state) return false
+    const restored = campus.userData.restoreWorldState(state)
+    if (!restored) return false
+    syncSandboxWalkableChunks()
+    if (collisionWorld) collisionWorld.bounds = campus.userData.walkableBounds
+    if (input) {
+      input.bounds = campus.userData.walkableBounds
+      if (input.collisionWorld) input.collisionWorld.bounds = campus.userData.walkableBounds
+    }
+    const world = getSandboxPlacementWorldBounds()
+    if (cameraRig?.orbit) cameraRig.orbit.maxDistance = Math.max(1200, Math.max(world.width, world.depth) * 4)
+    if (cameraRig?.mode === 'overview') focusSandboxOverview()
+    refreshSandboxExpandMarkers()
+    callbacks.onSandboxWorldChange?.(getSandboxWorldState())
+    requestFrame()
+    return true
+  }
+
+  function configureSandboxPlacementOrbit(span, world) {
+    const orbit = cameraRig?.orbit
+    if (!orbit) return
+    // Three-dimensional overview defaults to minDistance=24; that is too far for small models.
+    orbit.minDistance = Math.max(1, Math.min(24, Math.max(8, span) * 0.18))
+    orbit.maxDistance = Math.max(190, Math.max(world.width, world.depth) * 3)
+  }
+
+  function getSandboxGroundPoint(event) {
+    if (!renderer || !cameraRig) return null
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return null
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const point = new THREE.Vector3()
+    return raycaster.ray.intersectPlane(new THREE.Plane(new THREE.Vector3(0, 1, 0), -0.025), point) ? point : null
+  }
+
+  function getSandboxPlacementConflict(bounds, state, options = {}) {
+    // 普通模型用整体包围盒；道路提供逐段探针，按道路形状判重。
+    const probes = Array.isArray(state?.footprintProbes) && state.footprintProbes.length
+      ? state.footprintProbes
+      : [bounds]
+    if (isBlankSandbox) {
+      const worldState = getSandboxWorldState()
+      const width = Number(worldState?.chunkSize?.width)
+      const depth = Number(worldState?.chunkSize?.depth)
+      if (width > 0 && depth > 0) {
+        const existing = new Set((worldState.chunks || []).map(chunk => chunk.x + ':' + chunk.z))
+        for (const probe of probes) {
+          const minChunkX = Math.floor((probe.min.x + width / 2 + 0.001) / width)
+          const maxChunkX = Math.floor((probe.max.x + width / 2 - 0.001) / width)
+          const minChunkZ = Math.floor((probe.min.z + depth / 2 + 0.001) / depth)
+          const maxChunkZ = Math.floor((probe.max.z + depth / 2 - 0.001) / depth)
+          for (let x = minChunkX; x <= maxChunkX; x += 1) {
+            for (let z = minChunkZ; z <= maxChunkZ; z += 1) {
+              if (!existing.has(x + ':' + z)) return '该位置包含已回收的地块'
+            }
+          }
+        }
+      }
+    }
+    // 道路端点拉伸是编辑行为，允许贴着/压着附近模型；放置新模型仍做完整判重。
+    if (options.ignoreModels === true) return null
+    const overlaps = (a, b) => a.min.x < b.max.x - 0.015 && a.max.x > b.min.x + 0.015
+      && a.min.z < b.max.z - 0.015 && a.max.z > b.min.z + 0.015
+      && a.min.y < b.max.y - 0.015 && a.max.y > b.min.y + 0.015
+
+    for (const [id, model] of sandboxModels) {
+      if (model === state.model || !model.visible) continue
+      model.updateWorldMatrix(true, true)
+      const otherBounds = new THREE.Box3().setFromObject(model)
+      if (otherBounds.isEmpty()) continue
+      for (const probe of probes) {
+        if (overlaps(probe, otherBounds)) return model.name || id
+      }
+    }
+
+    // Also respect registered world colliders, including future static obstacles.
+    // This is a conservative XZ broad-phase; model-vs-model checks above include height.
+    for (const obstacle of collisionWorld?.obstacles || []) {
+      if (obstacle.ownerId && obstacle.ownerId === state.id) continue
+      for (const probe of probes) {
+        if (probe.max.x > obstacle.minX + 0.015 && probe.min.x < obstacle.maxX - 0.015
+          && probe.max.z > obstacle.minZ + 0.015 && probe.min.z < obstacle.maxZ - 0.015) {
+          const owner = obstacle.ownerId ? sandboxModels.get(String(obstacle.ownerId)) : null
+          return owner?.name || '已有场景碰撞区域'
+        }
+      }
+    }
+    return null
+  }
+
+  function getSandboxRoadJunctionMaterial(objectType) {
+    if (!sandboxRoadJunctionMaterials.has(objectType)) {
+      sandboxRoadJunctionMaterials.set(objectType, createRoadSurfaceMaterial(THREE, objectType))
+    }
+    return sandboxRoadJunctionMaterials.get(objectType)
+  }
+
+  // 路口拼接面：两两道路的占地交叠区铺一块路面（高于边线/中线），
+  // 口对口、口接路身都能盖住接缝。派生数据，随时重建，不进存档。
+  function rebuildSandboxRoadJunctions() {
+    if (!scene) return
+    if (!sandboxRoadJunctionGroup) {
+      sandboxRoadJunctionGroup = new THREE.Group()
+      sandboxRoadJunctionGroup.name = 'sandbox-road-junctions'
+      scene.add(sandboxRoadJunctionGroup)
+    }
+    for (const child of [...sandboxRoadJunctionGroup.children]) {
+      sandboxRoadJunctionGroup.remove(child)
+      child.geometry?.dispose?.()
+    }
+    const roads = []
+    for (const model of sandboxModels.values()) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      const bounds = new THREE.Box3().setFromObject(model)
+      roads.push({
+        objectType: model.userData.proceduralRoad.objectType,
+        topY: Number.isFinite(bounds.max.y) ? bounds.max.y : 0.1,
+        footprint: getRoadFootprint(model),
+      })
+    }
+    if (roads.length < 2) return
+    for (const patch of buildRoadJunctionPatches(roads)) {
+      const positions = []
+      for (const polygon of patch.polygons) {
+        for (let index = 1; index < polygon.length - 1; index += 1) {
+          positions.push(polygon[0].x, patch.y, polygon[0].z)
+          positions.push(polygon[index].x, patch.y, polygon[index].z)
+          positions.push(polygon[index + 1].x, patch.y, polygon[index + 1].z)
+        }
+      }
+      if (!positions.length) continue
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      geometry.computeVertexNormals()
+      const mesh = new THREE.Mesh(geometry, getSandboxRoadJunctionMaterial(patch.objectType))
+      mesh.name = 'road-junction-patch'
+      mesh.userData.roadJunction = true
+      mesh.renderOrder = 4
+      sandboxRoadJunctionGroup.add(mesh)
+    }
+  }
+
+  function getSandboxRoadEditor() {
+    if (sandboxRoadEditor || !scene || !renderer || !cameraRig) return sandboxRoadEditor
+    sandboxRoadEditor = createSandboxRoadEditor(THREE, {
+      scene,
+      domElement: renderer.domElement,
+      camera: cameraRig.camera,
+      getGroundPoint: getSandboxGroundPoint,
+      getPlacementConflict: (bounds, state) => getSandboxPlacementConflict(bounds, state, { ignoreModels: true }),
+      getWorldBounds: getSandboxPlacementWorldBounds,
+      commitRoadEdit: commitSandboxRoadEdit,
+      insertBreakpointAt: (modelId, point) => insertSandboxRoadBreakpoint(modelId, point),
+      onChange: payload => callbacks.onSandboxRoadEditChange?.(payload),
+      requestFrame,
+    })
+    return sandboxRoadEditor
+  }
+
+  function commitSandboxRoadEdit(current, solution) {
+    const id = String(current.userData.sandboxModelId)
+    const ref = current.userData.builtinAssetRef
+    const width = Number(current.userData?.proceduralRoad?.width) || undefined
+
+    // 折线道路（≥3 控制点）：按世界坐标重建，根固定在原点。
+    if (Array.isArray(solution.points) && solution.points.length > 2) {
+      const replacement = createPolylineRoadModel(THREE, {
+        objectType: ref.objectType,
+        width: Number(solution.width) || width,
+        points: solution.points,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: { x: 0, y: current.position.y, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (!accepted) return { ok: false, reason: '道路提交失败' }
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return { ok: true, replacement: sandboxModels.get(id) }
+    }
+
+    // 两控制点：宽度一致时回到直线道路（v1），宽度不同则保留为两点折线（v3/v4）。
+    if (Array.isArray(solution.points) && solution.points.length === 2) {
+      // 边缘点拖拽（端点编辑器）：按左右边缘点原样重建，松手后形状与预览完全一致。
+      if (Number.isFinite(solution.points[0]?.lx) && Number.isFinite(solution.points[1]?.lx)) {
+        const replacement = createPolylineRoadModel(THREE, {
+          objectType: ref.objectType,
+          width: Math.max(Number(solution.width) || 0, Number(width) || 0) || 1,
+          points: solution.points,
+        })
+        const accepted = replaceSandboxModel(id, replacement, {
+          transform: {
+            position: { x: 0, y: current.position.y, z: 0 },
+            rotation: { x: 0, y: 0, z: 0 },
+            scale: { x: 1, y: 1, z: 1 },
+          },
+        })
+        if (!accepted) return { ok: false, reason: '道路提交失败' }
+        cameraRig?.setOrbitInteractionEnabled?.(false)
+        return { ok: true, replacement: sandboxModels.get(id) }
+      }
+      const stations = normalizeSolutionStations(solution.points)
+      const [start, end] = stations
+      const fallbackHalf = (Number(width) || 2) / 2
+      const hwStart = Number.isFinite(start.hw) ? start.hw : fallbackHalf
+      const hwEnd = Number.isFinite(end.hw) ? end.hw : hwStart
+      const equalWidth = Math.abs(hwStart - hwEnd) <= 1e-3
+      if (!equalWidth) {
+        const replacement = createPolylineRoadModel(THREE, {
+          objectType: ref.objectType,
+          width: Math.max(hwStart, hwEnd) * 2,
+          points: [start, end],
+        })
+        const accepted = replaceSandboxModel(id, replacement, {
+          transform: {
+            position: { x: 0, y: current.position.y, z: 0 },
+            rotation: { x: 0, y: 0, z: 0 },
+            scale: { x: 1, y: 1, z: 1 },
+          },
+        })
+        if (!accepted) return { ok: false, reason: '道路提交失败' }
+        cameraRig?.setOrbitInteractionEnabled?.(false)
+        return { ok: true, replacement: sandboxModels.get(id) }
+      }
+      const dx = end.x - start.x
+      const dz = end.z - start.z
+      const rawLength = Math.hypot(dx, dz)
+      const clampedLength = Math.min(120, Math.max(2, rawLength))
+      const fallbackDirection = rawLength > 0 ? { x: dx / rawLength, z: dz / rawLength } : { x: 1, z: 0 }
+      const replacement = createProceduralRoadModel(THREE, {
+        objectType: ref.objectType,
+        length: clampedLength,
+        width: hwStart * 2,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: {
+            x: start.x + fallbackDirection.x * clampedLength / 2,
+            y: current.position.y,
+            z: start.z + fallbackDirection.z * clampedLength / 2,
+          },
+          rotation: { x: 0, y: Math.atan2(-fallbackDirection.z, fallbackDirection.x), z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (!accepted) return { ok: false, reason: '道路提交失败' }
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return { ok: true, replacement: sandboxModels.get(id) }
+    }
+
+    const replacement = createBuiltinSandboxModel(THREE, null, {
+      category: ref.category,
+      objectType: ref.objectType,
+      parameters: { length: solution.length },
+    })
+    const accepted = replaceSandboxModel(id, replacement, {
+      transform: {
+        position: solution.position,
+        rotation: solution.rotation,
+        scale: solution.scale,
+      },
+    })
+    if (!accepted) return { ok: false, reason: '道路提交失败' }
+    // replaceSandboxModel 会经选择流程恢复轨道控制；端点模式仍处于激活状态时需重新锁定。
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return { ok: true, replacement: sandboxModels.get(id) }
+  }
+
+  // 当前道路的控制点（中心线 + 半宽，世界坐标）；各类模型统一成同一结构。
+  function roadPointsOf(model) {
+    return getRoadStations(model).map(station => ({
+      x: station.x,
+      z: station.z,
+      hw: Number.isFinite(station.hw) ? station.hw : undefined,
+    }))
+  }
+
+  // 提交解里的点可能是「边缘点」（lx/lz/rx/rz）或「中心线+半宽」，统一成中心+半宽。
+  function normalizeSolutionStations(points) {
+    return points.map(point => {
+      if (Number.isFinite(point?.lx)) {
+        return {
+          x: (point.lx + point.rx) / 2,
+          z: (point.lz + point.rz) / 2,
+          hw: Math.hypot(point.rx - point.lx, point.rz - point.lz) / 2,
+        }
+      }
+      return {
+        x: point.x,
+        z: point.z,
+        hw: Number.isFinite(point.hw) ? point.hw : undefined,
+      }
+    })
+  }
+
+  function reattachRoadEditor(id, replacement) {
+    if (!sandboxRoadEditor?.isAttached?.()) return
+    if (String(sandboxRoadEditor.getModelId?.()) !== String(id)) return
+    sandboxRoadEditor.attach(replacement)
+  }
+
+  // 控制点序列：v4 道路直接用左右边缘点，加/删断点时不会把不对称的路缘拉回居中。
+  function breakpointSourcePoints(model) {
+    if (Number(model?.userData?.proceduralRoad?.version) === 4) {
+      return getRoadEdgeStations(model).map(station => ({
+        lx: station.left.x,
+        lz: station.left.z,
+        rx: station.right.x,
+        rz: station.right.z,
+      }))
+    }
+    return roadPointsOf(model)
+  }
+
+  // 加断点：直线道路一次给四个控制点（两端 + 1/3、2/3），折线在最长段中点再加一个。
+  function addSandboxRoadPoint(id) {
+    const model = sandboxModels.get(String(id))
+    if (!model || !isAnyStretchableRoadModel(model)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    let points
+    try {
+      points = insertRoadBreakpoints(breakpointSourcePoints(model))
+    } catch {
+      return false
+    }
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    const current = sandboxModels.get(String(id))
+    reattachRoadEditor(id, current)
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 在点击位置插入单个断点（端点编辑器的加断点拾取）。
+  function insertSandboxRoadBreakpoint(id, target) {
+    const model = sandboxModels.get(String(id))
+    if (!model || !isAnyStretchableRoadModel(model)) return false
+    if (!Number.isFinite(target?.x) || !Number.isFinite(target?.z)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    let points
+    try {
+      points = insertRoadBreakpointAt(breakpointSourcePoints(model), target)
+    } catch {
+      return false
+    }
+    if (!areRoadPointsValid(points)) return false
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    reattachRoadEditor(id, sandboxModels.get(String(id)))
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 删除最后一个转折点；剩两个点时退回直线道路。
+  function removeSandboxRoadPoint(id) {
+    const model = sandboxModels.get(String(id))
+    if (!model) return false
+    if (!isPolylineRoadModel(model)) return false
+    const ref = model.userData.builtinAssetRef
+    const width = Number(model.userData.proceduralRoad.width)
+    const currentPoints = breakpointSourcePoints(model)
+    let points
+    try {
+      points = removeRoadPoint(currentPoints)
+    } catch {
+      return false
+    }
+    if (points.length === 2) {
+      // 收回到两个控制点时转成中心线+半宽，直线道路仍回到 v1（带 length 语义）。
+      const centerPoints = points.map(point => {
+        if (!Number.isFinite(point?.lx)) return point
+        return {
+          x: (point.lx + point.rx) / 2,
+          z: (point.lz + point.rz) / 2,
+          hw: Math.hypot(point.rx - point.lx, point.rz - point.lz) / 2,
+        }
+      })
+      const accepted = commitSandboxRoadEdit(model, { points: centerPoints })
+      if (!accepted?.ok) return false
+      reattachRoadEditor(id, sandboxModels.get(String(id)))
+      selectSandboxModel(String(id))
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      return true
+    }
+    const replacement = createPolylineRoadModel(THREE, { objectType: ref.objectType, width, points })
+    const accepted = replaceSandboxModel(String(id), replacement, {
+      transform: {
+        position: { x: 0, y: model.position.y, z: 0 },
+        rotation: { x: 0, y: 0, z: 0 },
+        scale: { x: 1, y: 1, z: 1 },
+      },
+    })
+    if (!accepted) return false
+    reattachRoadEditor(id, sandboxModels.get(String(id)))
+    selectSandboxModel(String(id))
+    cameraRig?.setOrbitInteractionEnabled?.(false)
+    return true
+  }
+
+  // 道路占地几何：填充带按平滑路缘分段成三角形，轮廓是闭合路缘多边形。
+  function buildRoadFootprintFillGeometry(footprint, y) {
+    const positions = []
+    const push = point => positions.push(point.x, y, point.z)
+    const quad = (a, b, c, d) => { push(a); push(b); push(c); push(a); push(c); push(d) }
+    const { left, right } = footprint
+    for (let index = 1; index < left.length; index += 1) {
+      quad(left[index - 1], right[index - 1], right[index], left[index])
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.computeVertexNormals()
+    return geometry
+  }
+
+  function roadFootprintOutlinePoints(footprint) {
+    return [...footprint.left, ...footprint.right.slice().reverse()]
+  }
+
+  function buildRoadFootprintOutlineGeometry(footprint, y) {
+    const points = roadFootprintOutlinePoints(footprint)
+    const positions = []
+    for (let index = 0; index < points.length; index += 1) {
+      const start = points[index]
+      const end = points[(index + 1) % points.length]
+      positions.push(start.x, y, start.z, end.x, y, end.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    return geometry
+  }
+
+  // 分段探针：占地冲突按道路形状逐段判重，不再用整条路的大包围盒。
+  function buildRoadFootprintProbes(footprint, topY) {
+    const { left, right } = footprint
+    const probes = []
+    const maxY = Math.max(Number(topY) || 0, 0.05)
+    for (let index = 1; index < left.length; index += 1) {
+      const xs = [left[index - 1].x, left[index].x, right[index - 1].x, right[index].x]
+      const zs = [left[index - 1].z, left[index].z, right[index - 1].z, right[index].z]
+      probes.push(new THREE.Box3(
+        new THREE.Vector3(Math.min(...xs), 0, Math.min(...zs)),
+        new THREE.Vector3(Math.max(...xs), maxY, Math.max(...zs)),
+      ))
+    }
+    return probes
+  }
+
+  // 勾绘占地多边形（本地坐标）→ 世界坐标：随模型位置与 Y 轴旋转。
+  function placementFootprintWorldPolygon(state) {
+    const polygon = state.footprintPolygon || []
+    const yaw = Number(state.model?.rotation?.y) || 0
+    const cos = Math.cos(yaw)
+    const sin = Math.sin(yaw)
+    const origin = state.model?.position || { x: 0, z: 0 }
+    return polygon.map(point => ({
+      x: origin.x + point.x * cos + point.z * sin,
+      z: origin.z - point.x * sin + point.z * cos,
+    }))
+  }
+
+  function buildPolygonFillGeometry(polygon, y) {
+    const positions = []
+    for (const triangle of triangulatePolygon(polygon)) {
+      for (const point of triangle) positions.push(point.x, y, point.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    geometry.computeVertexNormals()
+    return geometry
+  }
+
+  function buildPolygonOutlineGeometry(polygon, y) {
+    const positions = []
+    for (let index = 0; index < polygon.length; index += 1) {
+      const start = polygon[index]
+      const end = polygon[(index + 1) % polygon.length]
+      positions.push(start.x, y, start.z, end.x, y, end.z)
+    }
+    const geometry = new THREE.BufferGeometry()
+    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+    return geometry
+  }
+
+  function updateSandboxPlacementPreview(point) {
+    const state = sandboxPlacementState
+    if (!state || !point) return false
+    const world = getSandboxPlacementWorldBounds()
+    const halfWidth = state.footprintWidth / 2
+    const halfDepth = state.footprintDepth / 2
+    // 吸附：先保证模型完整落在可放置区内，再在靠近边界时自动贴边、其余按 0.5m 网格对齐。
+    const snapped = snapPlacementCenter({
+      x: point.x,
+      z: point.z,
+      limitMinX: world.centerX - world.width / 2 + halfWidth,
+      limitMaxX: world.centerX + world.width / 2 - halfWidth,
+      limitMinZ: world.centerZ - world.depth / 2 + halfDepth,
+      limitMaxZ: world.centerZ + world.depth / 2 - halfDepth,
+    })
+    const x = snapped.x
+    const z = snapped.z
+    state.model.visible = true
+    state.model.position.x = x
+    state.model.position.z = z
+    state.model.updateWorldMatrix(true, true)
+    const bounds = new THREE.Box3().setFromObject(state.model)
+    if (!bounds.isEmpty()) state.model.position.y += 0.012 - bounds.min.y
+    state.model.updateWorldMatrix(true, true)
+    const placedBounds = new THREE.Box3().setFromObject(state.model)
+    if (state.footprintPolygon) {
+      // 勾绘占地：按多边形（随模型位置/旋转）更新填充、轮廓与三角探针。
+      const worldPolygon = placementFootprintWorldPolygon(state)
+      state.footprintProbes = buildFootprintProbes(worldPolygon, placedBounds.max.y)
+      if (sandboxPlacementFootprint) {
+        sandboxPlacementFootprint.geometry?.dispose?.()
+        sandboxPlacementFootprint.geometry = buildPolygonFillGeometry(worldPolygon, 0.035)
+        sandboxPlacementFootprint.position.set(0, 0, 0)
+      }
+      if (sandboxPlacementFootprintOutline) {
+        sandboxPlacementFootprintOutline.geometry?.dispose?.()
+        sandboxPlacementFootprintOutline.geometry = buildPolygonOutlineGeometry(worldPolygon, 0.055)
+        sandboxPlacementFootprintOutline.position.set(0, 0, 0)
+      }
+    } else if (state.roadFootprint) {
+      // 道路按实际形状更新占地填充/轮廓，冲突也用逐段探针判定。
+      const footprint = getRoadFootprint(state.model)
+      state.footprintProbes = buildRoadFootprintProbes(footprint, placedBounds.max.y)
+      if (sandboxPlacementFootprint) {
+        sandboxPlacementFootprint.geometry?.dispose?.()
+        sandboxPlacementFootprint.geometry = buildRoadFootprintFillGeometry(footprint, 0.035)
+        sandboxPlacementFootprint.position.set(0, 0, 0)
+      }
+      if (sandboxPlacementFootprintOutline) {
+        sandboxPlacementFootprintOutline.geometry?.dispose?.()
+        sandboxPlacementFootprintOutline.geometry = buildRoadFootprintOutlineGeometry(footprint, 0.055)
+        sandboxPlacementFootprintOutline.position.set(0, 0, 0)
+      }
+    }
+    const blockerName = getSandboxPlacementConflict(placedBounds, state)
+    state.blocked = Boolean(blockerName)
+    state.blockerName = blockerName
+    if (sandboxPlacementFootprint) {
+      sandboxPlacementFootprint.material.color.set(state.blocked ? '#e66b68' : '#8bd5a5')
+      if (!state.roadFootprint) {
+        sandboxPlacementFootprint.position.set(
+          (placedBounds.min.x + placedBounds.max.x) / 2,
+          0.035,
+          (placedBounds.min.z + placedBounds.max.z) / 2,
+        )
+      }
+      sandboxPlacementFootprint.visible = true
+    }
+    if (sandboxPlacementFootprintOutline) {
+      sandboxPlacementFootprintOutline.material.color.set(state.blocked ? '#ff8b82' : '#b8f5c8')
+      if (!state.roadFootprint) {
+        sandboxPlacementFootprintOutline.position.set(
+          (placedBounds.min.x + placedBounds.max.x) / 2,
+          0.055,
+          (placedBounds.min.z + placedBounds.max.z) / 2,
+        )
+      }
+      sandboxPlacementFootprintOutline.visible = true
+    }
+    state.hasTarget = true
+    state.target = { x, y: state.model.position.y, z }
+    if (state.lastReportedBlocker !== blockerName) {
+      state.lastReportedBlocker = blockerName
+      emitSandboxPlacementState({ instruction: blockerName ? `位置冲突：与“${blockerName}”重叠，请重新选择位置` : '位置可用：未检测到现有模型或碰撞区域重叠' })
+    }
+    invalidateShadowMap()
+    requestFrame()
+    return true
+  }
+
+  function emitSandboxPlacementState(extra = {}) {
+    if (!sandboxPlacementState) {
+      callbacks.onSandboxPlacementChange?.({ active: false, ...extra })
+      return
+    }
+    callbacks.onSandboxPlacementChange?.({
+      active: true,
+      stage: sandboxPlacementState.stage,
+      level: sandboxPlacementState.level,
+      hasTarget: sandboxPlacementState.hasTarget,
+      candidateLocked: sandboxPlacementState.candidateLocked,
+      modelName: sandboxPlacementState.model.name,
+      footprint: { width: sandboxPlacementState.footprintWidth, depth: sandboxPlacementState.footprintDepth },
+      target: sandboxPlacementState.target,
+      blocked: sandboxPlacementState.blocked === true,
+      blockerName: sandboxPlacementState.blockerName || null,
+      canConfirm: sandboxPlacementState.hasTarget && sandboxPlacementState.candidateLocked && sandboxPlacementState.blocked !== true,
+      ...extra,
+    })
+  }
+
+  function applySandboxPlacementGhost(state) {
+    state.materialSnapshots = []
+    state.model.traverse(object => {
+      if (!object.isMesh || !object.material) return
+      const original = object.material
+      const makeGhost = material => {
+        const clone = material.clone()
+        clone.transparent = true
+        clone.opacity = Math.min(Number.isFinite(material.opacity) ? material.opacity : 1, 0.42)
+        clone.depthWrite = false
+        clone.needsUpdate = true
+        return clone
+      }
+      const preview = Array.isArray(original) ? original.map(makeGhost) : makeGhost(original)
+      state.materialSnapshots.push({ object, original, preview, renderOrder: object.renderOrder })
+      object.material = preview
+      object.renderOrder = 20
+    })
+  }
+
+  function restoreSandboxPlacementGhost(state) {
+    for (const snapshot of state?.materialSnapshots || []) {
+      snapshot.object.material = snapshot.original
+      snapshot.object.renderOrder = snapshot.renderOrder
+      if (Array.isArray(snapshot.preview)) snapshot.preview.forEach(material => material?.dispose?.())
+      else snapshot.preview?.dispose?.()
+    }
+    state.materialSnapshots = []
+  }
+
+  function beginSandboxModelPlacement(modelOrId) {
+    if (!scene || sandboxPlacementState || placementState || indoorGroup) return false
+    // 勾绘占地只是生成前的辅助预览，进入摆放后交给模型自身的多边形占地显示。
+    clearSandboxFootprintRegion()
+    const existingEntry = typeof modelOrId === 'string'
+      ? [String(modelOrId), sandboxModels.get(String(modelOrId))]
+      : Array.from(sandboxModels.entries()).find(([, item]) => item === modelOrId) || null
+    const existing = Boolean(existingEntry?.[1])
+    const model = existing ? existingEntry[1] : modelOrId
+    if (!model?.isObject3D || (!existing && model.parent)) return false
+    model.updateWorldMatrix(true, true)
+    const initialBounds = new THREE.Box3().setFromObject(model)
+    if (initialBounds.isEmpty()) return false
+    const size = initialBounds.getSize(new THREE.Vector3())
+    const roadFootprint = isAnyStretchableRoadModel(model)
+    // 勾绘占地（AI 生成时画的区域）：本地坐标多边形，随模型移动/旋转。
+    const rawFootprintPolygon = model.userData?.sandboxFootprintPolygon?.points
+    const footprintPolygon = Array.isArray(rawFootprintPolygon) && rawFootprintPolygon.length >= 3
+      ? rawFootprintPolygon.map(point => ({ x: Number(point.x) || 0, z: Number(point.z) || 0 }))
+      : null
+    const polygonBounds = footprintPolygon ? footprintPolygonBounds(footprintPolygon) : null
+    const footprintWidth = polygonBounds ? Math.max(0.25, polygonBounds.width) : Math.max(0.25, size.x)
+    const footprintDepth = polygonBounds ? Math.max(0.25, polygonBounds.depth) : Math.max(0.25, size.z)
+    const worldBounds = getSandboxPlacementWorldBounds()
+    if (footprintWidth > worldBounds.width || footprintDepth > worldBounds.depth) return false
+    sandboxPlacementState = {
+      model,
+      existing,
+      id: existingEntry?.[0] || null,
+      originalPosition: model.position.clone(),
+      originalRotation: model.rotation.clone(),
+      originalScale: model.scale.clone(),
+      originalVisible: model.visible,
+      originalCameraMode: cameraRig?.mode || 'thirdPerson',
+      originalInputMode: input?.mode || cameraRig?.mode || 'thirdPerson',
+      footprintWidth,
+      footprintDepth,
+      roadFootprint,
+      footprintPolygon,
+      footprintProbes: null,
+      stage: 'point',
+      level: 0,
+      hasTarget: false,
+      candidateLocked: false,
+      target: null,
+      blocked: false,
+      blockerName: null,
+      lastReportedBlocker: undefined,
+      materialSnapshots: [],
+    }
+    if (!existing) selectSandboxModel(null)
+    else sandboxTransform?.detach()
+    applySandboxEnvironmentBindings(model)
+    if (!existing) scene.add(model)
+    model.visible = true
+    applySandboxPlacementGhost(sandboxPlacementState)
+    const footprintMaterial = new THREE.MeshBasicMaterial({
+      color: '#8bd5a5',
+      transparent: true,
+      opacity: 0.38,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    })
+    sandboxPlacementFootprint = new THREE.Mesh(
+      (roadFootprint || footprintPolygon) ? new THREE.BufferGeometry() : new THREE.PlaneGeometry(footprintWidth, footprintDepth),
+      footprintMaterial,
+    )
+    sandboxPlacementFootprint.name = 'sandbox-placement-footprint'
+    if (!roadFootprint && !footprintPolygon) {
+      sandboxPlacementFootprint.rotation.x = -Math.PI / 2
+      sandboxPlacementFootprint.position.y = 0.035
+    }
+    sandboxPlacementFootprint.visible = false
+    sandboxPlacementFootprint.renderOrder = 5
+    scene.add(sandboxPlacementFootprint)
+    let outlineGeometry
+    if (roadFootprint || footprintPolygon) {
+      outlineGeometry = new THREE.BufferGeometry()
+    } else {
+      const outlineSourceGeometry = new THREE.PlaneGeometry(footprintWidth, footprintDepth)
+      outlineGeometry = new THREE.EdgesGeometry(outlineSourceGeometry)
+      outlineSourceGeometry.dispose()
+    }
+    sandboxPlacementFootprintOutline = new THREE.LineSegments(outlineGeometry, new THREE.LineBasicMaterial({
+      color: '#b8f5c8', transparent: true, opacity: 0.98, depthTest: false,
+    }))
+    sandboxPlacementFootprintOutline.name = 'sandbox-placement-footprint-outline'
+    if (!roadFootprint && !footprintPolygon) {
+      sandboxPlacementFootprintOutline.rotation.x = -Math.PI / 2
+      sandboxPlacementFootprintOutline.position.y = 0.055
+    }
+    sandboxPlacementFootprintOutline.visible = false
+    sandboxPlacementFootprintOutline.renderOrder = 1001
+    scene.add(sandboxPlacementFootprintOutline)
+
+    if (cameraRig?.mode !== 'overview') cameraRig?.setMode('overview')
+    input?.setMode('overview')
+    input?.setMovementEnabled(false)
+    cameraRig?.setOrbitInteractionEnabled?.(true)
+    const world = getSandboxPlacementWorldBounds()
+    cameraRig?.focusBounds(world.width, world.depth, world.centerX, world.centerZ)
+    configureSandboxPlacementOrbit(cameraRig?.overviewSpan || Math.max(world.width, world.depth), world)
+    emitSandboxPlacementState({ instruction: '移动鼠标预览模型和最大水平占地范围，点击地面锁定候选位置' })
+    requestFrame()
+    return true
+  }
+
+  function onSandboxPlacementPointerDown(event) {
+    const state = sandboxPlacementState
+    if (!state || event.button !== 0) return
+    event.preventDefault()
+    event.stopImmediatePropagation()
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    updateSandboxPlacementPreview(point)
+    state.candidateLocked = true
+    emitSandboxPlacementState({ instruction: '候选位置已锁定；确认前可点击“重新选择”调整位置' })
+    requestFrame()
+    return;
+  }
+
+  function onSandboxPlacementPointerMove(event) {
+    const state = sandboxPlacementState
+    if (!state || state.stage !== 'point' || state.candidateLocked) return
+    const point = getSandboxGroundPoint(event)
+    if (point) updateSandboxPlacementPreview(point)
+  }
+
+  function clearSandboxPlacementFootprint() {
+    if (sandboxPlacementFootprint) {
+      scene?.remove(sandboxPlacementFootprint)
+      sandboxPlacementFootprint.geometry?.dispose?.()
+      sandboxPlacementFootprint.material?.dispose?.()
+      sandboxPlacementFootprint = null
+    }
+    if (sandboxPlacementFootprintOutline) {
+      scene?.remove(sandboxPlacementFootprintOutline)
+      sandboxPlacementFootprintOutline.geometry?.dispose?.()
+      sandboxPlacementFootprintOutline.material?.dispose?.()
+      sandboxPlacementFootprintOutline = null
+    }
+  }
+
+  function restoreSandboxPlacementCamera(state) {
+    const cameraMode = state?.originalCameraMode || 'thirdPerson'
+    const inputMode = state?.originalInputMode || cameraMode
+    if (cameraRig?.mode !== cameraMode) cameraRig?.setMode(cameraMode)
+    input?.setMode(inputMode)
+  }
+
+  function unlockSandboxPlacementCandidate() {
+    const state = sandboxPlacementState
+    if (!state || !state.candidateLocked) return false
+    state.candidateLocked = false
+    emitSandboxPlacementState({ instruction: '移动鼠标预览占地范围，再点击地面锁定候选位置' })
+    requestFrame()
+    return true
+  }
+
+  function confirmSandboxModelPlacement() {
+    const state = sandboxPlacementState
+    if (!state || state.stage !== 'point' || !state.hasTarget || !state.candidateLocked) return false
+    const { model, existing, id, target } = state
+    model.updateWorldMatrix(true, true)
+    const currentBounds = new THREE.Box3().setFromObject(model)
+    const blockerName = getSandboxPlacementConflict(currentBounds, state)
+    if (blockerName) {
+      state.blocked = true
+      state.blockerName = blockerName
+      emitSandboxPlacementState({ instruction: `无法落地：与“${blockerName}”发生空间重叠，请重新选择位置` })
+      return false
+    }
+    sandboxPlacementState = null
+    clearSandboxPlacementFootprint()
+    restoreSandboxPlacementGhost(state)
+    model.visible = true
+    if (existing) {
+      refreshSandboxModelSpatial(model)
+      selectSandboxModel(id)
+    } else {
+      scene.remove(model)
+      addSandboxModel(model, { name: model.name, position: target })
+    }
+    input?.setMovementEnabled(true)
+    restoreSandboxPlacementCamera(state)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onSandboxPlacementChange?.({ active: false, confirmed: true, id: existing ? id : model.userData.sandboxModelId })
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    return true
+  }
+
+  function cancelSandboxModelPlacement() {
+    const state = sandboxPlacementState
+    if (!state) return false
+    sandboxPlacementState = null
+    clearSandboxPlacementFootprint()
+    const { model, existing, id, originalPosition, originalRotation, originalScale, originalVisible } = state
+    restoreSandboxPlacementGhost(state)
+    model.position.copy(originalPosition)
+    model.rotation.copy(originalRotation)
+    model.scale.copy(originalScale)
+    model.visible = originalVisible
+    if (existing) {
+      refreshSandboxModelSpatial(model)
+      selectSandboxModel(id)
+    } else {
+      model.parent?.remove(model)
+      disposeObjectGroup(model)
+    }
+    input?.setMovementEnabled(true)
+    restoreSandboxPlacementCamera(state)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onSandboxPlacementChange?.({ active: false, cancelled: true, existing })
+    return true
+  }
+
+  function onSandboxPointerDown(event) {
+    if (chunkManagementActive || event.button !== 0 || sandboxPlacementState || !renderer || !cameraRig || sandboxTransform?.dragging) return
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const roots = Array.from(sandboxModels.values())
+    const hit = raycaster.intersectObjects(roots, true).find(item => item.object.visible)
+    if (!hit) {
+      selectSandboxModel(null)
+      return
+    }
+    let root = hit.object
+    while (root && !root.userData?.sandboxModelId) root = root.parent
+    const modelId = root?.userData?.sandboxModelId || null
+    selectSandboxModel(modelId)
+    let part = hit.object
+    // 合批 mesh 不再带 componentId，先按命中面还原源部件，再退回祖先回溯。
+    const batchPartId = resolveStaticBatchPartId(hit.object, hit.faceIndex)
+    if (batchPartId) {
+      let match = null
+      root?.traverse(object => {
+        if (!match && String(object.userData?.componentId ?? '') === batchPartId) match = object
+      })
+      if (match) part = match
+    }
+    while (part && part !== root && !part.userData?.componentId) part = part.parent
+    callbacks.onSandboxPartSelected?.(part && part !== root ? {
+      modelId,
+      id: String(part.userData.componentId),
+      name: part.name || String(part.userData.componentId),
+    } : null)
+  }
+
+  function applySandboxEnvironmentBindings(model) {
+    return applyEnvironmentBindings(model, {
+      'lighting.artificial.enabled': environmentConfig.artificialLightingEnabled,
+    })
+  }
+
+  function removeSandboxModelSpatialRegistration(ownerId) {
+    if (!ownerId) return
+    modelAnimationRuntime.remove(String(ownerId))
+    collisionWorld?.removeObstaclesByOwner(String(ownerId))
+    collisionWorld?.removeSupportSurfacesByOwner(String(ownerId))
+    physicsRuntime?.removeOwner(String(ownerId))
+    sandboxInteractionIndex.unregister(String(ownerId))
+    sandboxWaterVolumes.delete(String(ownerId))
+  }
+
+  function getCurrentEnvironmentSnapshot() {
+    return createSandboxEnvironmentSnapshot(environmentConfig)
+  }
+
+  function registerSandboxModelAnimation(model) {
+    const id = model?.userData?.sandboxModelId
+    if (!id) return Promise.resolve(null)
+    return modelAnimationRuntime.register(String(id), model, getCurrentEnvironmentSnapshot())
+  }
+
+  function refreshSandboxModelSpatial(model) {
+    const spatialCount = refreshModelSpatialRegistration(THREE, model, collisionWorld)
+    if (isBlankSandbox) refreshModelPhysicsRegistration(THREE, model, physicsRuntime)
+    const ownerId = model?.userData?.sandboxModelId
+    if (ownerId) {
+      sandboxInteractionIndex.register(String(ownerId), model)
+      const volumes = collectModelWaterVolumes(THREE, model, String(ownerId))
+      if (volumes.length) sandboxWaterVolumes.set(String(ownerId), volumes)
+      else sandboxWaterVolumes.delete(String(ownerId))
+    }
+    return spatialCount
+  }
+
+  function addSandboxModel(model, options = {}) {
+    if (!scene || !model?.isObject3D || model.parent) throw new TypeError('AI 建模结果必须是未挂载的 THREE.Object3D')
+    const id = options.id ? String(options.id) : 'sandbox_' + (++sandboxModelSequence)
+    if (sandboxModels.has(id)) throw new Error('沙盒模型实例 ID 已存在：' + id)
+    const restoredSequence = Number(id.match(/^sandbox_(\d+)$/)?.[1] || 0)
+    sandboxModelSequence = Math.max(sandboxModelSequence, restoredSequence)
+    model.userData = { ...(model.userData || {}), sandboxModelId: id, isSandboxModel: true }
+    model.name = options.name || model.name || 'AI 建模组 ' + sandboxModelSequence
+    if (options.position) model.position.set(Number(options.position.x) || 0, Number(options.position.y) || 0, Number(options.position.z) || 0)
+    else if (cameraRig?.player) model.position.set(cameraRig.player.x + 3, 0, cameraRig.player.z + 3)
+    model.traverse(object => { if (object.isMesh) { object.castShadow = true; object.receiveShadow = true } })
+    scene.add(model)
+    sandboxModels.set(id, model)
+    refreshSandboxModelSpatial(model)
+    // ObjectLoader 恢复后以持久化世界状态重建灯光/材质等运行时属性。
+    applyWorldStateBindings(model, model.userData.worldState || {})
+    applySandboxLightingState(model, model.userData.worldState || {})
+    applySandboxEnvironmentBindings(model)
+    // 静态装饰 mesh 按材质合批，把数百个 draw call 降到材质数量级；部件子树受保护不参与。
+    batchStaticModel(model)
+    registerSandboxModelAnimation(model)
+    if (isAnyStretchableRoadModel(model)) rebuildSandboxRoadJunctions()
+    selectSandboxModel(id)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    return id
+  }
+
+  function getSandboxModels() {
+    return Array.from(sandboxModels, ([id, model]) => ({ id, name: model.name, spec: model.userData.objectSculptSpec || null }))
+  }
+
+  function getSandboxModel(id) {
+    return sandboxModels.get(String(id)) || null
+  }
+
+  // 发布申请用的缩略图：立即渲染后同步读取当前 WebGL 画布，避免 drawingBuffer 被清空。
+  function captureSandboxThumbnail(maxWidth = 640) {
+    if (!renderer || !scene || !cameraRig?.camera) return null
+    try {
+      renderer.render(scene, cameraRig.camera)
+      const source = renderer.domElement
+      const scale = Math.min(1, Number(maxWidth) > 0 ? Number(maxWidth) / Math.max(1, source.width) : 1)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(source.width * scale))
+      canvas.height = Math.max(1, Math.round(source.height * scale))
+      const context = canvas.getContext('2d')
+      if (!context) return null
+      context.drawImage(source, 0, 0, canvas.width, canvas.height)
+      return canvas.toDataURL('image/jpeg', 0.68)
+    } catch {
+      return null
+    }
+  }
+
+  function serializeSandboxModel(id) {
+    const key = String(id)
+    const model = sandboxModels.get(key)
+    if (!model) return null
+    return modelAnimationRuntime.serializeModel(key) || model.toJSON()
+  }
+
+  function getPlayerPosition() {
+    return cameraRig?.player
+      ? { x: cameraRig.player.x, y: cameraRig.player.y, z: cameraRig.player.z }
+      : null
+  }
+
+  function replaceSandboxModel(id, replacement, metadata = {}) {
+    const current = sandboxModels.get(String(id))
+    if (!current || sandboxPlacementState?.model === current || !replacement?.isObject3D || replacement.parent) return false
+    if (activeSandboxInterior?.modelId === String(id)) return false
+    replacement.userData = {
+      ...(replacement.userData || {}),
+      ...(metadata.userData || {}),
+      // 实例运行状态与局部环境覆盖属于实例，不应因 AI 重建几何而丢失。
+      worldState: metadata.userData?.worldState ?? replacement.userData?.worldState ?? current.userData?.worldState ?? {},
+      environmentOverrides: metadata.userData?.environmentOverrides
+        ?? replacement.userData?.environmentOverrides ?? current.userData?.environmentOverrides ?? {},
+      sandboxModelId: String(id),
+      isSandboxModel: true,
+    }
+    replacement.name = metadata.name || current.name || replacement.name
+    const transform = metadata.transform
+    if (transform) {
+      if (transform.position) {
+        replacement.position.set(transform.position.x, transform.position.y, transform.position.z)
+      } else {
+        replacement.position.copy(current.position)
+      }
+      if (transform.rotation) {
+        replacement.rotation.set(transform.rotation.x, transform.rotation.y, transform.rotation.z)
+      } else {
+        replacement.rotation.copy(current.rotation)
+      }
+      if (transform.scale) {
+        replacement.scale.set(transform.scale.x, transform.scale.y, transform.scale.z)
+      } else {
+        replacement.scale.copy(current.scale)
+      }
+    } else {
+      replacement.position.copy(current.position)
+      replacement.rotation.copy(current.rotation)
+      replacement.scale.copy(current.scale)
+    }
+    replacement.traverse(object => { if (object.isMesh) { object.castShadow = true; object.receiveShadow = true } })
+    const parent = current.parent || scene
+    parent.add(replacement)
+    removeSandboxModelSpatialRegistration(id)
+    sandboxModels.set(String(id), replacement)
+    refreshSandboxModelSpatial(replacement)
+    applyWorldStateBindings(replacement, replacement.userData.worldState || {})
+    applySandboxLightingState(replacement, replacement.userData.worldState || {})
+    applySandboxEnvironmentBindings(replacement)
+    batchStaticModel(replacement)
+    registerSandboxModelAnimation(replacement)
+    if (isAnyStretchableRoadModel(replacement)) rebuildSandboxRoadJunctions()
+    const wasSelected = sandboxSelectedModel === current
+    if (wasSelected) sandboxSelectedModel = replacement
+    current.parent?.remove(current)
+    disposeObjectGroup(current)
+    if (wasSelected) selectSandboxModel(id)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    if (!wasSelected) callbacks.onSandboxModelSelected?.({
+      id: String(id),
+      name: replacement.name,
+      spec: replacement.userData.objectSculptSpec || null,
+    })
+    return true
+  }
+
+  function clearSandboxSelectionHelper() {
+    if (!sandboxSelectionHelper) return
+    scene?.remove(sandboxSelectionHelper)
+    sandboxSelectionHelper.geometry?.dispose?.()
+    const material = sandboxSelectionHelper.material
+    if (Array.isArray(material)) material.forEach(item => item?.dispose?.())
+    else material?.dispose?.()
+    sandboxSelectionHelper = null
+  }
+
+  // 道路选中轮廓贴合道路形状；其他模型仍用包围盒。
+  function roadOutlineY(model) {
+    const box = new THREE.Box3().setFromObject(model)
+    return Number.isFinite(box.max.y) ? box.max.y + 0.02 : 0.1
+  }
+
+  function createRoadSelectionOutline(model) {
+    const outline = new THREE.LineSegments(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({
+      color: '#a5c9b1',
+      depthTest: false,
+      transparent: true,
+      opacity: 0.95,
+      toneMapped: false,
+    }))
+    outline.name = 'sandbox-selection-outline'
+    outline.renderOrder = 1000
+    outline.update = () => {
+      const geometry = buildRoadFootprintOutlineGeometry(getRoadFootprint(model), roadOutlineY(model))
+      outline.geometry?.dispose?.()
+      outline.geometry = geometry
+    }
+    outline.update()
+    return outline
+  }
+
+  function selectSandboxModel(id) {
+    if (sandboxPlacementState && id) return false
+    const model = id ? sandboxModels.get(String(id)) : null
+    if (sandboxRoadEditor?.isAttached() && sandboxRoadEditor.getModelId() !== String(id)) {
+      sandboxRoadEditor.detach()
+    }
+    sandboxSelectedModel = model || null
+    clearSandboxSelectionHelper()
+    if (sandboxSelectedModel) {
+      if (isAnyStretchableRoadModel(sandboxSelectedModel)) {
+        sandboxSelectionHelper = createRoadSelectionOutline(sandboxSelectedModel)
+      } else {
+        sandboxSelectionHelper = new THREE.BoxHelper(sandboxSelectedModel, '#a5c9b1')
+        sandboxSelectionHelper.material.depthTest = false
+        sandboxSelectionHelper.material.transparent = true
+        sandboxSelectionHelper.material.opacity = 0.95
+        sandboxSelectionHelper.material.toneMapped = false
+        sandboxSelectionHelper.renderOrder = 1000
+      }
+      scene?.add(sandboxSelectionHelper)
+    }
+    // 选中与精细调整分离：单击只更新选择，不自动挂载 Gizmo，也不接管相机。
+    sandboxTransform?.detach()
+    cameraRig?.setOrbitInteractionEnabled?.(true)
+    callbacks.onSandboxModelSelected?.(sandboxSelectedModel ? {
+      id: sandboxSelectedModel.userData.sandboxModelId,
+      name: sandboxSelectedModel.name,
+      spec: sandboxSelectedModel.userData.objectSculptSpec || null,
+    } : null)
+    requestFrame()
+    return Boolean(sandboxSelectedModel)
+  }
+
+  // three r180 TransformControls 的轴向可见性是布尔属性（showX/showY/showZ），
+  // 旧版 showX()/hideX() 方法已移除；init 前 sandboxTransform 可能仍为 null。
+  function setSandboxTransformAxes(x, y, z) {
+    if (!sandboxTransform) return
+    sandboxTransform.showX = x
+    sandboxTransform.showY = y
+    sandboxTransform.showZ = z
+  }
+
+  function setSandboxTransformMode(mode) {
+    if (mode === 'road-endpoints') {
+      if (!isAnyStretchableRoadModel(sandboxSelectedModel)) return false
+      sandboxTransform?.detach()
+      const editor = getSandboxRoadEditor()
+      if (!editor?.attach(sandboxSelectedModel)) return false
+      cameraRig?.setOrbitInteractionEnabled?.(false)
+      requestFrame()
+      return true
+    }
+
+    sandboxRoadEditor?.detach()
+    if (mode === 'browse') {
+      sandboxTransform?.detach()
+      setSandboxTransformAxes(true, true, true)
+      cameraRig?.setOrbitInteractionEnabled?.(true)
+      requestFrame()
+      return true
+    }
+    if (!['translate', 'rotate', 'scale'].includes(mode)) return false
+    const selectedIsRoad = isAnyStretchableRoadModel(sandboxSelectedModel)
+    if (selectedIsRoad && mode === 'scale') return false
+    if (sandboxSelectedModel) sandboxTransform?.attach(sandboxSelectedModel)
+    cameraRig?.setOrbitInteractionEnabled?.(!sandboxSelectedModel)
+    sandboxTransform?.setMode(mode)
+    if (selectedIsRoad && mode === 'translate') {
+      setSandboxTransformAxes(true, false, true)
+    } else if (selectedIsRoad && mode === 'rotate') {
+      setSandboxTransformAxes(false, true, false)
+    } else {
+      setSandboxTransformAxes(true, true, true)
+    }
+    requestFrame()
+    return true
+  }
+
+  function removeSandboxModel(id) {
+    const model = sandboxModels.get(String(id))
+    if (!model || sandboxPlacementState?.model === model || activeSandboxInterior?.modelId === String(id)) return false
+    const wasRoad = isAnyStretchableRoadModel(model)
+    if (sandboxSelectedModel === model) selectSandboxModel(null)
+    sandboxModels.delete(String(id))
+    removeSandboxModelSpatialRegistration(id)
+    model.parent?.remove(model)
+    disposeObjectGroup(model)
+    if (wasRoad) rebuildSandboxRoadJunctions()
+    invalidateShadowMap()
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    requestFrame()
+    return true
+  }
+
+  // 世界状态保存在稳定的沙盒对象 ID 上；子节点通过 stateBinding 声明如何映射到 Runtime 属性。
+  function getSandboxModelState(id) {
+    const model = sandboxModels.get(String(id))
+    return model ? { ...(model.userData.worldState || {}) } : null
+  }
+
+  // 所有程序化 Transform 修改统一经过此入口，保证世界矩阵、碰撞体、支撑面和阴影同步。
+  function setSandboxModelTransform(id, transform = {}) {
+    const model = sandboxModels.get(String(id))
+    if (!model || sandboxPlacementState?.model === model || !transform || typeof transform !== 'object') return false
+
+    let changed = false
+    let hasValidTransformInput = false
+    for (const key of ['position', 'rotation', 'scale']) {
+      const values = transform[key]
+      if (!values || typeof values !== 'object') continue
+      const target = model[key]
+      for (const axis of ['x', 'y', 'z']) {
+        if (!Object.prototype.hasOwnProperty.call(values, axis)) continue
+        const value = Number(values[axis])
+        if (!Number.isFinite(value)) continue
+        hasValidTransformInput = true
+        if (target[axis] !== value) {
+          target[axis] = value
+          changed = true
+        }
+      }
+    }
+    // TransformControls 已经先修改了 Object3D；即使传入值与当前值相同，也必须刷新空间注册。
+    if (!hasValidTransformInput) return true
+    model.updateMatrixWorld(true)
+    refreshSandboxModelSpatial(model)
+    if (isAnyStretchableRoadModel(model)) rebuildSandboxRoadJunctions()
+    if (sandboxSelectedModel === model) sandboxSelectionHelper?.update()
+    invalidateShadowMap()
+    requestFrame()
+    return true
+  }
+
+  function refreshPlayerCameraAfterTeleport() {
+    if (cameraRig?.mode === 'firstPerson') cameraRig.updateFirstPersonDesired()
+    else cameraRig?.updateThirdPersonDesired()
+    requestFrame()
+  }
+
+  function applySandboxModelInteraction(payload = {}) {
+    const sourceModelId = String(payload.id || '')
+    const sourceModel = sandboxModels.get(sourceModelId)
+    if (!sourceModel) return { ok: false, reason: 'model-not-found' }
+    const config = payload.config || {}
+    // Legacy switches may explicitly target another model instance; keep that route intact.
+    const targetModelId = config.targetId ? String(config.targetId) : sourceModelId
+    const targetModel = sandboxModels.get(targetModelId)
+    if (!targetModel) return { ok: false, reason: 'target-model-not-found' }
+    const result = executeSandboxInteractionAction({
+      model: targetModel,
+      sourcePartId: targetModel === sourceModel ? (payload.targetPartId || null) : null,
+      config,
+    })
+    if (!result.ok) return result
+
+    if (result.action === 'enter') {
+      if (sourceModelId !== targetModelId) return { ok: false, reason: 'interior-source-mismatch' }
+      if (activeSandboxInterior) return { ok: false, reason: 'already-inside-model' }
+      const entry = resolveSandboxInteriorEntryPoint(THREE, targetModel, result.entryPointId)
+      if (!entry) return { ok: false, reason: 'interior-entry-point-not-found' }
+      if (collisionWorld?.isBlocked?.(entry.position.x, entry.position.z)) {
+        return { ok: false, reason: 'interior-entry-point-blocked' }
+      }
+      activeSandboxInterior = {
+        modelId: targetModelId,
+        player: cameraRig.player.clone(),
+        mode: cameraRig.mode,
+        cameraState: {
+          firstYaw: cameraRig.firstYaw,
+          firstPitch: cameraRig.firstPitch,
+          thirdYaw: cameraRig.thirdYaw,
+          thirdPitch: cameraRig.thirdPitch,
+          thirdDistance: cameraRig.thirdDistance,
+        },
+      }
+      // Manifest positions are floor-level local coordinates; the controller stores eye height.
+      const entered = input?.teleportPlayer?.({
+        x: entry.position.x,
+        y: entry.position.y + 1.7,
+        z: entry.position.z,
+      })
+      if (!entered) {
+        activeSandboxInterior = null
+        return { ok: false, reason: 'player-teleport-failed' }
+      }
+      refreshPlayerCameraAfterTeleport()
+      return { ...result, targetModelId, transition: 'entered' }
+    }
+
+    if (result.action === 'exit') {
+      if (sourceModelId !== targetModelId) return { ok: false, reason: 'interior-source-mismatch' }
+      if (!activeSandboxInterior || activeSandboxInterior.modelId !== targetModelId) {
+        return { ok: false, reason: 'not-inside-target-model' }
+      }
+      const previousInterior = activeSandboxInterior
+      cameraRig.setMode(previousInterior.mode)
+      input?.setMode(previousInterior.mode)
+      Object.assign(cameraRig, previousInterior.cameraState || {})
+      const restored = input?.teleportPlayer?.(previousInterior.player)
+      if (!restored) return { ok: false, reason: 'player-teleport-failed' }
+      activeSandboxInterior = null
+      refreshPlayerCameraAfterTeleport()
+      return { ...result, targetModelId, transition: 'exited' }
+    }
+
+    if (result.statePatch) {
+      const state = setSandboxModelState(targetModelId, result.statePatch)
+      return state ? { ...result, targetModelId, state } : { ok: false, reason: 'state-update-failed' }
+    }
+    targetModel.updateWorldMatrix(true, true)
+    refreshSandboxModelSpatial(targetModel)
+    invalidateShadowMap()
+    requestFrame()
+    return { ...result, targetModelId }
+  }
+
+  function setSandboxModelState(id, patch = {}) {
+    const model = sandboxModels.get(String(id))
+    if (!model || !patch || typeof patch !== 'object') return false
+    const previous = { ...(model.userData.worldState || {}) }
+    const next = { ...previous, ...patch }
+    model.userData.worldState = next
+    applyWorldStateBindings(model, next)
+    applySandboxLightingState(model, next)
+    // Door/hinge state can change movement collision without rebuilding the model.
+    refreshSandboxModelSpatial(model)
+    callbacks.onSandboxModelStateChange?.({ id: String(id), previous, state: next, patch: { ...patch } })
+    invalidateShadowMap()
+    requestFrame()
+    return next
+  }
+
+  function setSandboxModelEnvironmentOverride(id, variable, value) {
+    const model = sandboxModels.get(String(id))
+    if (!model || typeof variable !== 'string' || !variable) return false
+    model.userData.environmentOverrides = { ...(model.userData.environmentOverrides || {}), [variable]: value }
+    applySandboxEnvironmentBindings(model)
+    invalidateShadowMap()
+    requestFrame()
+    return true
+  }
+
+  function clearSandboxModelEnvironmentOverride(id, variable) {
+    const model = sandboxModels.get(String(id))
+    if (!model || typeof variable !== 'string' || !variable) return false
+    const overrides = { ...(model.userData.environmentOverrides || {}) }
+    if (!Object.prototype.hasOwnProperty.call(overrides, variable)) return false
+    delete overrides[variable]
+    model.userData.environmentOverrides = overrides
+    applySandboxEnvironmentBindings(model)
+    invalidateShadowMap()
+    requestFrame()
+    return true
+  }
+
+  function duplicateSandboxModel(id) {
+    const source = sandboxModels.get(String(id))
+    if (!source || sandboxPlacementState) return null
+    // 动画模型从动画前静态基准重建副本，避免把当前动画姿态或控制器运行时节点烘焙进新模型。
+    const baseline = modelAnimationRuntime.serializeModel(String(id))
+    const copy = clonePlacedSandboxModel(source, baseline)
+    if (!baseline) copy.userData = { ...source.userData }
+    copy.position.x += 3
+    copy.name = source.name + ' 副本'
+    delete copy.userData.sandboxModelId
+    return addSandboxModel(copy, { name: copy.name, position: copy.position })
+  }
+
+  // 静态校园保留阴影贴图；只有场景几何变化时才重算，不随相机交互重复执行 shadow pass。
+  function invalidateShadowMap() {
+    if (shadowSystem) return shadowSystem.invalidateStatic()
+    if (!renderer || !renderer.shadowMap.enabled) return false
+    renderer.shadowMap.needsUpdate = true
+    return true
+  }
+
+  function invalidateDynamicShadowMap() {
+    // A/B 测试只跳过动态阴影失效；正式模式完全沿用 Three.js 原生更新语义。
+    if (staticShadowTestEnabled) return false
+    if (shadowSystem) return shadowSystem.invalidateDynamic()
+    if (!renderer || !renderer.shadowMap.enabled) return false
+    renderer.shadowMap.needsUpdate = true
+    return true
+  }
+
+  function setEnvironment(config = {}) {
+    const requestedTime = config.time === undefined
+      ? (config.timeOfDay === 'night' ? 22 : config.timeOfDay === 'day' ? 14 : environmentConfig.time)
+      : Number(config.time)
+    const time = Number.isFinite(requestedTime) ? Math.max(0, Math.min(24, requestedTime)) : environmentConfig.time
+    const solar = getVirtualSunState(time)
+    const timeOfDay = solar.isNight ? 'night' : 'day'
+    const weather = ['clear', 'rain'].includes(config.weather) ? config.weather : environmentConfig.weather
+    const windValue = config.wind === undefined ? environmentConfig.wind : Number(config.wind)
+    const wind = Number.isFinite(windValue) ? Math.max(0, Math.min(1, windValue)) : environmentConfig.wind
+    const artificialLightingEnabled = config.artificialLightingEnabled === undefined
+      ? environmentConfig.artificialLightingEnabled
+      : Boolean(config.artificialLightingEnabled)
+    const requestedWindDirection = config.windDirection
+      ?? (typeof config.wind === 'object' ? config.wind?.direction : undefined)
+      ?? environmentConfig.windDirection
+    const windDirection = createSandboxEnvironmentSnapshot(
+      { windDirection: requestedWindDirection },
+      { windDirection: environmentConfig.windDirection },
+    ).wind.direction
+    environmentConfig = { time, timeOfDay, weather, wind, windDirection, artificialLightingEnabled }
+    for (const model of sandboxModels.values()) applySandboxEnvironmentBindings(model)
+    if (sandboxPlacementState?.model) applySandboxEnvironmentBindings(sandboxPlacementState.model)
+    if (!scene) return { ...environmentConfig }
+
+    const night = solar.isNight
+    const rainy = weather === 'rain'
+    const nightSky = new THREE.Color('#111d31')
+    const dawnSky = new THREE.Color('#e4a77e')
+    const daySky = new THREE.Color('#b9d0c2')
+    const sky = night ? nightSky : dawnSky.lerp(daySky, solar.daylight)
+    if (rainy) sky.lerp(new THREE.Color('#788894'), 0.55)
+    scene.background = sky
+    if (skyRuntime) {
+      const skyState = getSkyVisualState(solar, weather, { r: sky.r, g: sky.g, b: sky.b })
+      skyRuntime.update(skyState)
+    }
+    scene.fog = rainy
+      ? new THREE.Fog(night ? '#303e51' : '#87939b', 24, 125)
+      : night ? new THREE.Fog('#17243a', 48, 180) : null
+    if (hemisphereLight) {
+      hemisphereLight.color.set(night ? '#7187b0' : '#fff2d8')
+      hemisphereLight.groundColor.set(night ? '#202b3a' : '#71865e')
+      hemisphereLight.intensity = night ? 0.48 : 0.55 + solar.daylight * 1.65
+    }
+    if (directionalLight) {
+      const daylightColor = new THREE.Color('#fff2d8').lerp(new THREE.Color('#ffe0bd'), 1 - solar.daylight)
+      directionalLight.color.copy(night ? new THREE.Color('#91a9d6') : daylightColor)
+      directionalLight.intensity = night ? 0.38 : 0.25 + solar.daylight * 2.45
+      directionalLight.position.set(solar.direction[0] * 90, solar.direction[1] * 90, solar.direction[2] * 90)
+    }
+    rainField?.setVisible(!indoorGroup && rainy)
+    invalidateShadowMap()
+    requestFrame()
+    return { ...environmentConfig }
+  }
+
+  // 天气模式：扩展后的「天气模式」下拉。只改天气相关效果（降水、云、雪、雾、光照修正），
+  // 不改时间与风力——时间归时间滑杆、风力归风力开关，避免互相覆盖。
+  // intensity（0–1）是每种天气的统一强度维度：晴天=阳光强度、多云=云量、阴天=暗度、
+  // 下雨=雨量、下雪=雪量、大雾=浓度。下雨模式进入即自动下雨，无需额外开关。
+  // 不改变沙盒存档结构（存档仍只存既有 time/weather/wind 字段）。
+  function setWeatherMode(name, intensity = 0.5) {
+    const mode = resolveWeatherMode(name, intensity)
+    weatherModeName = mode.key
+    weatherModeIntensity = mode.intensity
+    // 仅更新 weather 字段，time 与 wind 保持当前值（下雨模式自动显示雨场）
+    const environment = setEnvironment({ weather: mode.weather })
+    // 在 setEnvironment 按当前时间算出的光照基础上叠加天气修正：
+    // 阴天/雨/雾压低直射光、抬高环境漫射光，并把天空向天气色混合，避免"晴天强光 + 灰天空"的割裂。
+    if (directionalLight) directionalLight.intensity *= mode.sunScale
+    if (hemisphereLight) hemisphereLight.intensity *= mode.hemiScale
+    if (mode.skyTint && scene?.background?.isColor) {
+      scene.background = scene.background.clone().lerp(new THREE.Color(mode.skyTint), mode.skyMix)
+      if (skyRuntime) {
+        const solar = getVirtualSunState(environmentConfig.time)
+        skyRuntime.update(getSkyVisualState(solar, environmentConfig.weather, {
+          r: scene.background.r,
+          g: scene.background.g,
+          b: scene.background.b,
+        }))
+      }
+    }
+    cloudLayer?.setCloudiness(mode.cloudiness)
+    cloudLayer?.setTint(getCloudTint(environmentConfig.time))
+    snowField?.setVisible(mode.snow && !indoorGroup)
+    snowField?.setIntensity(mode.snowIntensity)
+    rainField?.setIntensity(mode.weather === 'rain' ? mode.rainIntensity : 0)
+    if (mode.fog && scene) {
+      scene.fog = new THREE.Fog(mode.fog.color, mode.fog.near, mode.fog.far)
+    }
+    invalidateShadowMap()
+    requestFrame()
+    return {
+      ...environment,
+      mode: weatherModeName,
+      intensity: weatherModeIntensity,
+      cloudiness: mode.cloudiness,
+      snow: mode.snow,
+      sunScale: mode.sunScale,
+      hemiScale: mode.hemiScale,
+    }
+  }
+
+  function getWeatherModeState() {
+    return { mode: weatherModeName, intensity: weatherModeIntensity }
+  }
+
+  function getSandboxExpandMarkerDirections() {
+    return (sandboxExpandMarkers?.children || [])
+      .filter(marker => marker.userData.expandChunk)
+      .map(marker => marker.userData.expandDirection)
+  }
+
+  function getSandboxExpandMarkers() {
+    return (sandboxExpandMarkers?.children || [])
+      .filter(marker => marker.userData.expandChunk)
+      .map(marker => ({
+        direction: marker.userData.expandDirection,
+        chunk: { ...marker.userData.expandChunk },
+      }))
+  }
+
+  // ---- 道路绘制模式：点击地面逐个生成端点，端点自动吸附已有道路，完工时自动接合 ----
+  let roadDrawingState = null
+  let sandboxFootprintDrawingState = null
+
+  function collectExistingRoadPoints() {
+    const points = []
+    for (const model of sandboxModels.values()) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      points.push(...roadPointsOf(model))
+    }
+    return points
+  }
+
+  function clearRoadDrawingPreview() {
+    if (!roadDrawingState?.preview) return
+    const preview = roadDrawingState.preview
+    preview.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.dispose?.()
+    })
+    scene?.remove(preview)
+    roadDrawingState.preview = null
+  }
+
+  function updateRoadDrawingPreview() {
+    if (!roadDrawingState) return
+    const { preview, points } = roadDrawingState
+    if (!preview) return
+    // 清空旧预览子对象
+    for (const child of [...preview.children]) {
+      preview.remove(child)
+      child.geometry?.dispose?.()
+      child.material?.dispose?.()
+    }
+    const y = 0.15
+    if (points.length >= 2) {
+      const positions = []
+      for (let index = 1; index < points.length; index += 1) {
+        positions.push(points[index - 1].x, y, points[index - 1].z, points[index].x, y, points[index].z)
+      }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      const line = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({ color: '#8bd5a5' }))
+      line.renderOrder = 20
+      preview.add(line)
+    }
+    for (const point of points) {
+      const marker = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.35, 0.35, 0.1, 16),
+        new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+      )
+      marker.position.set(point.x, y, point.z)
+      marker.renderOrder = 20
+      preview.add(marker)
+    }
+    requestFrame()
+  }
+
+  function onRoadDrawingPointerDown(event) {
+    if (!roadDrawingState || event.button !== 0) return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    addSandboxRoadDrawingPoint(point.x, point.z)
+  }
+
+  function beginSandboxRoadDrawing(objectType) {
+    if (!isBlankSandbox || !scene) return false
+    if (!ROAD_OBJECT_TYPES.includes(objectType)) return false
+    cancelSandboxRoadDrawing()
+    sandboxRoadEditor?.detach()
+    sandboxTransform?.detach()
+    const definition = ROAD_DEFINITIONS.find(item => item.objectType === objectType)
+    if (!definition) return false
+    const preview = new THREE.Group()
+    preview.name = 'sandbox-road-drawing'
+    scene.add(preview)
+    roadDrawingState = { objectType, width: definition.width, points: [], preview }
+    renderer?.domElement?.addEventListener('pointerdown', onRoadDrawingPointerDown, true)
+    updateRoadDrawingPreview()
+    callbacks.onSandboxRoadDrawingChange?.({ active: true, objectType, points: [] })
+    return true
+  }
+
+  // 添加一个绘制端点：自动吸附到附近已有道路控制点，并限制在世界范围内。
+  function addSandboxRoadDrawingPoint(x, z) {
+    if (!roadDrawingState) return null
+    const world = getSandboxPlacementWorldBounds()
+    const clampedX = THREE.MathUtils.clamp(Number(x), world.centerX - world.width / 2, world.centerX + world.width / 2)
+    const clampedZ = THREE.MathUtils.clamp(Number(z), world.centerZ - world.depth / 2, world.centerZ + world.depth / 2)
+    if (!Number.isFinite(clampedX) || !Number.isFinite(clampedZ)) return null
+    const snapped = snapRoadPointToExisting({ x: clampedX, z: clampedZ }, collectExistingRoadPoints())
+    const point = { x: snapped.x, z: snapped.z }
+    const last = roadDrawingState.points[roadDrawingState.points.length - 1]
+    if (!last || Math.hypot(last.x - point.x, last.z - point.z) > 0.05) {
+      roadDrawingState.points.push(point)
+      updateRoadDrawingPreview()
+      callbacks.onSandboxRoadDrawingChange?.({
+        active: true,
+        objectType: roadDrawingState.objectType,
+        points: roadDrawingState.points.map(item => ({ ...item })),
+        snapped: snapped.snapped,
+      })
+    }
+    return { ...point, snapped: snapped.snapped }
+  }
+
+  function finishSandboxRoadDrawing() {
+    if (!roadDrawingState) return { ok: false, reason: 'not-drawing' }
+    const { objectType, width, points } = roadDrawingState
+    if (!areRoadPointsValid(points)) {
+      cancelSandboxRoadDrawing()
+      return { ok: false, reason: 'too-short' }
+    }
+    // 尝试与已有道路接合：新路端点与旧路端点重合时合并成一条折线。
+    let mergedId = null
+    for (const [id, model] of sandboxModels) {
+      if (!isAnyStretchableRoadModel(model)) continue
+      const combined = mergeRoadPointSequences(roadPointsOf(model), points)
+      if (!combined || !areRoadPointsValid(combined)) continue
+      const replacement = createPolylineRoadModel(THREE, {
+        objectType: model.userData.proceduralRoad.objectType,
+        width: Number(model.userData.proceduralRoad.width),
+        points: combined,
+      })
+      const accepted = replaceSandboxModel(id, replacement, {
+        transform: {
+          position: { x: 0, y: model.position.y, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        },
+      })
+      if (accepted) { mergedId = id; break }
+    }
+    if (!mergedId) {
+      const road = createPolylineRoadModel(THREE, { objectType, width, points })
+      addSandboxModel(road, { position: { x: 0, y: 0, z: 0 } })
+    }
+    cancelSandboxRoadDrawing()
+    callbacks.onSandboxModelsChange?.(getSandboxModels())
+    requestFrame()
+    return { ok: true, mergedId, points: points.length }
+  }
+
+  function cancelSandboxRoadDrawing() {
+    if (!roadDrawingState) return false
+    renderer?.domElement?.removeEventListener('pointerdown', onRoadDrawingPointerDown, true)
+    clearRoadDrawingPreview()
+    roadDrawingState = null
+    callbacks.onSandboxRoadDrawingChange?.({ active: false, points: [] })
+    requestFrame()
+    return true
+  }
+
+  function getSandboxRoadDrawingState() {
+    if (!roadDrawingState) return { active: false, objectType: null, points: [] }
+    return {
+      active: true,
+      objectType: roadDrawingState.objectType,
+      width: roadDrawingState.width,
+      points: roadDrawingState.points.map(point => ({ ...point })),
+    }
+  }
+
+  // ---- 占地勾绘/编辑：画多边形 → 完成后保留，顶点与整体都能拖动 ----
+  function footprintEventTarget() {
+    return renderer?.domElement || null
+  }
+
+  function removeFootprintListeners() {
+    const target = footprintEventTarget()
+    if (!target) return
+    target.removeEventListener('pointerdown', onFootprintEditPointerDown, true)
+    target.removeEventListener('pointermove', onFootprintEditPointerMove, true)
+    target.removeEventListener('pointerup', onFootprintEditPointerUp, true)
+  }
+
+  function disposeFootprintPreview() {
+    const state = sandboxFootprintDrawingState
+    if (!state?.preview) return
+    state.preview.traverse(object => {
+      object.geometry?.dispose?.()
+      object.material?.dispose?.()
+    })
+    scene?.remove(state.preview)
+    state.preview = null
+  }
+
+  function footprintEditHandles() {
+    const state = sandboxFootprintDrawingState
+    if (!state) return []
+    return [...(state.handles || []), ...(state.centerHandle ? [state.centerHandle] : [])]
+  }
+
+  function emitFootprintState() {
+    const state = sandboxFootprintDrawingState
+    callbacks.onSandboxFootprintDrawingChange?.({
+      active: Boolean(state),
+      editing: state?.phase === 'editing',
+      drawing: state?.phase === 'drawing',
+      selfIntersecting: state?.selfIntersecting === true,
+      points: state ? state.points.map(point => ({ ...point })) : [],
+    })
+  }
+
+  // 占地边界：沿多边形每条边铺一条贴地的窄带。
+  // 绘制阶段只按标点顺序连成折线（不自动收尾），完成后才连成闭合边界。
+  function footprintBoundaryPositions(points, y, halfWidth, closed) {
+    const positions = []
+    const count = points.length
+    const edgeCount = closed ? count : count - 1
+    for (let index = 0; index < edgeCount; index += 1) {
+      const a = points[index]
+      const b = points[(index + 1) % count]
+      const dx = b.x - a.x
+      const dz = b.z - a.z
+      const length = Math.hypot(dx, dz)
+      if (length < 1e-6) continue
+      const nx = (-dz / length) * halfWidth
+      const nz = (dx / length) * halfWidth
+      positions.push(a.x + nx, y, a.z + nz)
+      positions.push(b.x + nx, y, b.z + nz)
+      positions.push(b.x - nx, y, b.z - nz)
+      positions.push(a.x + nx, y, a.z + nz)
+      positions.push(b.x - nx, y, b.z - nz)
+      positions.push(a.x - nx, y, a.z - nz)
+    }
+    return positions
+  }
+
+  function updateFootprintPreview() {
+    const state = sandboxFootprintDrawingState
+    if (!state?.preview) return
+    const { preview, points } = state
+    for (const child of [...preview.children]) {
+      preview.remove(child)
+      child.geometry?.dispose?.()
+      child.material?.dispose?.()
+    }
+    state.handles = []
+    state.centerHandle = null
+    state.fillMesh = null
+    const editing = state.phase === 'editing'
+    state.selfIntersecting = editing && points.length >= 4 && polygonSelfIntersects(points)
+    const y = 0.12
+    if (editing && points.length >= 3) {
+      // 完成后才铺填充面；轮廓自交时换橙色提示
+      const positions = []
+      for (const triangle of triangulatePolygon(points)) {
+        for (const point of triangle) positions.push(point.x, 0.02, point.z)
+      }
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      const fill = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+        color: state.selfIntersecting ? '#e6a06b' : '#6cc08d',
+        transparent: true,
+        opacity: 0.45,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }))
+      fill.name = 'footprint-fill'
+      fill.renderOrder = 5
+      preview.add(fill)
+      state.fillMesh = fill
+    }
+    if (points.length >= 2) {
+      // 绘制中按标点顺序连线，完成后收尾闭合
+      const boundary = footprintBoundaryPositions(points, 0.04, 0.09, editing)
+      if (boundary.length) {
+        const geometry = new THREE.BufferGeometry()
+        geometry.setAttribute('position', new THREE.Float32BufferAttribute(boundary, 3))
+        const mesh = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
+          color: state.selfIntersecting ? '#e66b68' : '#46b978',
+          transparent: true,
+          opacity: 0.95,
+          depthWrite: false,
+          side: THREE.DoubleSide,
+        }))
+        mesh.name = 'footprint-boundary'
+        mesh.renderOrder = 6
+        preview.add(mesh)
+      }
+    }
+    if (editing) {
+      // 顶点手柄：拖动只改这个点
+      points.forEach((point, index) => {
+        const handle = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.28, 0.28, 0.2, 18),
+          new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+        )
+        handle.name = `footprint-vertex-handle-${index}`
+        handle.userData.footprintHandleRole = 'vertex'
+        handle.userData.index = index
+        handle.position.set(point.x, y + 0.04, point.z)
+        handle.renderOrder = 21
+        preview.add(handle)
+        state.handles.push(handle)
+      })
+      // 中心手柄：拖动整体平移
+      if (points.length >= 3) {
+        const center = polygonCentroid(points)
+        const handle = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.38, 0.38, 0.24, 22),
+          new THREE.MeshBasicMaterial({ color: '#9ad0ff' }),
+        )
+        handle.name = 'footprint-center-handle'
+        handle.userData.footprintHandleRole = 'center'
+        handle.position.set(center.x, y + 0.04, center.z)
+        handle.renderOrder = 21
+        preview.add(handle)
+        state.centerHandle = handle
+      }
+    } else {
+      for (const point of points) {
+        const marker = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.22, 0.22, 0.1, 16),
+          new THREE.MeshBasicMaterial({ color: '#f0d98a' }),
+        )
+        marker.name = 'footprint-point-marker'
+        marker.position.set(point.x, y, point.z)
+        marker.renderOrder = 20
+        preview.add(marker)
+      }
+    }
+    requestFrame()
+  }
+
+  function footprintHandleAt(event) {
+    if (!cameraRig || !renderer) return null
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return null
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    const handles = footprintEditHandles()
+    const hit = raycaster.intersectObjects(handles, false)[0]
+    if (hit) return hit.object
+    // 屏幕距离兜底：手柄正中心偶尔会因浮点精度漏检
+    const pointerX = event.clientX - rect.left
+    const pointerY = event.clientY - rect.top
+    const world = new THREE.Vector3()
+    let best = null
+    let bestDistance = Infinity
+    for (const handle of handles) {
+      handle.getWorldPosition(world).project(cameraRig.camera)
+      const x = ((world.x + 1) / 2) * rect.width
+      const y = ((1 - world.y) / 2) * rect.height
+      const distance = Math.hypot(x - pointerX, y - pointerY)
+      if (distance < bestDistance) {
+        bestDistance = distance
+        best = handle
+      }
+    }
+    return bestDistance <= 12 ? best : null
+  }
+
+  function onFootprintEditPointerDown(event) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'editing' || state.drag || event.button !== 0) return
+    const handle = footprintHandleAt(event)
+    let kind = null
+    let index = 0
+    if (handle) {
+      kind = handle.userData.footprintHandleRole === 'center' ? 'center' : 'vertex'
+      index = Number(handle.userData.index) || 0
+    } else if (state.fillMesh) {
+      // 点在区域内部也能整体拖动（射线已在 footprintHandleAt 里按本次指针设置好）
+      const hit = raycaster.intersectObject(state.fillMesh, false)[0]
+      if (hit) kind = 'center'
+    }
+    if (!kind) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    const ground = getSandboxGroundPoint(event)
+    renderer.domElement.setPointerCapture?.(event.pointerId)
+    state.drag = {
+      pointerId: event.pointerId,
+      kind,
+      index,
+      startPointer: ground ? { x: ground.x, z: ground.z } : { x: 0, z: 0 },
+      basePoints: state.points.map(point => ({ ...point })),
+    }
+  }
+
+  function onFootprintEditPointerMove(event) {
+    const state = sandboxFootprintDrawingState
+    const drag = state?.drag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    const dx = point.x - drag.startPointer.x
+    const dz = point.z - drag.startPointer.z
+    state.points = drag.kind === 'center'
+      ? drag.basePoints.map(item => ({ x: item.x + dx, z: item.z + dz }))
+      : drag.basePoints.map((item, index) => (index === drag.index ? { x: item.x + dx, z: item.z + dz } : item))
+    updateFootprintPreview()
+    emitFootprintState()
+  }
+
+  function onFootprintEditPointerUp(event) {
+    const state = sandboxFootprintDrawingState
+    const drag = state?.drag
+    if (!drag || event.pointerId !== drag.pointerId) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    state.drag = null
+    if (renderer?.domElement?.hasPointerCapture?.(event.pointerId)) {
+      renderer.domElement.releasePointerCapture(event.pointerId)
+    }
+    emitFootprintState()
+    requestFrame()
+  }
+
+  // 占地编辑器：直接给一个矩形区域，拖角点改形状、拖中心整体移动，
+  // 「添加断点」在最长边上插一个可拖动的点，做出缺口/凹凸（和道路端点编辑同一套手感）。
+  function beginSandboxFootprintDrawing() {
+    if (!isBlankSandbox || !scene) return false
+    clearSandboxFootprintRegion()
+    sandboxRoadEditor?.detach()
+    sandboxTransform?.detach()
+    const preview = new THREE.Group()
+    preview.name = 'sandbox-footprint-drawing'
+    scene.add(preview)
+    const world = getSandboxPlacementWorldBounds()
+    const halfWidth = 5
+    const halfDepth = 4
+    // 矩形落在当前角色/镜头附近，保证创建后立刻能在视野里看到；
+    // 没有角色位置时退回世界中心，并整体夹在可建造边界内。
+    const playerX = Number(cameraRig?.player?.x)
+    const playerZ = Number(cameraRig?.player?.z)
+    const anchorX = Number.isFinite(playerX) ? playerX : (Number.isFinite(world.centerX) ? world.centerX : 0)
+    const anchorZ = Number.isFinite(playerZ) ? playerZ : (Number.isFinite(world.centerZ) ? world.centerZ : 0)
+    const minX = world.centerX - world.width / 2 + halfWidth
+    const maxX = world.centerX + world.width / 2 - halfWidth
+    const minZ = world.centerZ - world.depth / 2 + halfDepth
+    const maxZ = world.centerZ + world.depth / 2 - halfDepth
+    const centerX = THREE.MathUtils.clamp(anchorX, Math.min(minX, maxX), Math.max(minX, maxX))
+    const centerZ = THREE.MathUtils.clamp(anchorZ, Math.min(minZ, maxZ), Math.max(minZ, maxZ))
+    const points = [
+      { x: centerX - halfWidth, z: centerZ - halfDepth },
+      { x: centerX + halfWidth, z: centerZ - halfDepth },
+      { x: centerX + halfWidth, z: centerZ + halfDepth },
+      { x: centerX - halfWidth, z: centerZ + halfDepth },
+    ]
+    sandboxFootprintDrawingState = {
+      phase: 'editing',
+      points,
+      preview,
+      handles: [],
+      centerHandle: null,
+      fillMesh: null,
+      drag: null,
+      lastBreakpointIndex: null,
+    }
+    const target = footprintEventTarget()
+    target?.addEventListener('pointerdown', onFootprintEditPointerDown, true)
+    target?.addEventListener('pointermove', onFootprintEditPointerMove, true)
+    target?.addEventListener('pointerup', onFootprintEditPointerUp, true)
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  // 在最长边的中点插入一个断点，返回是否成功。
+  function addSandboxFootprintBreakpoint() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.points.length < 3) return false
+    let bestIndex = 0
+    let bestLength = -1
+    for (let index = 0; index < state.points.length; index += 1) {
+      const a = state.points[index]
+      const b = state.points[(index + 1) % state.points.length]
+      const length = Math.hypot(b.x - a.x, b.z - a.z)
+      if (length > bestLength) {
+        bestLength = length
+        bestIndex = index
+      }
+    }
+    const a = state.points[bestIndex]
+    const b = state.points[(bestIndex + 1) % state.points.length]
+    const midpoint = { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 }
+    const insertAt = bestIndex + 1
+    state.points = [
+      ...state.points.slice(0, insertAt),
+      midpoint,
+      ...state.points.slice(insertAt),
+    ]
+    state.lastBreakpointIndex = insertAt
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  // 删除最近一次添加的断点（至少保留三个点）。
+  function removeSandboxFootprintBreakpoint() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.points.length <= 3) return false
+    const index = Number.isInteger(state.lastBreakpointIndex)
+      && state.lastBreakpointIndex >= 0
+      && state.lastBreakpointIndex < state.points.length
+      ? state.lastBreakpointIndex
+      : state.points.length - 1
+    state.points = state.points.filter((_, itemIndex) => itemIndex !== index)
+    state.lastBreakpointIndex = null
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  function clearSandboxFootprintRegion() {
+    if (!sandboxFootprintDrawingState) return false
+    removeFootprintListeners()
+    disposeFootprintPreview()
+    sandboxFootprintDrawingState = null
+    emitFootprintState()
+    requestFrame()
+    return true
+  }
+
+  function cancelSandboxFootprintDrawing() {
+    return clearSandboxFootprintRegion()
+  }
+
+  function getSandboxFootprintDrawingState() {
+    const state = sandboxFootprintDrawingState
+    if (!state) return { active: false, editing: false, points: [] }
+    return {
+      active: true,
+      editing: state.phase === 'editing',
+      points: state.points.map(point => ({ ...point })),
+    }
+  }
+
+  function syncRenderQuality() {
+    if (!renderer || !cameraRig) return
+    renderer.shadowMap.enabled = true
+    renderer.shadowMap.autoUpdate = false
+    if (directionalLight) directionalLight.castShadow = true
+    shadowSystem?.configure({ enabled: true, type: THREE.PCFSoftShadowMap })
+    invalidateShadowMap()
+  }
+
+  async function init() {
+    initializationStage = 'validate-container'
+    try {
+    if (!container) throw new Error('未找到三维场景容器')
+
+    initializationStage = 'create-scene'
+    scene = new THREE.Scene()
+    scene.background = new THREE.Color('#b9d0c2')
+    // 暂不启用线性雾效：低角度视线会让远处地面在固定深度区间内
+    // 出现横向雾化分界，视觉上像场景被水平裁切；先保持背景色统一以排除该因素。
+    scene.fog = null
+
+    renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false })
+    initializeGpuTimerDiagnostics()
+    initializationStage = 'renderer-created'
+    // 像素纹理仍使用 NearestFilter；MSAA 只平滑几何轮廓，不会把像素贴图模糊化。
+    renderer.setPixelRatio(getRendererPixelRatio(container.clientWidth, container.clientHeight))
+    renderer.setSize(container.clientWidth, container.clientHeight)
+    // 静态阴影贴图按需更新，避免每帧重复生成。
+    renderer.shadowMap.enabled = true
+    renderer.shadowMap.autoUpdate = false
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap
+    shadowSystem = new ShadowSystem(renderer)
+    if (motionProbe) {
+      const probeGl = renderer.getContext()
+      motionProbe.setEnvironment({
+        pixelRatio: renderer.getPixelRatio(),
+        drawingBufferWidth: probeGl.drawingBufferWidth,
+        drawingBufferHeight: probeGl.drawingBufferHeight,
+        shadowMapEnabled: renderer.shadowMap.enabled,
+        shadowMapType: renderer.shadowMap.type,
+        userAgent: navigator.userAgent,
+      })
+      window.__motionProbe = motionProbe
+      // 场景/渲染器入口仅供 motion-probe 诊断会话使用，便于盘点 draw call 来源与 GPU 信息。
+      window.__campusRenderer = renderer
+      window.__campusScene = scene
+      // 短命令场景盘点：控制台执行 copy(__campusAudit()) 即可，避免长脚本粘贴损坏。
+      window.__campusAudit = () => {
+        const gl = renderer.getContext()
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info')
+        const gpu = debugInfo
+          ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL)
+          : gl.getParameter(gl.RENDERER)
+        let meshes = 0
+        let lines = 0
+        let visibleObjects = 0
+        let shadowCasters = 0
+        scene.traverse((object) => {
+          if (object.isMesh) {
+            meshes += 1
+            if (object.visible) {
+              visibleObjects += 1
+              if (object.castShadow) shadowCasters += 1
+            }
+          } else if (object.isLine || object.isLineSegments) {
+            lines += 1
+            if (object.visible) visibleObjects += 1
+          }
+        })
+        const topLevel = scene.children.map((child) => {
+          let childMeshes = 0
+          let childLines = 0
+          let childVisible = 0
+          child.traverse((object) => {
+            if (object.isMesh) {
+              childMeshes += 1
+              if (object.visible) childVisible += 1
+            }
+            if ((object.isLine || object.isLineSegments) && object.visible) {
+              childLines += 1
+              childVisible += 1
+            }
+          })
+          return {
+            name: child.name || child.type,
+            meshes: childMeshes,
+            lines: childLines,
+            visibleDraws: childVisible,
+          }
+        }).sort((a, b) => b.visibleDraws - a.visibleDraws).slice(0, 15)
+        return JSON.stringify({
+          gpu,
+          pixelRatio: renderer.getPixelRatio(),
+          canvas: { width: renderer.domElement.width, height: renderer.domElement.height },
+          totals: { meshes, lines, visibleObjects, shadowCasters },
+          rendererInfo: renderer.info.render,
+          memory: renderer.info.memory,
+          topLevel,
+        }, null, 1)
+      }
+      // 合批干跑诊断：解释每个沙盒模型为什么能/不能合批，不修改场景。
+      window.__batchAudit = () => JSON.stringify(
+        Array.from(sandboxModels.values()).map(model => explainBatching(model)),
+        null, 1,
+      )
+      // 走路复测摘要：走路后执行 copy(__motionSummary())。
+      window.__motionSummary = () => {
+        const report = motionProbe.analyze()
+        if (!report.frameCount) return JSON.stringify({ frameCount: 0 })
+        return JSON.stringify({
+          frameCount: report.frameCount,
+          windowMs: report.windowMs,
+          effectiveHz: +(report.frameCount / (report.windowMs / 1000)).toFixed(1),
+          longFrameRate: +(report.longFrameCount / report.frameCount).toFixed(3),
+          mode: report.mode,
+          intervalMs: report.intervalMs,
+          renderCostMs: report.renderCostMs,
+          heldFrameCount: report.heldFrameCount,
+          stallFrames: report.stallFrames,
+          quantizedFrames: report.quantizedFrames,
+          doubleStepFrames: report.doubleStepFrames,
+          shadowRate: report.shadowInvalidationRate,
+          drawCalls: report.drawCalls,
+          anomalies: report.anomalies,
+        }, null, 1)
+      }
+      // 停顿段逐帧明细：走路复现卡顿后执行 copy(__motionStalls())。
+      window.__motionStalls = () => JSON.stringify(extractMotionStalls(motionProbe.samples), null, 1)
+    }
+    renderer.outputColorSpace = THREE.SRGBColorSpace
+    // 保留像素美术标准色板，避免电影色调映射改变颜色。
+    renderer.toneMapping = THREE.NoToneMapping
+    container.appendChild(renderer.domElement)
+    renderer.domElement.addEventListener('webglcontextlost', event => {
+      event.preventDefault()
+      logRenderFailure('webglcontextlost', new Error('WebGL context lost'))
+    })
+    renderer.domElement.addEventListener('webglcontextrestored', () => {
+      console.info('[CampusRenderDiagnostics] WebGL context restored')
+      requestFrame()
+    })
+
+    initializationStage = 'create-world'
+    // MVP 使用独立空白地面；正式校园与旧 RPG 样板仅在明确选择对应 sceneType 时加载。
+    campus = isBlankSandbox
+      ? createBlankSandboxScene(THREE, options.worldBounds || { width: 54, depth: 42 })
+      : isRpgSample
+        ? createRpgSampleScene(THREE)
+        : createCampusScene(THREE, options.featureCollection || null, { manifest: options.assetManifest || null, buildingTemplates: options.buildingTemplates || [], assetBaseUrl: options.assetBaseUrl || '' })
+    // Only the legacy RPG sample has this fixed teaching-building entrance.
+    // Resolve it once; the blank sandbox must not search its scene graph every frame.
+    if (options.sceneType === 'rpg-sample') {
+      sampleTeachingBuilding = campus.getObjectByName('sample-teaching-building') || null
+      const entrance = sampleTeachingBuilding?.userData?.indoorEntrance
+      if (entrance) {
+        sampleTeachingEntranceLocal = new THREE.Vector3(entrance.x, 0, entrance.z)
+        sampleTeachingEntranceWorld = new THREE.Vector3()
+        sampleTeachingEntranceRadius = Number(entrance.radius) || 0
+      }
+    }
+    windSwayTargets = []
+    campus.traverse(object => {
+      if (object.name !== 'tree-canopy-occluder') return
+      windSwayTargets.push({
+        object,
+        baseX: object.rotation.x,
+        baseZ: object.rotation.z,
+        phase: windSwayTargets.length * 1.73,
+        amplitude: 0.055,
+      })
+    })
+    // 碰撞与渲染必须读取同一份规范化空间数据；不能让已移动/删除的旧湖泊继续留在碰撞层。
+    const spatialLayers = isRpgSample ? null : createCampusSceneRenderData(options.featureCollection || undefined).layers
+    // 基础空间图层已为校园建筑注册精确墙段/footprint 碰撞；GLB 仅替换视觉模型，
+    // 不得再用 GLB 世界 AABB 叠加粗碰撞，否则不规则建筑外侧空地也会被封住。
+    const canonicalBuildingIds = new Set((spatialLayers?.buildings || []).map(building => String(building.id)))
+    if (!isRpgSample && spatialLayers && options.skipSceneAudit !== true) {
+      const sceneAudit = auditCampusSceneFeatureCoverage(spatialLayers, campus)
+      callbacks.onSceneAudit?.(sceneAudit)
+      if (sceneAudit.errorCount > 0) console.warn('[CampusSceneAudit] 检测到场景装配异常', sceneAudit)
+      else if (renderDebugEnabled) console.info('[CampusSceneAudit] 场景装配检查通过', sceneAudit.summary)
+    }
+    scene.add(campus)
+    generatedAssetsGroup = new THREE.Group()
+    generatedAssetsGroup.name = 'GeneratedAssets'
+    campus.add(generatedAssetsGroup)
+    cameraRig = new CameraRig(THREE, renderer.domElement, { isometricRpg: Boolean(options.isometricRpg ?? isRpgSample), viewMode: options.viewMode, freeOverview: isBlankSandbox })
+    initializationStage = 'camera-created'
+    // 默认示意场景的人物出生点与可见 Sprite 保持一致，避免相机从地图中心凭空出现。
+    playerSpriteObject = campus.getObjectByName('PixelExplorerSprite')
+    if (staticShadowTestEnabled && playerSpriteObject) {
+      // 排除角色作为 ShadowMap caster 的成本，但保留角色正常可见性、动画和物理。
+      playerSpriteObject.traverse(object => {
+        if (object.isMesh) object.castShadow = false
+      })
+    }
+    if (isBlankSandbox && playerSpriteObject) playerCharacterRuntime = new PlayerCharacterRuntime(THREE, playerSpriteObject)
+    const fallbackSpawn = mapPixelToWorld(...CAMPUS_PLAYER_SPAWN_PIXEL)
+    const spawn = campus.userData.playerSpawn || fallbackSpawn
+    cameraRig.player.set(playerSpriteObject?.position.x ?? spawn.x, 1.7, playerSpriteObject?.position.z ?? spawn.z)
+    if (isRpgSample && !options.deferInitialFocus && campus.userData.sampleBounds) {
+      cameraRig.resize(Math.max(0.1, container.clientWidth / Math.max(container.clientHeight, 1)))
+      cameraRig.focusBounds(campus.userData.sampleBounds.width, campus.userData.sampleBounds.depth)
+    } else if (!isRpgSample && !options.deferInitialFocus && campus.userData.contentBounds) {
+      const bounds = campus.userData.contentBounds
+      // 首页首次进入按真实校园内容包络居中并适配当前视口；不影响后续用户手动操作。
+      cameraRig.resize(Math.max(0.1, container.clientWidth / Math.max(container.clientHeight, 1)))
+      cameraRig.focusBounds(bounds.width, bounds.depth, bounds.centerX, bounds.centerZ, { immediate: true })
+    }
+    // 从像素地图进入建筑时，先将室外角色恢复到离开前的地图坐标；
+    // enterIndoorPrototype 会快照该位置，退出室内后即可回到原地。
+    if (Number.isFinite(options.initialPlayerPosition?.x) && Number.isFinite(options.initialPlayerPosition?.z)) {
+      cameraRig.player.set(options.initialPlayerPosition.x, 1.7, options.initialPlayerPosition.z)
+      cameraRig.updateThirdPersonDesired()
+    }
+    // 从明确标记为建筑的场景对象提取世界包围盒，避免把道路、树木等误判为墙体。
+    campus.updateMatrixWorld(true)
+    outdoorEntranceObjects = []
+    campus.traverse((object) => {
+      if (object.userData?.indoorEntrance) {
+        outdoorEntranceObjects.push({ object, worldPosition: new THREE.Vector3() })
+      }
+    })
+    lastEntranceCheckPosition = null
+    const buildingObstacles = []
+    const circularObstacles = []
+    const buildingWallSets = []
+    cameraObstacleRoots = []
+    campus.traverse((object) => {
+      if (!(object.userData?.buildingId || object.userData?.objectType === 'building')) return
+      cameraObstacleRoots.push(object)
+      if (object.userData?.walkable === true) return
+      const bounds = new THREE.Box3().setFromObject(object)
+      if (bounds.isEmpty()) return
+      if (isRpgSample && object.userData?.buildingId === 'sample-teaching-building') {
+        // 碰撞轮廓跟随实际挂载的生成模型，不再假设固定 14.8 × 8.5 的建筑尺寸。
+        const buildingBounds = object.userData.generatedBuildingShell
+          ? new THREE.Box3().setFromObject(object.userData.generatedBuildingShell)
+          : bounds
+        const centerX = (buildingBounds.min.x + buildingBounds.max.x) / 2
+        const width = buildingBounds.max.x - buildingBounds.min.x
+        const depth = buildingBounds.max.z - buildingBounds.min.z
+        const frontZ = buildingBounds.max.z
+        const backZ = buildingBounds.min.z
+        const sideWidth = Math.min(0.55, width * 0.08)
+        const doorHalfWidth = Math.min(1.08, width * 0.14)
+        const wallDepth = Math.min(0.5, depth * 0.06)
+        object.userData.collisionObstacleStart = buildingObstacles.length
+        buildingObstacles.push(
+          { minX: buildingBounds.min.x, maxX: centerX - doorHalfWidth, minZ: frontZ - wallDepth, maxZ: frontZ + 0.12 },
+          { minX: centerX + doorHalfWidth, maxX: buildingBounds.max.x, minZ: frontZ - wallDepth, maxZ: frontZ + 0.12 },
+          { minX: buildingBounds.min.x, maxX: buildingBounds.max.x, minZ: backZ - 0.12, maxZ: backZ + wallDepth },
+          { minX: buildingBounds.min.x, maxX: buildingBounds.min.x + sideWidth, minZ: backZ, maxZ: frontZ },
+          { minX: buildingBounds.max.x - sideWidth, maxX: buildingBounds.max.x, minZ: backZ, maxZ: frontZ },
+        )
+        object.userData.collisionObstacleCount = 5
+      } else if (Array.isArray(object.userData?.collisionSegments) && object.userData.collisionSegments.length) {
+        // 按建筑生成器的墙体分段数据注册碰撞，门洞本身不生成障碍。
+        const polygons = object.userData.collisionSegments.map(segment => {
+          const start = object.localToWorld(new THREE.Vector3(segment.start.x, 0, -segment.start.y))
+          const end = object.localToWorld(new THREE.Vector3(segment.end.x, 0, -segment.end.y))
+          const dx = end.x - start.x, dz = end.z - start.z
+          const length = Math.hypot(dx, dz) || 1
+          const half = Math.max(0.12, Number(segment.thickness) || 0.28) / 2
+          const nx = -dz / length * half, nz = dx / length * half
+          return [
+            [start.x + nx, start.z + nz], [end.x + nx, end.z + nz],
+            [end.x - nx, end.z - nz], [start.x - nx, start.z - nz],
+          ]
+        })
+        buildingWallSets.push({ object, polygons })
+      } else if (Array.isArray(object.userData?.collisionPolygon) && object.userData.collisionPolygon.length >= 3) {
+        const polygon = object.userData.collisionPolygon
+        const xs = polygon.map(point => point[0])
+        const zs = polygon.map(point => point[1])
+        buildingObstacles.push({
+          polygon,
+          holes: [],
+          minX: Math.min(...xs), maxX: Math.max(...xs),
+          minZ: Math.min(...zs), maxZ: Math.max(...zs),
+        })
+      } else {
+        buildingObstacles.push({
+          minX: bounds.min.x, maxX: bounds.max.x,
+          minZ: bounds.min.z, maxZ: bounds.max.z,
+        })
+      }
+    })
+    // 树冠用于视觉遮挡，碰撞仅按树干半径计算，避免把整片树冠误判成墙。
+    campus.traverse((object) => {
+      const radius = Number(object.userData?.collisionRadius)
+      if (!(radius > 0) || object.userData?.walkable === true) return
+      const position = object.getWorldPosition(new THREE.Vector3())
+      circularObstacles.push({ x: position.x, z: position.z, radius })
+    })
+    collisionWorld = new CollisionWorld(campus.userData.walkableBounds, buildingObstacles, 0.62)
+    if (isBlankSandbox) {
+      syncSandboxWalkableChunks()
+      physicsRuntime = await PhysicsRuntime.create()
+      syncSandboxPhysicsWorld()
+    }
+    for (const { object, polygons } of buildingWallSets) {
+      object.userData.collisionObstacleStart = collisionWorld.obstacles.length
+      polygons.forEach(polygon => collisionWorld.addPolygonObstacle({ outer: polygon }))
+      object.userData.collisionObstacleCount = collisionWorld.obstacles.length - object.userData.collisionObstacleStart
+    }
+    // 树木、长椅和路灯使用圆形碰撞体，避免 AABB 方形外扩占用过多步行空间。
+    for (const obstacle of circularObstacles) collisionWorld.addCircleObstacle(obstacle)
+    // 湖水不可通行；中央湖区保留 holes 中定义的岛屿步行区域。
+    // 必须使用与首页/编辑器预览相同的 FeatureCollection 派生层，不能读取过期静态 CAMPUS_AREAS。
+    const toWorldRing = ring => ring.map(([x, y]) => {
+      const point = mapPixelToWorld(x, y)
+      return [point.x, point.z]
+    })
+    for (const area of (spatialLayers?.areas || []).filter(item => item.walkable !== true && item.polygon?.length >= 3)) {
+      collisionWorld.addPolygonObstacle({
+        outer: toWorldRing(area.polygon),
+        holes: (area.holes || []).map(toWorldRing),
+      })
+    }
+    // 道路默认可通行；若编辑者显式设置为不可通行，则按道路宽度生成面碰撞。
+    const blockedRoads = (spatialLayers?.roads || []).filter(road => road.walkable === false)
+    if (blockedRoads.length) {
+      for (const polygon of roadNetworkToMultiPolygon(blockedRoads)) {
+        const outer = polygon[0]
+        if (!outer?.length) continue
+        collisionWorld.addPolygonObstacle({
+          outer: toWorldRing(outer.slice(0, -1)),
+          holes: polygon.slice(1).map(ring => toWorldRing(ring.slice(0, -1))),
+        })
+      }
+    }
+    outdoorCollisionWorld = collisionWorld
+    cameraRig.setObstructionObjects(cameraObstacleRoots)
+    // 3D 建筑模型延迟到用户切换 3D/跟随视角时加载，2.5D 总览不承担 GLB 下载与解析成本。
+    input = new InputController(THREE, renderer.domElement, cameraRig, campus.userData.walkableBounds, collisionWorld, {
+      movementBackend: isBlankSandbox ? 'rapier' : 'collision-world',
+    })
+    if (playerCharacterRuntime) input.setPlayerDimensions(playerCharacterRuntime.getInfo().dimensions)
+    if (isBlankSandbox && physicsRuntime) input.setPhysicsRuntime(physicsRuntime)
+    input.setFreeCameraMovementEnabled(isBlankSandbox)
+    input.onMovementInput = () => { if (isBlankSandbox && cameraRig?.mode === 'overview') requestFrame() }
+    input.attach()
+    sandboxTransform = new TransformControls(cameraRig.camera, renderer.domElement)
+    sandboxTransform.setMode('translate')
+    sandboxTransform.addEventListener('dragging-changed', event => {
+      // 只要 Gizmo 仍挂载在对象上，精调模式就继续独占相机输入；完成调整并 detach 后才恢复镜头。
+      cameraRig?.setOrbitInteractionEnabled?.(!event.value && !sandboxTransform?.object)
+      input?.setMovementEnabled(!event.value)
+    })
+    sandboxTransform.addEventListener('objectChange', () => {
+      if (sandboxSelectedModel) {
+        sandboxSelectionHelper?.update()
+        const model = sandboxSelectedModel
+        setSandboxModelTransform(model.userData.sandboxModelId, {
+          position: model.position,
+          rotation: model.rotation,
+          scale: model.scale,
+        })
+      }
+    })
+    sandboxTransform.addEventListener('change', () => {
+      invalidateDynamicShadowMap()
+      requestFrame()
+    })
+    scene.add(sandboxTransform.getHelper())
+    renderer.domElement.addEventListener('pointerdown', onSandboxPlacementPointerDown, true)
+    renderer.domElement.addEventListener('pointermove', onSandboxPlacementPointerMove, true)
+    renderer.domElement.addEventListener('pointerdown', onSandboxPointerDown)
+    renderer.domElement.addEventListener('pointerdown', onScenePointerDown)
+    renderer.domElement.addEventListener('pointerup', onScenePointerUp)
+    renderer.domElement.addEventListener('pointerup', requestFrame)
+    // 总览模式按需渲染：用户操作、相机阻尼或窗口变化时才请求下一帧。
+    renderer.domElement.addEventListener('pointerdown', requestFrame)
+    renderer.domElement.addEventListener('pointermove', onScenePointerMove)
+    renderer.domElement.addEventListener('pointermove', requestFrame)
+    renderer.domElement.addEventListener('wheel', requestFrame, { passive: true })
+    if (cameraRig.viewMode === '3d') void ensureCampusBuildingModelsLoaded()
+
+    hemisphereLight = new THREE.HemisphereLight(0xfff2d8, 0x71865e, 2.2)
+    scene.add(hemisphereLight)
+    directionalLight = new THREE.DirectionalLight(0xffe2b2, 2.7)
+    directionalLight.position.set(-55, 90, 45)
+    directionalLight.castShadow = true
+    directionalLight.shadow.mapSize.set(2048, 2048)
+    directionalLight.shadow.camera.left = -100
+    directionalLight.shadow.camera.right = 100
+    directionalLight.shadow.camera.top = 100
+    directionalLight.shadow.camera.bottom = -100
+    directionalLight.shadow.camera.near = 0.5
+    directionalLight.shadow.camera.far = 320
+    directionalLight.shadow.bias = -0.00015
+    directionalLight.shadow.normalBias = 0.025
+    directionalLight.shadow.radius = 3
+    scene.add(directionalLight)
+    skyRuntime = createSkyRuntime(THREE)
+    skyRuntime.group.name = 'world-sky-layer'
+    scene.add(skyRuntime.group)
+    skyRuntime.update(getSkyVisualState(getVirtualSunState(environmentConfig.time), environmentConfig.weather))
+    skyRuntime.setIndoor(Boolean(indoorGroup))
+    rainField = createRainFieldRuntime(THREE)
+    scene.add(rainField.object)
+    if (cameraRig?.camera) rainField.followCamera(cameraRig.camera.position)
+    cloudLayer = createCloudLayerRuntime(THREE)
+    scene.add(cloudLayer.object)
+    cloudLayer.setCloudiness(resolveWeatherMode('clear').cloudiness)
+    if (cameraRig?.camera) {
+      cloudLayer.followCamera(cameraRig.camera.position)
+      cloudLayer.setOrientation(cameraRig.camera)
+    }
+    snowField = createSnowFieldRuntime(THREE)
+    scene.add(snowField.object)
+    if (cameraRig?.camera) snowField.followCamera(cameraRig.camera.position)
+    syncRenderQuality()
+
+    initializationStage = 'install-resize-observer'
+    resizeObserver = new ResizeObserver(resize)
+    resizeObserver.observe(container)
+    resize()
+    window.addEventListener('keydown', onKeyDown)
+    initialized = true
+    initializationStage = 'ready'
+    if (renderDebugEnabled) {
+      console.info('[CampusRenderDiagnostics] 引擎初始化完成', {
+        canvasConnected: renderer.domElement.isConnected,
+        sceneChildren: scene.children.length,
+        cameraType: cameraRig.camera.type,
+        cameraPosition: cameraRig.camera.position.toArray(),
+      })
+    }
+    callbacks.onReady?.()
+    requestFrame()
+    } catch (error) {
+      logRenderFailure('init', error)
+      throw error
+    }
+  }
+
+
+  function disposeMaterial(material) {
+    // 复制后的实例拥有独立纹理；遍历全部直接纹理属性，避免遗漏 AO/位移等贴图。
+    disposeSandboxMaterial(material)
+  }
+
+  function disposeObjectGroup(group) {
+    group?.traverse((object) => {
+      disposeOwnedGeometry(object.geometry)
+      if (Array.isArray(object.material)) object.material.forEach(disposeMaterial)
+      else disposeMaterial(object.material)
+    })
+  }
+
+  function shouldShowBuildingModels() {
+    return !editorPreviewActive && !indoorGroup
+      && (cameraRig?.viewMode === '3d' || cameraRig?.mode !== 'overview')
+  }
+
+  async function ensureCampusBuildingModelsLoaded() {
+    if (isRpgSample || loadedBuildingModels.length || !scene || disposed) return
+    if (buildingModelsLoadPromise) return buildingModelsLoadPromise
+    // GLB 模型体积较大；2.5D 总览使用程序化像素场景，不提前下载/解析 3D 建筑资产。
+    buildingModelsLoadPromise = import('../world/buildings/loadCampusBuildingModels.js')
+      .then(({ loadCampusBuildingModels }) => loadCampusBuildingModels(scene))
+      .then((result) => {
+        if (disposed || !scene) {
+          for (const model of result.models || []) {
+            model.parent?.remove(model)
+            disposeObjectGroup(model)
+          }
+          return result
+        }
+        loadedBuildingModels = result.models || []
+        const assetInventory = createCampusBuildingAssetInventory(
+          spatialLayers?.buildings || [],
+          result.manifest?.buildings || [],
+          mapPixelToWorld,
+        )
+        callbacks.onAssetInventory?.(assetInventory)
+        if (assetInventory.errors.length > 0) console.warn('[CampusAssetInventory] 建筑资产清单关联异常', assetInventory)
+        else if (renderDebugEnabled) console.info('[CampusAssetInventory] 建筑资产清单', assetInventory.summary)
+        const modelAudit = validateCampusBuildingModels(loadedBuildingModels, canonicalBuildingIds)
+        const geometryRecords = loadedBuildingModels.map(model => {
+          model.updateWorldMatrix(true, true)
+          const bounds = new THREE.Box3().setFromObject(model)
+          const position = model.getWorldPosition(new THREE.Vector3())
+          return {
+            buildingId: String(model.userData.buildingId ?? model.name ?? ''),
+            bounds: bounds.isEmpty() ? null : {
+              minX: bounds.min.x, maxX: bounds.max.x,
+              minY: bounds.min.y, maxY: bounds.max.y,
+              minZ: bounds.min.z, maxZ: bounds.max.z,
+            },
+            transform: { x: position.x, y: position.y, z: position.z, rotationY: model.rotation.y },
+          }
+        })
+        const geometryAudit = auditCampusBuildingModelGeometry(
+          spatialLayers?.buildings || [],
+          geometryRecords,
+          mapPixelToWorld,
+        )
+        callbacks.onAssetGeometryAudit?.(geometryAudit)
+        if (geometryAudit.errorCount > 0) console.warn('[CampusAssetGeometryAudit] 建筑模型与 footprint 几何偏差', geometryAudit)
+        else if (renderDebugEnabled) console.info('[CampusAssetGeometryAudit] 建筑模型几何审计', geometryAudit.summary)
+        const assetAudit = {
+          ...modelAudit,
+          loadErrorCount: (result.errors || []).length,
+          loadErrors: (result.errors || []).map(item => ({ buildingId: item.buildingId, code: item.code, message: item.error?.message || String(item.error) })),
+          skippedCount: (result.skipped || []).length,
+          skipped: result.skipped || [],
+          manifestTotal: result.total || 0,
+          loadedCount: loadedBuildingModels.length,
+        }
+        callbacks.onAssetAudit?.(assetAudit)
+        if (assetAudit.errorCount > 0 || assetAudit.loadErrorCount > 0) console.warn('[CampusAssetAudit] 建筑 GLB 资产检查发现异常', assetAudit)
+        else if (renderDebugEnabled) console.info('[CampusAssetAudit] 建筑 GLB 资产检查通过', assetAudit)
+        for (const model of loadedBuildingModels) {
+          model.visible = shouldShowBuildingModels()
+          model.userData.objectType = 'building'
+          model.updateMatrixWorld(true)
+          // 已存在规范 Feature footprint 的建筑继续使用初始化时注册的墙段碰撞。
+          // GLB 的世界 AABB 会填满凹角/斜边外侧空地，因此不能重复注册。
+          // 仅对空间数据中没有 footprint 的独立模型保留 AABB 兜底。
+          if (!canonicalBuildingIds.has(String(model.userData.buildingId)) && model.userData.walkable !== true) {
+            const bounds = new THREE.Box3().setFromObject(model)
+            if (!bounds.isEmpty()) outdoorCollisionWorld?.addObstacle({
+              minX: bounds.min.x, maxX: bounds.max.x,
+              minZ: bounds.min.z, maxZ: bounds.max.z,
+            })
+          }
+        }
+        cameraRig?.setObstructionObjects([...cameraObstacleRoots, ...loadedBuildingModels])
+        invalidateShadowMap()
+        callbacks.onAssetsLoaded?.(result)
+        requestFrame()
+        return result
+      })
+      .catch((error) => {
+        buildingModelsLoadPromise = null
+        callbacks.onAssetError?.(error)
+        return null
+      })
+    return buildingModelsLoadPromise
+  }
+
+  function clearRpgPreview() {
+    editorPreviewActive = false
+    activeHorizonGround = null
+    if (rpgPreviewGroup) {
+      scene?.remove(rpgPreviewGroup)
+      disposeObjectGroup(rpgPreviewGroup)
+      rpgPreviewGroup = null
+    }
+    invalidateShadowMap()
+    playerSpriteObject = campus?.getObjectByName('PixelExplorerSprite') || null
+    requestFrame()
+    // 基础校园由 campus 容器和独立加载的 GLB 建筑共同组成。
+    // 预览退出时必须恢复两类对象，不能只恢复 campus 容器。
+    if (campus) campus.visible = true
+    loadedBuildingModels.forEach((model) => { model.visible = shouldShowBuildingModels() })
+    cameraRig?.setObstructionObjects([
+      ...(campus ? (() => { const roots = []; campus.traverse(object => { if (object.userData?.buildingId || object.userData?.objectType === 'building') roots.push(object) }); return roots })() : []),
+      ...loadedBuildingModels,
+    ])
+    if (outdoorCollisionWorld && !indoorGroup) {
+      collisionWorld = outdoorCollisionWorld
+      if (input) input.collisionWorld = collisionWorld
+    }
+  }
+
+  function previewRpgMap(document) {
+    if (!scene || !document?.grid || !Array.isArray(document.layers)) return false
+    clearRpgPreview()
+    editorPreviewActive = true
+    const width = Number(document.grid.width), height = Number(document.grid.height)
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width < 1 || height < 1) return false
+    const unit = Number(document.worldUnitsPerTile) > 0 ? Number(document.worldUnitsPerTile) : 1
+    const originX = -width * unit / 2, originZ = -height * unit / 2
+    const palette = { grass:'#6eaa55','grass-dark':'#4f8745',dirt:'#b58a55',sand:'#d7c17c',stone:'#a5a69a',road:'#77796f','road-edge':'#aaa58c',water:'#4c9db5','water-deep':'#367c9d' }
+    rpgPreviewGroup = new THREE.Group()
+    rpgPreviewGroup.name = 'RpgMapLivePreview'
+    const geometry = new THREE.BoxGeometry(unit, 0.12, unit), materials = new Map()
+    for (const layer of document.layers) {
+      if (layer.visible === false || layer.type !== 'tile') continue
+      for (let y=0;y<height;y++) for (let x=0;x<width;x++) {
+        const tile=layer.tiles?.[y]?.[x]; if (!tile) continue
+        const color=palette[tile] || '#777777'
+        if (!materials.has(color)) materials.set(color,new THREE.MeshStandardMaterial({color,roughness:1}))
+        const mesh=new THREE.Mesh(geometry,materials.get(color))
+        mesh.position.set(originX+(x+.5)*unit,0,originZ+(y+.5)*unit); mesh.receiveShadow=true
+        rpgPreviewGroup.add(mesh)
+      }
+    }
+    for (const object of document.objects || []) {
+      const asset=String(object.assetId || ''), w=Math.max(.25,Number(object.width)||1)*unit, d=Math.max(.25,Number(object.height)||1)*unit
+      const group=new THREE.Group(), material=new THREE.MeshStandardMaterial({color:object.color||'#39764a',roughness:.9})
+      if (asset==='tree') {
+        const trunk=new THREE.Mesh(new THREE.CylinderGeometry(.09*unit,.12*unit,1.15*unit,6),new THREE.MeshStandardMaterial({color:'#765238'})); trunk.position.y=.575*unit
+        const crown=new THREE.Mesh(new THREE.ConeGeometry(Math.max(w,d)*.42,1.8*unit,7),material); crown.position.y=1.85*unit; group.add(trunk,crown)
+      } else if (asset==='lamp') {
+        const pole=new THREE.Mesh(new THREE.CylinderGeometry(.045*unit,.07*unit,2.3*unit,6),new THREE.MeshStandardMaterial({color:'#4d5148'})); pole.position.y=1.15*unit
+        const lamp=new THREE.Mesh(new THREE.SphereGeometry(.16*unit,7,5),new THREE.MeshStandardMaterial({color:'#f2d98a',emissive:'#80652c'})); lamp.position.y=2.35*unit; group.add(pole,lamp)
+      } else {
+        const h=(asset==='bridge'?.38:.22)*unit, mesh=new THREE.Mesh(new THREE.BoxGeometry(w*.92,h,d*.92),material); mesh.position.y=h/2; group.add(mesh)
+      }
+      group.position.set(originX+(Number(object.x)+w/unit/2)*unit,0,originZ+(Number(object.y)+d/unit/2)*unit)
+      group.rotation.y=-(Number(object.rotation)||0)*Math.PI/180
+      group.userData.rpgObjectId=object.id; rpgPreviewGroup.add(group)
+    }
+    const ground=new THREE.Mesh(new THREE.PlaneGeometry(width*unit,height*unit),new THREE.MeshStandardMaterial({color:'#6eaa55',roughness:1}))
+    ground.rotation.x=-Math.PI/2; ground.position.set(0,-.09,0); ground.receiveShadow=true; rpgPreviewGroup.add(ground)
+    scene.add(rpgPreviewGroup)
+    invalidateShadowMap()
+    requestFrame()
+    if (campus) campus.visible = false
+    loadedBuildingModels.forEach((model) => { model.visible = false })
+    cameraRig?.focusBounds(width*unit,height*unit)
+    return true
+  }
+
+  function setBuildingTemplates(templates) {
+    options.buildingTemplates = Array.isArray(templates) ? templates.filter(item => item?.status === 'ready') : []
+  }
+
+  function previewCampusPlan(document) {
+    if (!scene || !document) return false
+    // Prefer the canonical GeoJSON FeatureCollection; legacy arrays are a transitional UI adapter.
+    if (document.featureCollection?.type === 'FeatureCollection') {
+      const canonicalDocument = fromCampusFeatureCollection(document.featureCollection)
+      const sharedRenderData = createCampusSceneRenderData(document.featureCollection)
+      document = { ...document, ...canonicalDocument, ...sharedRenderData.previewDocument }
+    } else {
+      const legacyFeatureCollection = toCampusFeatureCollection(document)
+      const sharedRenderData = createCampusSceneRenderData(legacyFeatureCollection)
+      document = { ...document, ...sharedRenderData.previewDocument }
+    }
+    if (!Array.isArray(document.buildings) || !Array.isArray(document.roads)) return false
+    clearRpgPreview()
+    editorPreviewActive = true
+    rpgPreviewGroup = new THREE.Group()
+    rpgPreviewGroup.name = 'CampusPlanLivePreview'
+
+    // 复制完整 3D 人物层级；预览对象独立持有几何/材质，避免退出预览时释放正式场景资源。
+    const sourcePlayer = campus?.getObjectByName('PixelExplorerSprite')
+    if (sourcePlayer?.isGroup) {
+      const previewPlayer = sourcePlayer.clone(true)
+      previewPlayer.name = 'CampusPlanPlayerSprite'
+      previewPlayer.traverse(object => {
+        if (!object.isMesh) return
+        object.geometry = object.geometry.clone()
+        const cloneMaterial = material => {
+          const cloned = material.clone()
+          // 预览副本独立持有贴图；退出预览释放资源时不能销毁正式角色的接触阴影纹理。
+          if (material.map) cloned.map = material.map.clone()
+          return cloned
+        }
+        if (Array.isArray(object.material)) object.material = object.material.map(cloneMaterial)
+        else object.material = cloneMaterial(object.material)
+      })
+      previewPlayer.userData.updateAnimation = sourcePlayer.userData.updateAnimation?.bind(previewPlayer)
+      previewPlayer.position.copy(sourcePlayer.position)
+      previewPlayer.visible = true
+      rpgPreviewGroup.add(previewPlayer)
+      playerSpriteObject = previewPlayer
+    }
+    const calibratedPoint = (x, y) => mapEditorPointToCalibratedWorld(
+      [x, y],
+      document.calibration,
+      document.referenceImage,
+      Number(document.worldUnitsPerCampusUnit || 1),
+    ) || mapPixelToWorld(x, y)
+
+    // 世界范围从完整编辑文档计算，不再假设校园永远只有 640×480 / 150×96。
+    // workspaceBounds 包含视口原点参考范围和超出底图的新增要素。
+    const sourcePoints = []
+    const addSourcePoints = (points) => {
+      if (Array.isArray(points)) for (const point of points) {
+        if (Array.isArray(point) && Number.isFinite(point[0]) && Number.isFinite(point[1])) sourcePoints.push(point)
+      }
+    }
+    for (const building of document.buildings || []) {
+      if (Array.isArray(building.footprint)) addSourcePoints(building.footprint)
+      else if (Array.isArray(building.rect)) {
+        const [left, top, right, bottom] = building.rect
+        addSourcePoints([[left, top], [right, top], [right, bottom], [left, bottom]])
+      }
+    }
+    for (const area of document.areas || []) {
+      if (Array.isArray(area.polygon)) addSourcePoints(area.polygon)
+      else if (Array.isArray(area.rect)) {
+        const [left, top, right, bottom] = area.rect
+        addSourcePoints([[left, top], [right, top], [right, bottom], [left, bottom]])
+      }
+    }
+    for (const road of document.roads || []) addSourcePoints(road.points)
+    for (const object of document.objects || []) if (object.geometry?.type === 'Point') addSourcePoints([object.geometry.coordinates])
+    const workspace = document.workspaceBounds
+    if (workspace && [workspace.minX, workspace.minY, workspace.maxX, workspace.maxY].every(Number.isFinite)) {
+      addSourcePoints([[workspace.minX, workspace.minY], [workspace.maxX, workspace.minY], [workspace.maxX, workspace.maxY], [workspace.minX, workspace.maxY]])
+    }
+    if (!sourcePoints.length) addSourcePoints([[36, 92], [612, 460]])
+    const worldPoints = sourcePoints.map(([x, y]) => calibratedPoint(x, y))
+    const minX = Math.min(...worldPoints.map(point => point.x))
+    const maxX = Math.max(...worldPoints.map(point => point.x))
+    const minZ = Math.min(...worldPoints.map(point => point.z))
+    const maxZ = Math.max(...worldPoints.map(point => point.z))
+    const centerX = (minX + maxX) / 2
+    const centerZ = (minZ + maxZ) / 2
+    // 内容边界只由校园要素/工作区决定；远景地面尺寸不能参与相机取景和角色活动边界计算。
+    const contentWidth = Math.max(20, maxX - minX)
+    const contentDepth = Math.max(20, maxZ - minZ)
+    const margin = Math.max(8, Math.max(contentWidth, contentDepth) * 0.04)
+    // 远景地面只负责填充视野，不代表校园内容范围。
+    const groundWidth = Math.max(4000, contentWidth + margin * 2)
+    const groundDepth = Math.max(4000, contentDepth + margin * 2)
+    const ground = new THREE.Mesh(
+      // 相机低角度观察时，地面边界会被投影成横向截断线；大尺寸平面并随相机水平位置移动，
+      // 让地面边缘始终远离当前视锥体。校园内容边界仍使用独立的 contentWidth/contentDepth。
+      new THREE.PlaneGeometry(Math.max(12000, groundWidth), Math.max(12000, groundDepth)),
+      new THREE.MeshStandardMaterial({ color: '#8eae69', roughness: 1 }),
+    )
+    ground.name = 'campus-preview-horizon-ground'
+    ground.rotation.x = -Math.PI / 2
+    ground.position.set(centerX, -0.12, centerZ)
+    ground.receiveShadow = true
+    activeHorizonGround = ground
+    rpgPreviewGroup.add(ground)
+
+    for (const area of document.areas || []) {
+      if (area.polygon?.length >= 3) {
+        const points = area.polygon.map(([x, y]) => {
+          const p = calibratedPoint(x, y)
+          return new THREE.Vector2(p.x, -p.z)
+        })
+        const shape = new THREE.Shape(points)
+        for (const hole of area.holes || []) {
+          if (!Array.isArray(hole) || hole.length < 3) continue
+          const holePoints = hole.map(([x, y]) => {
+            const point = calibratedPoint(x, y)
+            return new THREE.Vector2(point.x, -point.z)
+          })
+          shape.holes.push(new THREE.Path(holePoints))
+        }
+        const mesh = new THREE.Mesh(
+          new THREE.ShapeGeometry(shape),
+          new THREE.MeshStandardMaterial({ color: ({ water: '#68b9b5', sports: '#b9b69f', vegetation: '#78936d', plaza: '#b8b2a0', parking: '#858b8d' }[area.type] || '#a4bd83'), roughness: area.type === 'water' ? 0.32 : 1 }),
+        )
+        mesh.rotation.x = -Math.PI / 2
+        mesh.position.y = 0.015
+        mesh.receiveShadow = true
+        rpgPreviewGroup.add(mesh)
+      } else if (area.rect) {
+        const [left, top, right, bottom] = area.rect
+        const corners = [[left, top], [right, top], [right, bottom], [left, bottom]]
+          .map(([x, y]) => calibratedPoint(x, y))
+        const shape = new THREE.Shape(corners.map((point) => new THREE.Vector2(point.x, -point.z)))
+        const mesh = new THREE.Mesh(
+          new THREE.ShapeGeometry(shape),
+          new THREE.MeshStandardMaterial({ color: ({ water: '#68b9b5', sports: '#b9b69f', vegetation: '#78936d', plaza: '#b8b2a0', parking: '#858b8d' }[area.type] || '#829a70'), roughness: area.type === 'water' ? 0.32 : 1, side: THREE.DoubleSide }),
+        )
+        mesh.rotation.x = -Math.PI / 2
+        mesh.position.y = 0.02
+        rpgPreviewGroup.add(mesh)
+      }
+    }
+
+    // 点/实例类对象直接从统一 Feature 文档生成；不再依赖画布硬编码装饰。
+    for (const feature of document.objects || []) {
+      if (feature.geometry?.type !== 'Point' || !Array.isArray(feature.geometry.coordinates)) continue
+      const point = calibratedPoint(feature.geometry.coordinates[0], feature.geometry.coordinates[1])
+      const type = feature.type || feature.properties?.type || 'tree'
+      const scale = Math.max(0.2, Number(feature.properties?.scale) || 1)
+      const group = new THREE.Group()
+      group.name = `campus-feature-${feature.id || type}`
+      group.userData.campusFeatureId = feature.id
+      group.userData.objectType = type
+      group.position.set(point.x, 0, point.z)
+      group.rotation.y = THREE.MathUtils.degToRad(Number(feature.properties?.rotation) || 0)
+      if (type === 'tree') {
+        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.12 * scale, 0.16 * scale, 1.1 * scale, 5), new THREE.MeshStandardMaterial({ color: '#79583b', roughness: 1 }))
+        trunk.position.y = 0.55 * scale
+        const crown = new THREE.Mesh(new THREE.ConeGeometry(0.72 * scale, 1.65 * scale, 6), new THREE.MeshStandardMaterial({ color: '#477b48', roughness: 1 }))
+        crown.position.y = 1.75 * scale
+        group.add(trunk, crown)
+      } else if (type === 'streetlight') {
+        const pole = new THREE.Mesh(new THREE.CylinderGeometry(0.045 * scale, 0.06 * scale, 2.8 * scale, 6), new THREE.MeshStandardMaterial({ color: '#59645e', metalness: 0.35, roughness: 0.6 }))
+        pole.position.y = 1.4 * scale
+        const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.16 * scale, 8, 6), new THREE.MeshStandardMaterial({ color: '#f5dfa0', emissive: '#b68a42', emissiveIntensity: 0.25 }))
+        lamp.position.set(0, 2.82 * scale, 0)
+        group.add(pole, lamp)
+      } else if (type === 'bench') {
+        const material = new THREE.MeshStandardMaterial({ color: '#98734f', roughness: 0.9 })
+        const seat = new THREE.Mesh(new THREE.BoxGeometry(1.1 * scale, 0.12 * scale, 0.38 * scale), material)
+        seat.position.y = 0.48 * scale
+        const back = new THREE.Mesh(new THREE.BoxGeometry(1.1 * scale, 0.48 * scale, 0.1 * scale), material)
+        back.position.set(0, 0.76 * scale, -0.14 * scale)
+        group.add(seat, back)
+      } else {
+        const sculpture = new THREE.Mesh(new THREE.OctahedronGeometry(0.55 * scale, 0), new THREE.MeshStandardMaterial({ color: '#8c7b9e', roughness: 0.65, metalness: 0.18 }))
+        sculpture.position.y = 0.58 * scale
+        group.add(sculpture)
+      }
+      group.traverse(child => { if (child.isMesh) { child.castShadow = true; child.receiveShadow = true } })
+      rpgPreviewGroup.add(group)
+    }
+
+    const roadNetwork = roadNetworkToMultiPolygon(document.roads)
+    roadNetwork.forEach((polygon, polygonIndex) => {
+      const outer = polygon[0]
+      if (!outer || outer.length < 4) return
+      const toShapePoint = ([x, y]) => {
+        const point = calibratedPoint(x, y)
+        return new THREE.Vector2(point.x, -point.z)
+      }
+      const shape = new THREE.Shape(outer.slice(0, -1).map(toShapePoint))
+      for (const hole of polygon.slice(1)) {
+        if (hole.length < 4) continue
+        const path = new THREE.Path(hole.slice(0, -1).map(toShapePoint))
+        shape.holes.push(path)
+      }
+      const geometry = new THREE.ShapeGeometry(shape)
+      geometry.rotateX(-Math.PI / 2)
+      const mesh = new THREE.Mesh(
+        geometry,
+        new THREE.MeshStandardMaterial({ color: '#c4a477', roughness: 1, side: THREE.DoubleSide }),
+      )
+      mesh.position.y = 0.075
+      mesh.name = `RoadNetworkUnion-${polygonIndex + 1}`
+      mesh.receiveShadow = true
+      rpgPreviewGroup.add(mesh)
+    })
+
+    const buildingMaterials = createCampusMaterials(THREE)
+    const invalidBuildingFootprints = []
+    for (const building of document.buildings) {
+      const footprint = Array.isArray(building.footprint) && building.footprint.length >= 3
+        ? building.footprint
+        : Array.isArray(building.rect) && building.rect.length === 4
+          ? [[building.rect[0], building.rect[1]], [building.rect[2], building.rect[1]], [building.rect[2], building.rect[3]], [building.rect[0], building.rect[3]]]
+          : null
+      if (!footprint) continue
+      const footprintValidation = validateBuildingFootprint(footprint)
+      if (!footprintValidation.valid) {
+        invalidBuildingFootprints.push({ id: building.id, label: building.label, errors: footprintValidation.errors })
+        continue
+      }
+      const worldPoints = footprint.map(([x, y]) => {
+        const point = calibratedPoint(x, y)
+        return { x: point.x, z: point.z }
+      })
+      const minX = Math.min(...worldPoints.map(point => point.x))
+      const maxX = Math.max(...worldPoints.map(point => point.x))
+      const minZ = Math.min(...worldPoints.map(point => point.z))
+      const maxZ = Math.max(...worldPoints.map(point => point.z))
+      const centerX = (minX + maxX) / 2
+      const centerZ = (minZ + maxZ) / 2
+      const width = Math.max(4.2, maxX - minX)
+      const depth = Math.max(2.4, maxZ - minZ)
+      const localShape = new THREE.Shape(worldPoints.map(point => new THREE.Vector2(point.x - centerX, -(point.z - centerZ))))
+      const publishedTemplate = options.buildingTemplates?.find(entry => entry.templateId === building.modelTemplateId && entry.status === 'ready') || null
+      const design = publishedTemplate?.modelType === 'procedural' ? publishedTemplate.buildingDesign || {} : {}
+      const height = Math.max(2.2, Number(design.height ?? building.height ?? (building.floors ? building.floors * 0.45 : 3.4)))
+      const group = createPixelBuilding(THREE, {
+        footprint: localShape, width, depth, height,
+        floors: design.floors ?? building.floors,
+        roofStyle: design.roofStyle ?? building.roofStyle,
+        roofRise: design.roofRise ?? building.roofRise,
+        windowDensity: design.windowDensity ?? building.windowDensity,
+        windowWidth: design.windowWidth ?? building.windowWidth,
+        windowHeight: design.windowHeight ?? building.windowHeight,
+        doorWidth: design.doorWidth ?? building.doorWidth,
+        facadeStyle: design.facadeStyle ?? building.facadeStyle,
+        hasBalconies: design.hasBalconies ?? building.hasBalconies,
+        balconyFloors: design.balconyFloors ?? building.balconyFloors,
+        columnCount: design.columnCount ?? building.columnCount,
+        roofColor: design.roofColor ?? building.roofColor,
+        facadeSections: design.facadeSections ?? building.facadeSections,
+        hasArcade: design.hasArcade ?? building.hasArcade,
+        podiumFloors: design.podiumFloors ?? building.podiumFloors,
+        windowColumns: design.windowColumns ?? building.windowColumns,
+        entranceEdgeIndex: building.entranceEdgeIndex,
+        template: design.template || building.template || building.label,
+        materials: buildingMaterials,
+        label: building.label || building.id || 'Campus Building',
+        confidence: building.confidence || 'unverified',
+      })
+      group.position.set(centerX, 0.16, centerZ)
+      group.userData.campusBuildingId = building.id
+      group.userData.objectType = 'building'
+      group.userData.displayName = building.label
+      group.userData.modelTemplateId = publishedTemplate?.templateId || null
+      if (publishedTemplate?.modelType === 'glb' && publishedTemplate.modelFile?.url && options.assetBaseUrl) {
+        const modelUrl = new URL(publishedTemplate.modelFile.url, options.assetBaseUrl).toString()
+        new GLTFLoader().load(modelUrl, gltf => {
+          const model = gltf.scene
+          const originalBounds = new THREE.Box3().setFromObject(model)
+          const size = originalBounds.getSize(new THREE.Vector3())
+          const fit = Math.min(width / Math.max(size.x, 0.001), depth / Math.max(size.z, 0.001), height / Math.max(size.y, 0.001))
+          model.scale.setScalar(fit)
+          const fitted = new THREE.Box3().setFromObject(model)
+          const center = fitted.getCenter(new THREE.Vector3())
+          model.position.set(-center.x, -fitted.min.y, -center.z)
+          group.traverse(node => { if (node !== group && node.geometry) node.geometry.dispose() })
+          group.clear()
+          group.add(model)
+        }, undefined, error => console.warn('[CampusEditorPreview] GLB 模板加载失败，保留程序化回退：', publishedTemplate.templateId, error))
+      }
+      rpgPreviewGroup.add(group)
+    }
+    rpgPreviewGroup.userData.invalidBuildingFootprints = invalidBuildingFootprints
+    if (invalidBuildingFootprints.length) {
+      console.warn('三维预览已跳过无效建筑轮廓：', invalidBuildingFootprints)
+    }
+
+    scene.add(rpgPreviewGroup)
+    invalidateShadowMap()
+    cameraRig?.setObstructionObjects(rpgPreviewGroup.children.filter(object => object.userData?.objectType === 'building'))
+    if (campus) campus.visible = false
+    // GLB 建筑模型直接挂载在 scene 下，不属于 campus 容器；必须单独隐藏，
+    // 否则预览中会同时残留原校园建筑，看起来像没有切换到编辑方案。
+    loadedBuildingModels.forEach((model) => { model.visible = false })
+    // 编辑器实时预览使用当前文档的地面边界和建筑碰撞体，不能沿用旧校园场景的碰撞数据。
+    const previewBounds = {
+      minX: minX - margin, maxX: maxX + margin,
+      minZ: minZ - margin, maxZ: maxZ + margin,
+    }
+    const previewObstacles = []
+    rpgPreviewGroup.updateMatrixWorld(true)
+    rpgPreviewGroup.traverse(object => {
+      if (object.userData?.objectType !== 'building') return
+      const bounds = new THREE.Box3().setFromObject(object)
+      if (!bounds.isEmpty()) previewObstacles.push({ minX: bounds.min.x, maxX: bounds.max.x, minZ: bounds.min.z, maxZ: bounds.max.z })
+    })
+    collisionWorld = new CollisionWorld(previewBounds, previewObstacles, 0.62)
+    input.collisionWorld = collisionWorld
+    const safeSpawn = collisionWorld.resolvePosition(cameraRig.player)
+    cameraRig.player.x = safeSpawn.x
+    cameraRig.player.z = safeSpawn.z
+    // 相机按真实校园内容范围取景，不能按 4000 单位的远景地面取景。
+    cameraRig?.focusBounds(contentWidth + margin * 2, contentDepth + margin * 2, centerX, centerZ, { immediate: true })
+    if (cameraRig.mode === 'firstPerson') cameraRig.updateFirstPersonDesired()
+    else if (cameraRig.mode === 'thirdPerson') cameraRig.updateThirdPersonDesired()
+    requestFrame()
+    return true
+  }
+
+
+  function clearNavigationVisuals() {
+    if (!navigationVisualGroup) return
+    scene?.remove(navigationVisualGroup)
+    disposeObjectGroup(navigationVisualGroup)
+    navigationVisualGroup = null
+  }
+
+  function showNavigationVisuals(path) {
+    clearNavigationVisuals()
+    if (!Array.isArray(path) || path.length < 2) return
+    navigationVisualGroup = new THREE.Group()
+    navigationVisualGroup.name = 'IndoorNavigationVisuals'
+    const points = path.map(point => new THREE.Vector3(point.x, 0.075, point.z))
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(points),
+      new THREE.LineBasicMaterial({ color: 0xf5c85b, transparent: true, opacity: 0.95 }),
+    )
+    navigationVisualGroup.add(line)
+    const target = path[path.length - 1]
+    const marker = new THREE.Mesh(
+      new THREE.RingGeometry(0.28, 0.42, 20),
+      new THREE.MeshBasicMaterial({ color: 0xffdf78, side: THREE.DoubleSide }),
+    )
+    marker.rotation.x = -Math.PI / 2
+    marker.position.set(target.x, 0.09, target.z)
+    navigationVisualGroup.add(marker)
+    scene.add(navigationVisualGroup)
+  }
+
+  function navigateIndoorTo(point) {
+    const graph = indoorGroup?.userData.navigationGraph
+    const route = graph?.findPath(
+      { x: cameraRig.player.x, z: cameraRig.player.z },
+      { x: point.x, z: point.z },
+    )
+    if (route?.length > 1 && input.setNavigationPath(route)) {
+      showNavigationVisuals(route)
+      navigationWasActive = true
+      callbacks.onIndoorPromptChange?.({ visible: false })
+      return true
+    }
+    input.setNavigationPath(null)
+    clearNavigationVisuals()
+    navigationWasActive = false
+    callbacks.onIndoorPromptChange?.({ visible: true, text: '该位置不可到达，请选择走廊或房间入口' })
+    return false
+  }
+
+  function getAdjacentStairTargetLevel() {
+    if (!indoorBuilding || !indoorGroup?.userData?.stairPath || !cameraRig?.player) return null
+    const levels = indoorBuilding.floors.map(floor => floor.level).sort((a, b) => a - b)
+    const index = levels.indexOf(currentIndoorFloor)
+    if (index < 0) return null
+    const path = indoorGroup.userData.stairPath
+    const distanceToStart = Math.hypot(cameraRig.player.x - path.start.x, cameraRig.player.z - path.start.z)
+    const distanceToEnd = Math.hypot(cameraRig.player.x - path.end.x, cameraRig.player.z - path.end.z)
+    // 楼梯两端分别代表上行/下行入口；按角色实际走到的平台决定方向。
+    if (distanceToStart <= distanceToEnd) return levels[index + 1] ?? null
+    return levels[index - 1] ?? null
+  }
+
+  function navigateToIndoorFloor(targetLevel) {
+    if (!indoorGroup || !indoorBuilding || stairTransition || activeIndoorRoom) return false
+    const plan = planIndoorFloorRoute(indoorBuilding, currentIndoorFloor, Number(targetLevel))
+    if (!plan) return false
+    if (!plan.transitions.length) {
+      pendingIndoorFloorTarget = null
+      input?.setNavigationPath(null)
+      clearNavigationVisuals()
+      navigationWasActive = false
+      return true
+    }
+    pendingIndoorFloorTarget = Number(targetLevel)
+    const stairPath = indoorGroup.userData.stairPath
+    const traversal = getStairTraversalPoints(stairPath, plan.transitions[0].direction)
+    if (!traversal) {
+      pendingIndoorFloorTarget = null
+      return false
+    }
+    if (isAtStairLanding(cameraRig.player, traversal.entry)) {
+      const started = beginStairTransition(plan.transitions[0].toLevel)
+      if (!started) pendingIndoorFloorTarget = null
+      return started
+    }
+    const started = navigateIndoorTo(traversal.entry)
+    if (!started) pendingIndoorFloorTarget = null
+    return started
+  }
+
+  function onScenePointerDown(event) {
+    if (event.button !== 0 || (!chunkManagementActive && !placementState && cameraRig?.mode !== 'overview' && !indoorGroup && generatedAssets.size === 0)) { pointerStart = null; return }
+    pointerStart = { x: event.clientX, y: event.clientY, pointerId: event.pointerId }
+  }
+
+  function onScenePointerMove(event) {
+    if (placementState) updatePlacementFromPointer(event)
+  }
+
+  function onScenePointerUp(event) {
+    if (!pointerStart || pointerStart.pointerId !== event.pointerId) return
+    const moved = Math.hypot(event.clientX - pointerStart.x, event.clientY - pointerStart.y)
+    pointerStart = null
+    if (placementState) {
+      updatePlacementFromPointer(event)
+      confirmGeneratedAssetPlacement()
+      return
+    }
+    if (chunkManagementActive) {
+      if (moved <= 5) selectSandboxChunkFromPointer(event)
+      return
+    }
+    if (moved > 5) return
+    if (cameraRig?.mode !== 'overview' && !indoorGroup && generatedAssets.size === 0) return
+    const rect = renderer.domElement.getBoundingClientRect()
+    if (!rect.width || !rect.height) return
+    pointerNdc.set(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1)
+    raycaster.setFromCamera(pointerNdc, cameraRig.camera)
+    if (indoorGroup) {
+      const indoorHits = raycaster.intersectObjects(indoorGroup.children, true)
+      const indoorTarget = indoorHits.find(hit => hit.object.userData?.interactionData)?.object
+      if (indoorTarget?.userData?.interactionData) {
+        const interaction = indoorTarget.userData.interactionData
+        if (interaction.action === 'enter-room' && interaction.roomId) {
+          const doorway = (indoorGroup.userData.roomInteractions || []).find(item => item.roomId === interaction.roomId)
+          if (doorway) navigateIndoorTo(doorway.approach)
+          return
+        }
+        if (interaction.action === 'change-floor') {
+          const stairs = indoorGroup.userData.stairPoint
+          if (stairs) navigateIndoorTo(stairs)
+          return
+        }
+        selectIndoorObject(indoorTarget)
+        return
+      }
+      const floorHit = indoorHits.find(hit => hit.object.name === 'indoor-floor-slab')
+      if (floorHit) { navigateIndoorTo({ x: floorHit.point.x, z: floorHit.point.z }); return }
+    }
+    if (generatedAssetsGroup) {
+      const assetHits = raycaster.intersectObjects(generatedAssetsGroup.children, true)
+      let assetTarget = assetHits[0]?.object || null
+      while (assetTarget && assetTarget !== generatedAssetsGroup && !assetTarget.userData?.generatedAssetId) assetTarget = assetTarget.parent
+      if (assetTarget?.userData?.generatedAssetId) { selectGeneratedAsset(assetTarget); return }
+    }
+    const hits = raycaster.intersectObjects(campus.children.filter(child => child !== generatedAssetsGroup), true)
+    let target = hits[0]?.object || null
+    while (target && target !== campus
+      && !target.userData?.featureId
+      && !target.userData?.buildingId
+      && target.userData?.objectType !== 'landmark-label') target = target.parent
+    if (!target || target === campus) return clearSelection()
+    if (target.userData?.featureId) selectObject(target.userData.featureId)
+    else selectCampusObject(target)
+  }
+
+  function selectCampusObject(target) {
+    if (!target || target === campus) return clearSelection()
+    if (selectedFeatureObject === target) return
+    restoreSelectionHighlight()
+    selectedIndoorObject = null
+    selectedFeatureObject = target
+    target.traverse((object) => {
+      if (!object.isMesh || !object.material) return
+      const materials = Array.isArray(object.material) ? object.material : [object.material]
+      object.userData.selectionOriginalMaterials = materials.map((material) => ({
+        color: material.emissive?.getHex?.() ?? 0,
+        intensity: material.emissiveIntensity ?? 1,
+      }))
+      materials.forEach((material) => {
+        if (material.emissive) {
+          material.emissive.set('#f0b84d')
+          material.emissiveIntensity = 0.65
+        }
+      })
+    })
+    callbacks.onObjectSelected?.({
+      featureId: null,
+      buildingId: target.userData.buildingId || null,
+      sceneObjectId: null,
+      objectType: target.userData.objectType || (target.userData.buildingId ? 'building' : 'campus-object'),
+      name: target.userData.displayName || target.name || '校园对象',
+    })
+  }
+
+  function selectIndoorObject(target) {
+    if (selectedFeatureObject) restoreSelectionHighlight()
+    selectedIndoorObject = target
+    callbacks.onObjectSelected?.({
+      featureId: null,
+      sceneObjectId: null,
+      objectType: target.userData.interactionData.objectType,
+      name: target.userData.interactionData.name,
+      interaction: { ...target.userData.interactionData },
+    })
+  }
+
+  function restoreSelectionHighlight() {
+    if (!selectedFeatureObject) return
+    selectedFeatureObject.traverse((object) => {
+      const originals = object.userData?.selectionOriginalMaterials
+      if (!originals || !object.material) return
+      const materials = Array.isArray(object.material) ? object.material : [object.material]
+      materials.forEach((material, index) => {
+        const original = originals[index]
+        if (original && material.emissive) { material.emissive.setHex(original.color); material.emissiveIntensity = original.intensity }
+      })
+      delete object.userData.selectionOriginalMaterials
+    })
+    selectedFeatureObject = null
+  }
+
+  function selectObject(featureId) {
+    requestFrame()
+    const target = campus?.children?.find((item) => String(item.userData?.featureId) === String(featureId))
+    if (!target) return clearSelection()
+    if (selectedFeatureObject === target) return
+    restoreSelectionHighlight()
+    selectedIndoorObject = null
+    selectedFeatureObject = target
+    target.traverse((object) => {
+      if (!object.isMesh || !object.material) return
+      const materials = Array.isArray(object.material) ? object.material : [object.material]
+      object.userData.selectionOriginalMaterials = materials.map((material) => ({ color: material.emissive?.getHex?.() ?? 0, intensity: material.emissiveIntensity ?? 1 }))
+      materials.forEach((material) => { if (material.emissive) { material.emissive.set('#f0b84d'); material.emissiveIntensity = 0.65 } })
+    })
+    callbacks.onObjectSelected?.({ featureId: String(target.userData.featureId), sceneObjectId: target.userData.sceneObjectId || null, objectType: target.userData.objectType || null, name: target.name })
+  }
+
+  function clearSelection() {
+    requestFrame()
+    if (!selectedFeatureObject && !selectedIndoorObject) return
+    if (selectedFeatureObject) restoreSelectionHighlight()
+    selectedIndoorObject = null
+    callbacks.onObjectSelected?.(null)
+  }
   function onKeyDown(event) {
+    // 道路绘制：Esc 取消、Enter 完成
+    if (roadDrawingState) {
+      if (event.key === 'Escape') { cancelSandboxRoadDrawing(); return }
+      if (event.key === 'Enter') { finishSandboxRoadDrawing(); return }
+    }
+    if (event.key === 'Escape' && sandboxRoadEditor?.handleEscape()) return
+    if (placementState && event.key === 'Escape') { cancelGeneratedAssetPlacement(); return }
+    if (placementState && ['q', 'Q', 'e', 'E'].includes(event.key)) {
+      rotateGeneratedAsset(placementState.instance.userData.generatedAssetId, event.key.toLowerCase() === 'q' ? -Math.PI / 12 : Math.PI / 12)
+      return
+    }
     if (event.key === 'Escape') input?.exitPointerLock()
+    if (event.repeat || event.altKey || event.ctrlKey || event.metaKey) return
+    if (event.key.toLowerCase() !== 'e') return
+    // 室外靠近教学楼正门按 E 进入；室内交互继续由同一按键处理。
+    if (!indoorGroup) {
+      if (nearSandboxModelId) {
+        const target = sandboxModels.get(nearSandboxModelId)
+        if (target) {
+          const interaction = nearSandboxInteractionTarget
+          callbacks.onSandboxModelInteract?.({
+            id: nearSandboxModelId,
+            name: interaction?.name || target.name,
+            targetPartId: interaction?.targetPartId || null,
+            config: interaction?.config || target.userData.interactionConfig || null,
+            message: target.userData.interactionMessage || ('你与 ' + (interaction?.name || target.name) + ' 完成了一次交互'),
+          })
+          return
+        }
+        nearSandboxModelId = null
+      }
+      if (nearOutdoorBuildingId) enterIndoorBuilding(nearOutdoorBuildingId)
+      else if (nearOutdoorEntrance) {
+        if (isRpgSample) enterIndoorBuilding('sample-teaching-building')
+        else enterIndoorPrototype()
+      }
+      return
+    }
+    if (stairTransition) return
+    if (nearIndoorExit) {
+      exitIndoorPrototype()
+      return
+    }
+    if (activeIndoorRoom && roomReturnPosition) {
+      if (pendingRoomTransition) return
+      pendingRoomTransition = { type: 'exit' }
+      if (!navigateIndoorTo(roomReturnPosition)) pendingRoomTransition = null
+      return
+    }
+    if (nearIndoorRoom) {
+      if (pendingRoomTransition) return
+      const interaction = indoorGroup.userData.roomInteractions?.find(item => item.roomId === nearIndoorRoom.roomId)
+      if (!interaction) return
+      roomReturnPosition = { x: cameraRig.player.x, y: cameraRig.player.y, z: cameraRig.player.z }
+      pendingRoomTransition = { type: 'enter', roomId: interaction.roomId, roomName: interaction.roomName }
+      nearIndoorRoom = null
+      if (!navigateIndoorTo(interaction.inside)) {
+        pendingRoomTransition = null
+        roomReturnPosition = null
+      }
+      return
+    }
+    if (stairInteractionActive && indoorBuilding) {
+      const target = getAdjacentStairTargetLevel()
+      if (target !== null) navigateToIndoorFloor(target)
+    }
+  }
+
+  function logRenderDiagnostics(stage) {
+    if (!renderDebugEnabled || !renderer || !cameraRig) return
+    const canvas = renderer.domElement
+    const rect = canvas.getBoundingClientRect()
+    const containerRect = container.getBoundingClientRect()
+    const gl = renderer.getContext()
+    const camera = cameraRig.camera
+    console.info('[CampusRenderDiagnostics]', {
+      stage,
+      container: { width: containerRect.width, height: containerRect.height, top: containerRect.top, bottom: containerRect.bottom },
+      canvas: { cssWidth: rect.width, cssHeight: rect.height, top: rect.top, bottom: rect.bottom, width: canvas.width, height: canvas.height },
+      drawingBuffer: { width: gl.drawingBufferWidth, height: gl.drawingBufferHeight },
+      viewport: Array.from(gl.getParameter(gl.VIEWPORT)),
+      scissor: Array.from(gl.getParameter(gl.SCISSOR_BOX)),
+      scissorTest: gl.isEnabled(gl.SCISSOR_TEST),
+      pixelRatio: renderer.getPixelRatio(),
+      render: { ...renderer.info.render },
+      memory: { ...renderer.info.memory },
+      lastRenderCostMs,
+      framePerformance: getFramePerformanceDiagnostics(),
+      timing: lastFrameTiming ? {
+        rawFrameDeltaSeconds: lastFrameTiming.rawDeltaSeconds,
+        simulationDeltaSeconds: lastFrameTiming.deltaSeconds,
+        droppedFrameTimeSeconds: lastFrameTiming.droppedFrameTimeSeconds,
+        simulationTimeSeconds,
+      } : null,
+      physics: physicsRuntime ? {
+        fixedTimeStep: physicsRuntime.fixedTimeStep,
+        accumulator: physicsRuntime.accumulator,
+        stepCount: physicsRuntime.stepCount,
+        totalDroppedTime: physicsRuntime.droppedTime,
+        lastStep: lastPhysicsStepResult,
+      } : null,
+      shadows: {
+        ...(shadowSystem?.getDiagnostics?.() || {}),
+        staticShadowTestEnabled,
+      },
+      sceneObjects: (() => { let objects = 0, meshes = 0; scene.traverse(object => { objects += 1; if (object.isMesh) meshes += 1 }); return { objects, meshes } })(),
+      camera: {
+        type: camera.type,
+        near: camera.near,
+        far: camera.far,
+        zoom: camera.zoom,
+        aspect: camera.aspect,
+        position: camera.position.toArray(),
+        target: cameraRig.currentTarget?.toArray?.() || null,
+      },
+    })
+  }
+
+  function logRenderFailure(stage, error) {
+    const canvas = renderer?.domElement
+    const gl = renderer?.getContext?.()
+    let sceneSummary = null
+    if (scene) {
+      let objects = 0
+      let meshes = 0
+      let visibleMeshes = 0
+      scene.traverse(object => {
+        objects += 1
+        if (object.isMesh) {
+          meshes += 1
+          if (object.visible) visibleMeshes += 1
+        }
+      })
+      sceneSummary = { objects, meshes, visibleMeshes, children: scene.children.length }
+    }
+    const camera = cameraRig?.camera
+    console.error('[CampusRenderFailure]', {
+      stage,
+      initializationStage,
+      error: error?.message || String(error),
+      stack: error?.stack || null,
+      initialized,
+      disposed,
+      canvasConnected: Boolean(canvas?.isConnected),
+      canvasSize: canvas ? { width: canvas.width, height: canvas.height } : null,
+      contextLost: gl?.isContextLost?.() ?? null,
+      drawingBuffer: gl ? { width: gl.drawingBufferWidth, height: gl.drawingBufferHeight } : null,
+      scene: sceneSummary,
+      camera: camera ? {
+        type: camera.type,
+        near: camera.near,
+        far: camera.far,
+        position: camera.position.toArray(),
+        quaternion: camera.quaternion.toArray(),
+        aspect: camera.aspect,
+      } : null,
+      renderInfo: renderer?.info ? { ...renderer.info.render } : null,
+    })
+  }
+
+  function getRendererPixelRatio(width, height) {
+    const safeWidth = Math.max(Number(width) || 0, 1)
+    const safeHeight = Math.max(Number(height) || 0, 1)
+    const devicePixelRatio = window.devicePixelRatio || 1
+    const maxPixelRatioByBufferArea = Math.sqrt(2_400_000 / (safeWidth * safeHeight))
+    // 统一初始化与 resize 的质量上限，避免 resize 覆盖初始化阶段的 1.5 DPR 限制。
+    return Math.min(devicePixelRatio, 1.5, maxPixelRatioByBufferArea)
   }
 
   function resize() {
     if (!renderer || !cameraRig) return
     const width = Math.max(container.clientWidth, 1)
     const height = Math.max(container.clientHeight, 1)
+    renderer.setPixelRatio(getRendererPixelRatio(width, height))
     renderer.setSize(width, height)
     cameraRig.resize(width / height)
+    logRenderDiagnostics('resize')
+    requestFrame()
+  }
+
+  function requestFrame() {
+    if (disposed || frameId) return
+    frameId = requestAnimationFrame(animate)
+  }
+
+  function recordMotionProbe(gateContinues, renderCostMs, shadowWasInvalidated) {
+    if (!motionProbe || !cameraRig?.player) return
+    const player = cameraRig.player
+    const previous = motionProbeLastPlayer
+    const characterState = physicsRuntime?.getKinematicCharacterState?.(input?.physicsCharacterId) || null
+    motionProbe.setEnvironment({
+      ...motionProbe.environment,
+      mode: cameraRig.mode,
+      viewMode: cameraRig.viewMode,
+      wind: environmentConfig.wind,
+    })
+    motionProbe.record({
+      intervalMs: Math.max(0, (lastFrameTiming?.rawDeltaSeconds || 0) * 1000),
+      px: player.x,
+      py: player.y,
+      pz: player.z,
+      dx: previous ? player.x - previous.x : 0,
+      dy: previous ? player.y - previous.y : 0,
+      dz: previous ? player.z - previous.z : 0,
+      keysHeld: input?.keys?.size || 0,
+      movementIntent: input?.hasMovementInput?.() === true,
+      physicsSteps: lastPhysicsStepResult?.steps || 0,
+      physicsAlpha: Number.isFinite(lastPhysicsStepResult?.alpha)
+        ? lastPhysicsStepResult.alpha
+        : (physicsRuntime?.accumulator || 0) / (physicsRuntime?.fixedTimeStep || 1),
+      grounded: input?.grounded === true,
+      desiredSpeed: characterState ? Math.hypot(characterState.commandedVelocity?.x || 0, characterState.commandedVelocity?.z || 0) : 0,
+      actualSpeed: characterState ? Math.hypot(characterState.actualVelocity?.x || 0, characterState.actualVelocity?.z || 0) : 0,
+      wallContacts: characterState?.wallContactCount || 0,
+      contacts: characterState?.contactCount || 0,
+      renderCostMs,
+      drawCalls: renderer?.info?.render?.calls || 0,
+      triangles: renderer?.info?.render?.triangles || 0,
+      shadowInvalidated: shadowWasInvalidated === true,
+      gateContinues: gateContinues === true,
+      mode: cameraRig.mode,
+    })
+    motionProbeLastPlayer = { x: player.x, y: player.y, z: player.z }
+    motionProbeFrameCount += 1
+    if (motionProbeFrameCount % 240 === 0) {
+      console.info('[MotionProbe] 滚动报告（240 帧；完整报告：__motionProbe.analyze()）', motionProbe.analyze())
+    }
   }
 
   function animate(time) {
-    frameId = requestAnimationFrame(animate)
-    const delta = Math.min((time - (previousTime || time)) / 1000, 0.05)
-    previousTime = time
-    input?.update(delta)
-    cameraRig?.update(delta)
+    frameId = 0
+    const frameStartedAt = renderDebugEnabled ? performance.now() : 0
+    const motionProbeShadowBefore = motionProbe ? (shadowSystem?.dynamicInvalidations ?? 0) : 0
+    let motionProbeRenderCostMs = 0
+    try {
+    lastFrameTiming = advanceFrameTiming(time, previousTime, simulationTimeSeconds, 0.05)
+    previousTime = lastFrameTiming.previousTimestampMs
+    simulationTimeSeconds = lastFrameTiming.simulationTimeSeconds
+    const delta = lastFrameTiming.deltaSeconds
+    if (stairTransition) {
+      lastPhysicsStepResult = physicsRuntime?.step(delta, {
+        beforeFixedStep: context => input?.beforeFixedStep?.(context),
+        afterFixedStep: context => input?.afterFixedStep?.(context),
+      }) || null
+      updateStairTransition(delta)
+    } else {
+      // Submit movement intent before advancing Rapier, avoiding a one-step input delay.
+      input?.update(delta)
+      lastPhysicsStepResult = physicsRuntime?.step(delta, {
+        beforeFixedStep: context => input?.beforeFixedStep?.(context),
+        afterFixedStep: context => input?.afterFixedStep?.(context),
+      }) || null
+      // Render and animate from the completed physical position.
+      input?.syncPlayerFromPhysicsState?.()
+    }
+    if (pendingRoomTransition) {
+      const completed = input?.consumeNavigationPathCompletion?.() || false
+      if (completed) {
+        const transition = pendingRoomTransition
+        pendingRoomTransition = null
+        if (transition.type === 'enter') {
+          activeIndoorRoom = { id: transition.roomId, name: transition.roomName }
+          callbacks.onIndoorStateChange?.({ active: true, floor: currentIndoorFloor, floors: indoorBuilding.floors.map(item => item.level), buildingId: indoorBuilding.id, buildingName: indoorBuilding.name, prototype: true, nearStairs: false, nearRoom: null, activeRoom: activeIndoorRoom })
+        } else {
+          activeIndoorRoom = null
+          roomReturnPosition = null
+          nearIndoorRoom = null
+          callbacks.onIndoorStateChange?.({ active: true, floor: currentIndoorFloor, floors: indoorBuilding.floors.map(item => item.level), buildingId: indoorBuilding.id, buildingName: indoorBuilding.name, prototype: true, nearStairs: stairInteractionActive, nearRoom: null, activeRoom: null })
+        }
+      } else if (!input?.navigationPath) {
+        // 玩家手动接管或路线被碰撞阻断时，取消未完成的房间切换，不传送角色。
+        pendingRoomTransition = null
+        if (!activeIndoorRoom) roomReturnPosition = null
+      }
+    }
+    if (navigationWasActive && !input?.navigationPath) {
+      navigationWasActive = false
+      clearNavigationVisuals()
+    }
+    if (!indoorGroup && cameraRig?.player && sampleTeachingBuilding && sampleTeachingEntranceLocal) {
+      // Reuse cached scene/object references and vectors; no per-frame getObjectByName traversal.
+      sampleTeachingBuilding.localToWorld(sampleTeachingEntranceWorld.copy(sampleTeachingEntranceLocal))
+      const near = Math.hypot(cameraRig.player.x - sampleTeachingEntranceWorld.x, cameraRig.player.z - sampleTeachingEntranceWorld.z) <= sampleTeachingEntranceRadius
+      if (near !== nearOutdoorEntrance) {
+        nearOutdoorEntrance = near
+        callbacks.onIndoorPromptChange?.(near ? { visible: true, text: '按 E 进入教学楼' } : { visible: false })
+      }
+    }
+    if (!indoorGroup && cameraRig?.player && !isRpgSample) {
+      const player = cameraRig.player
+      const movedSinceLastCheck = !lastEntranceCheckPosition
+        || (player.x - lastEntranceCheckPosition.x) ** 2 + (player.z - lastEntranceCheckPosition.z) ** 2 > 0.0004
+      // 入口提示只依赖玩家位置；静止帧跳过距离计算，移动时只检查初始化索引。
+      if (movedSinceLastCheck) {
+        lastEntranceCheckPosition = { x: player.x, z: player.z }
+        let nearest = null
+        for (const entry of outdoorEntranceObjects) {
+          const { object, worldPosition } = entry
+          const entrance = object.userData?.indoorEntrance
+          if (!entrance || !object.userData?.buildingId) continue
+          const point = object.localToWorld(worldPosition.set(entrance.x, 0, entrance.z))
+          const distance = Math.hypot(player.x - point.x, player.z - point.z)
+          if (distance <= (entrance.radius || 2.25) && (!nearest || distance < nearest.distance)) {
+            nearest = { id: String(object.userData.buildingId), name: object.userData.displayName || object.name, distance }
+          }
+        }
+        const nextId = nearest?.id || null
+        if (nextId !== nearOutdoorBuildingId) {
+          nearOutdoorBuildingId = nextId
+          callbacks.onIndoorPromptChange?.(nearest
+            ? { visible: true, text: '按 E 进入' + nearest.name }
+            : { visible: false })
+        }
+      }
+    }
+
+    if (!indoorGroup && cameraRig?.player && isRpgSample && (sandboxModels.size > 0 || nearSandboxInteractionKey)) {
+      const nearestSandboxModel = sandboxInteractionIndex.findNearest(cameraRig.player)
+      const nextId = nearestSandboxModel?.id || null
+      const nextKey = nearestSandboxModel
+        ? nextId + ':' + (nearestSandboxModel.targetPartId || 'root')
+        : null
+      if (nextKey !== nearSandboxInteractionKey) {
+        nearSandboxModelId = nextId
+        nearSandboxInteractionTarget = nearestSandboxModel
+        nearSandboxInteractionKey = nextKey
+        const promptText = nearestSandboxModel?.config?.prompt
+          || ('靠近 ' + (nearestSandboxModel?.name || '') + '，按 E 交互')
+        callbacks.onSandboxInteractionPromptChange?.(nearestSandboxModel
+          ? {
+              visible: true,
+              id: nearestSandboxModel.id,
+              name: nearestSandboxModel.name,
+              targetPartId: nearestSandboxModel.targetPartId,
+              text: promptText,
+            }
+          : { visible: false })
+      }
+    }
+
+    if (indoorGroup && cameraRig?.player && !stairTransition && pendingIndoorFloorTarget !== null && !activeIndoorRoom) {
+      if (input?.keys?.size) {
+        // 玩家主动接管移动时，取消自动楼层导航，避免之后意外触发楼层切换。
+        pendingIndoorFloorTarget = null
+      } else {
+        const plan = planIndoorFloorRoute(indoorBuilding, currentIndoorFloor, pendingIndoorFloorTarget)
+        const nextTransition = plan?.transitions?.[0]
+        const traversal = getStairTraversalPoints(indoorGroup.userData.stairPath, nextTransition?.direction)
+        if (!nextTransition || !traversal) {
+          pendingIndoorFloorTarget = null
+        } else if (isAtStairLanding(cameraRig.player, traversal.entry)) {
+          input?.setNavigationPath(null)
+          navigationWasActive = false
+          clearNavigationVisuals()
+          if (!beginStairTransition(nextTransition.toLevel)) pendingIndoorFloorTarget = null
+        } else if (!input?.navigationPath) {
+          // 自动寻路被碰撞中断或外部清空时，不能让楼层目标残留并在稍后误触发。
+          pendingIndoorFloorTarget = null
+          navigationWasActive = false
+          clearNavigationVisuals()
+        }
+      }
+    }
+    if (indoorGroup && cameraRig?.player && !stairTransition) {
+      const point = indoorGroup.userData.stairPoint
+      const exitPoint = indoorGroup.userData.exitInteractions?.[0]
+      const nearExit = !activeIndoorRoom && exitPoint && Math.hypot(cameraRig.player.x - exitPoint.x, cameraRig.player.z - exitPoint.z) <= 1.7
+      nearIndoorExit = Boolean(nearExit)
+      const nearStairs = !activeIndoorRoom && point && Math.hypot(cameraRig.player.x - point.x, cameraRig.player.z - point.z) <= 2.4
+      const nearestRoom = activeIndoorRoom ? null : (indoorGroup.userData.roomInteractions || [])
+        .map(item => ({ item, distance: Math.hypot(cameraRig.player.x - item.approach.x, cameraRig.player.z - item.approach.z) }))
+        .filter(entry => entry.distance <= 1.7)
+        .sort((a, b) => a.distance - b.distance)[0]?.item || null
+      const nextRoom = nearestRoom ? { roomId: nearestRoom.roomId, roomName: nearestRoom.roomName } : null
+      const roomChanged = nextRoom?.roomId !== nearIndoorRoom?.roomId
+      const stairChanged = Boolean(nearStairs) !== stairInteractionActive
+      if (stairChanged || roomChanged) {
+        stairInteractionActive = Boolean(nearStairs)
+        nearIndoorRoom = nextRoom
+        callbacks.onIndoorStateChange?.({ active: true, floor: currentIndoorFloor, floors: indoorBuilding.floors.map(item => item.level), buildingId: indoorBuilding.id, buildingName: indoorBuilding.name, prototype: true, nearStairs: stairInteractionActive, nearRoom: nearIndoorRoom, activeRoom: activeIndoorRoom })
+      }
+      const stairTarget = nearStairs ? getAdjacentStairTargetLevel() : null
+      const prompt = getIndoorInteractionPrompt({
+        activeRoom: activeIndoorRoom,
+        nearExit: Boolean(nearExit),
+        nearStairs: Boolean(nearStairs && stairTarget !== null),
+        stairTarget: stairTarget === null ? null : (stairTarget > currentIndoorFloor ? stairTarget : -stairTarget),
+        nearRoom: nearestRoom,
+        buildingName: indoorBuilding?.name || '建筑',
+      })
+      const nextPromptKey = prompt?.key || ''
+      if (nextPromptKey !== indoorPromptKey) {
+        indoorPromptKey = nextPromptKey
+        callbacks.onIndoorPromptChange?.(prompt ? { visible: true, text: prompt.text } : { visible: false })
+      }
+    }
+    const playerWaterState = getPlayerWaterState()
+    const playerWaterStateKey = playerWaterState
+      ? playerWaterState.volumeId + ':' + Math.round(playerWaterState.depth * 50) + ':'
+        + Math.round(playerWaterState.surfaceHeight * 50) + ':' + Math.round(playerWaterState.immersionDepth * 50)
+      : ''
+    if (playerWaterStateKey !== lastPlayerWaterStateKey) {
+      lastPlayerWaterStateKey = playerWaterStateKey
+      callbacks.onPlayerWaterStateChange?.(playerWaterState)
+    }
+    const playerSprite = playerSpriteObject || scene?.getObjectByName('CampusPlanPlayerSprite')
+    if (playerSprite && cameraRig?.player) {
+      // 第一人称相机位于角色眼部，隐藏完整角色模型，避免模型遮挡视野。
+      playerSprite.visible = cameraRig.mode !== 'firstPerson'
+      // cameraRig.player 表示眼部高度，角色根节点需要回落到当前楼层地面。
+      playerSprite.position.set(cameraRig.player.x, Math.max(0, cameraRig.player.y - (input?.playerEyeHeight || 1.7)), cameraRig.player.z)
+      const dx = cameraRig.player.x - lastPlayerX
+      const dz = cameraRig.player.z - lastPlayerZ
+      const dy = playerSprite.position.y - lastPlayerY
+      // Use the rendered character-anchor displacement as the presentation signal.
+      // It is already interpolated by PhysicsRuntime and therefore matches what the user sees.
+      const movementSpeed = Math.hypot(dx, dz) / Math.max(delta, 0.001)
+      // Movement intent preserves restrained feedback while blocked; actual rendered travel drives gait cadence.
+      const movementIntent = input?.hasMovementInput?.() === true
+      const moving = movementIntent || movementSpeed > 0.08
+      const running = input?.keys?.has('shift') === true
+      // These reference speeds match InputController's authoritative 9 / 18 world-units-per-second motor commands.
+      const gaitRate = movementSpeed > 0.08
+        ? Math.max(0.65, Math.min(1.45, movementSpeed / (running ? 18 : 9)))
+        : 0.42
+      const animationDx = dx
+      const animationDz = dz
+      const verticalChanged = Math.abs(dy) > 0.0001
+      const visibilityChanged = lastPlayerVisibility !== playerSprite.visible
+      lastPlayerVisibility = playerSprite.visible
+      lastPlayerY = playerSprite.position.y
+      if (typeof playerSprite.userData.updateAnimation === 'function') {
+        const airborne = input?.grounded === false
+        playerSprite.userData.updateAnimation.call(playerSprite, moving, simulationTimeSeconds, animationDx, animationDz, running, gaitRate, airborne)
+      } else {
+        campus?.userData.updatePlayerAnimation?.(moving, simulationTimeSeconds, animationDx, animationDz, gaitRate)
+      }
+      // 动画姿态也可能改变投影；在动画更新后失效，确保本帧 ShadowMap 使用最新姿态。
+      if (((moving || verticalChanged) && playerSprite.visible) || visibilityChanged) invalidateDynamicShadowMap()
+      lastPlayerX = cameraRig.player.x
+      lastPlayerZ = cameraRig.player.z
+    }
+    playerCharacterRuntime?.update(delta)
+    const cameraChanged = cameraRig?.update(delta) || false
+    if (rainField) {
+      rainField.update(delta, environmentConfig.wind)
+      if (cameraRig?.camera) rainField.followCamera(cameraRig.camera.position)
+    }
+    if (cloudLayer) {
+      cloudLayer.update(delta, environmentConfig.wind)
+      if (cameraRig?.camera) {
+        cloudLayer.followCamera(cameraRig.camera.position)
+        cloudLayer.setOrientation(cameraRig.camera)
+      }
+    }
+    if (snowField) {
+      snowField.update(delta, environmentConfig.wind)
+      if (cameraRig?.camera) snowField.followCamera(cameraRig.camera.position)
+    }
+    if (windSwayTargets.length) {
+      const wind = environmentConfig.wind
+      const seconds = time / 1000
+      for (const target of windSwayTargets) {
+        const sway = Math.sin(seconds * 1.25 + target.phase) * target.amplitude * wind
+        target.object.rotation.x = target.baseX + sway
+        target.object.rotation.z = target.baseZ + sway * 0.62
+      }
+      if (wind > 0) invalidateDynamicShadowMap()
+    }
+    const animationSnapshot = getCurrentEnvironmentSnapshot()
+    modelAnimationRuntime.update(simulationTimeSeconds, delta, animationSnapshot)
+    if (modelAnimationRuntime.hasActiveAnimations()) invalidateDynamicShadowMap()
+    // 远景地面跟随相机的 X/Z 坐标，避免相机平移或低角度观察时看到有限平面的边缘。
+    if (activeHorizonGround && cameraRig?.camera) {
+      activeHorizonGround.position.x = cameraRig.camera.position.x
+      activeHorizonGround.position.z = cameraRig.camera.position.z
+    }
+    // 天空层 XYZ 全跟随相机，相机恒在穹顶球心；室内状态每帧同步避免进出事件漏接。
+    if (skyRuntime && cameraRig?.camera) {
+      skyRuntime.followCamera(cameraRig.camera.position)
+      skyRuntime.setIndoor(Boolean(indoorGroup))
+    }
+    const renderStartedAt = renderDebugEnabled ? performance.now() : 0
+    if (renderDebugEnabled) {
+      collectGpuTimerResults()
+      beginGpuTimeQuery()
+    }
+    const motionProbeRenderStart = motionProbe ? performance.now() : 0
     renderer.render(scene, cameraRig.camera)
+    if (motionProbe) motionProbeRenderCostMs = performance.now() - motionProbeRenderStart
+    if (renderDebugEnabled) {
+      endGpuTimeQuery()
+      const frameFinishedAt = performance.now()
+      lastRenderCostMs = frameFinishedAt - renderStartedAt
+      frameSequence += 1
+      const frameSample = {
+        frame: frameSequence,
+        startedAtMs: frameStartedAt,
+        endedAtMs: frameFinishedAt,
+        rafIntervalMs: Math.max(0, lastFrameTiming.rawDeltaSeconds * 1000),
+        updateCpuMs: Math.max(0, renderStartedAt - frameStartedAt),
+        renderSubmitCpuMs: lastRenderCostMs,
+        totalFrameCpuMs: Math.max(0, frameFinishedAt - frameStartedAt),
+      }
+      framePerformanceSamples.push(frameSample)
+      if (frameSample.rafIntervalMs > 10 || frameSample.totalFrameCpuMs > 10 || lastRenderCostMs > 8.33) {
+        }
+      if (framePerformanceSamples.length > 120) framePerformanceSamples.shift()
+      renderDebugFrame += 1
+      if (renderDebugFrame === 1 || renderDebugFrame % 120 === 0) logRenderDiagnostics(renderDebugFrame === 1 ? 'first-render' : 'render')
+    }
+    // 角色模式持续更新输入/动画；静止总览只在 OrbitControls 阻尼或交互引发变化时继续绘制。
+    const freePlayerIsMoving = isBlankSandbox && input?.freeCameraMovementEnabled && input?.movementEnabled
+      && (input.keys.size > 0 || Boolean(input.navigationPath) || !input.grounded)
+    const gateContinues = cameraRig?.mode !== 'overview' || cameraChanged || rainField?.visible
+      || environmentConfig.wind > 0 || freePlayerIsMoving || modelAnimationRuntime.hasActiveAnimations()
+    if (gateContinues) requestFrame()
+    if (motionProbe) {
+      const shadowWasInvalidated = (shadowSystem?.dynamicInvalidations ?? 0) !== motionProbeShadowBefore
+      recordMotionProbe(gateContinues, motionProbeRenderCostMs, shadowWasInvalidated)
+    }
+    } catch (error) {
+      endGpuTimeQuery()
+      // 不吞掉帧内异常，也不在确定性错误后无限重试；记录完整现场，等待修复。
+      logRenderFailure('animate', error)
+    }
+  }
+
+  function updateSceneObject(sceneObject) {
+    if (!loadedSceneData || !campus?.userData.isGISDriven || !sceneObject?.id) return false
+    const item = loadedSceneData.objects.find((entry) => entry.sceneObject.id === sceneObject.id)
+    if (!item) return false
+    const current = campus.children.find((entry) => entry.userData?.sceneObjectId === sceneObject.id)
+    if (!current) return false
+    const wasSelected = selectedFeatureObject === current
+    if (wasSelected) restoreSelectionHighlight()
+    const replacement = buildFeatureObject(item.feature, sceneObject, {
+      mapCoordinateToWorld: loadedSceneData.mapCoordinateToWorld,
+    })
+    const index = campus.children.indexOf(current)
+    campus.remove(current)
+    campus.add(replacement)
+    campus.children.splice(campus.children.indexOf(replacement), 1)
+    campus.children.splice(index, 0, replacement)
+    current.traverse((object) => {
+      object.geometry?.dispose?.()
+      if (Array.isArray(object.material)) object.material.forEach(disposeMaterial)
+      else disposeMaterial(object.material)
+    })
+    item.sceneObject = sceneObject
+    if (wasSelected) selectObject(item.feature.id)
+    invalidateShadowMap()
+    requestFrame()
+    return true
+  }
+
+  function buildIndoorFloor(level, transitionPosition = null) {
+    input?.setNavigationPath(null)
+    navigationWasActive = false
+    clearNavigationVisuals()
+    const floor = indoorBuilding?.floors.find(item => item.level === level)
+    if (!floor) return false
+    const interiorPolygon = indoorBuilding.interiorFootprint?.polygon || (
+      !indoorBuilding.interiorNormalized ? indoorBuilding.footprint?.polygon : null
+    )
+    const floorDefinition = interiorPolygon?.length >= 3
+      ? { ...floor, footprintPolygon: interiorPolygon.map(point => ({ x: point.x, z: point.z })) }
+      : floor
+    const group = createIndoorFloor(THREE, floorDefinition, indoorBuilding.floorHeight)
+    group.position.y = (level - 1) * indoorBuilding.floorHeight
+    scene.add(group)
+    if (indoorGroup) { scene.remove(indoorGroup); disposeObjectGroup(indoorGroup) }
+    invalidateShadowMap()
+    indoorGroup = group
+    currentIndoorFloor = level
+    collisionWorld = new CollisionWorld(indoorBuilding.bounds, group.userData.collisionObstacles, 0.48)
+    input.collisionWorld = collisionWorld
+    cameraRig.player.set(transitionPosition?.x ?? floor.spawnPoint.x, group.position.y + floor.spawnPoint.y, transitionPosition?.z ?? floor.spawnPoint.z)
+    if (cameraRig.mode === 'firstPerson') cameraRig.updateFirstPersonDesired()
+    else cameraRig.updateThirdPersonDesired()
+    stairInteractionActive = false
+    nearIndoorRoom = null
+    activeIndoorRoom = null
+    roomReturnPosition = null
+    pendingRoomTransition = null
+    callbacks.onIndoorStateChange?.({ active: true, floor: level, floors: indoorBuilding.floors.map(item => item.level), buildingId: indoorBuilding.id, buildingName: indoorBuilding.name, prototype: true, nearStairs: false, nearRoom: null, activeRoom: null })
+    requestFrame()
+    return true
+  }
+
+  function enterIndoorPrototype(definitionOverride = null) {
+    if (!scene || indoorGroup) return false
+    const definition = definitionOverride || indoorBuildingDefinitions.teachingBlockPrototype
+    const errors = validateIndoorBuilding(definition)
+    if (errors.length) throw new TypeError(errors.join('；'))
+    indoorBuilding = definition
+    callbacks.onIndoorPromptChange?.({ visible: false })
+    nearOutdoorEntrance = false
+    outdoorState = {
+      visible: campus.visible,
+      player: cameraRig.player.clone(),
+      mode: cameraRig.mode,
+      collisionWorld,
+      background: scene.background?.clone?.() ?? scene.background,
+      fog: scene.fog?.clone?.() ?? scene.fog,
+      loadedModelVisibility: loadedBuildingModels.map(model => ({ model, visible: model.visible })),
+    }
+    // 室内是独立空间：校园地面、树木及独立加载的建筑模型全部隐藏，不能从室内看到室外。
+    campus.visible = false
+    rainField?.setVisible(false)
+    loadedBuildingModels.forEach(model => { model.visible = false })
+    scene.background = new THREE.Color('#d9d4c5')
+    scene.fog = new THREE.Fog('#d9d4c5', 38, 95)
+    // 进入时直接落在一楼走廊内，以第一人称观察教室和家具，不再从建筑外部看剖面。
+    cameraRig.setMode('firstPerson')
+    input.setMode('firstPerson')
+    buildIndoorFloor(definition.floors[0].level)
+    // 楼层生成器已将建筑外门映射为室内门洞；直接使用同一门洞计算出的出生点。
+    const firstFloor = definition.floors.find(floor => floor.level === currentIndoorFloor)
+    const entranceLanding = firstFloor?.spawnPoint
+    if (entranceLanding) {
+      cameraRig.player.set(
+        entranceLanding.x,
+        indoorGroup.position.y + (entranceLanding.y ?? 1.7),
+        entranceLanding.z,
+      )
+      if (cameraRig.mode === 'firstPerson') cameraRig.updateFirstPersonDesired()
+      else cameraRig.updateThirdPersonDesired()
+    }
+    cameraRig.thirdDistance = 8
+    cameraRig.updateThirdPersonDesired()
+    requestFrame()
+    return true
+  }
+
+  function syncOutdoorBuildingFootprint(definition) {
+    if (!indoorOutdoorTarget || !indoorOutdoorBase || !definition?.footprintSize) return false
+    const width = Number(definition.footprintSize.width)
+    const depth = Number(definition.footprintSize.depth)
+    if (!Number.isFinite(width) || !Number.isFinite(depth) || width <= 0 || depth <= 0) return false
+    const target = indoorOutdoorTarget
+    const rootScale = target.scale
+    if (Math.abs(rootScale.x) < 1e-6 || Math.abs(rootScale.y) < 1e-6 || Math.abs(rootScale.z) < 1e-6) return false
+    const localWidth = width / Math.abs(rootScale.x)
+    const localDepth = depth / Math.abs(rootScale.z)
+    const expansion = definition.footprint?.expansion || {}
+    const shiftX = (Number(expansion.east) - Number(expansion.west)) / 2
+    const shiftZ = (Number(expansion.south) - Number(expansion.north)) / 2
+    const scaledPolygon = definition.footprint?.polygon
+    const polygon = Array.isArray(scaledPolygon)
+      ? scaledPolygon.map(point => ({ x: point.x / rootScale.x, z: point.z / rootScale.z }))
+      : scaledPolygon
+    const rebuildOptions = target.userData?.rebuildOptions
+
+    // 对程序化校园建筑按真实多边形重新生成建筑实体，不再用 scale 把矩形模型硬拉伸。
+    if (rebuildOptions && Array.isArray(polygon) && polygon.length >= 3) {
+      const localFloorHeight = Number(definition.floorHeight) / Math.abs(rootScale.y)
+      const geometryKey = JSON.stringify({
+        polygon, width: localWidth, depth: localDepth,
+        height: localFloorHeight * definition.floors.length,
+        floors: definition.floors.length,
+        roofStyle: definition.exterior?.roofStyle || rebuildOptions.roofStyle || 'flat',
+      })
+      if (indoorOutdoorBase.geometryKey !== geometryKey) {
+      const shape = new THREE.Shape()
+      shape.moveTo(polygon[0].x, -polygon[0].z)
+      polygon.slice(1).forEach(point => shape.lineTo(point.x, -point.z))
+      shape.closePath()
+      const rebuilt = createPixelBuilding(THREE, {
+        ...rebuildOptions,
+        footprint: shape,
+        width: localWidth,
+        depth: localDepth,
+        height: localFloorHeight * definition.floors.length,
+        floors: definition.floors.length,
+        roofStyle: definition.exterior?.roofStyle || rebuildOptions.roofStyle || 'flat',
+        label: rebuildOptions.label || target.name,
+      })
+      const foundation = target.userData.foundationMesh
+      target.children.slice().forEach(child => {
+        if (child === foundation) return
+        child.traverse?.(object => {
+          object.geometry?.dispose?.()
+        })
+        target.remove(child)
+      })
+      rebuilt.position.y = Number(target.userData.generatedBuildingBaseY || 0)
+      target.add(rebuilt)
+      target.userData.generatedBuildingShell = rebuilt
+      for (const key of ['floorCount', 'floorHeight', 'buildingHeight', 'roofStyle', 'entrance']) {
+        if (rebuilt.userData[key] !== undefined) target.userData[key] = rebuilt.userData[key]
+      }
+
+      // 基座使用同一轮廓挤出，避免扩建后出现矩形底座露边。
+      if (foundation) {
+        foundation.geometry?.dispose?.()
+        const foundationIsLocal = foundation.parent === target
+        const foundationDepth = foundationIsLocal ? 0.55 : 0.16
+        const foundationGeometry = new THREE.ExtrudeGeometry(shape, { depth: foundationDepth, bevelEnabled: false, curveSegments: 1 })
+        foundationGeometry.rotateX(-Math.PI / 2)
+        foundation.geometry = foundationGeometry
+        foundation.userData.generatedFoundationIsLocal = foundationIsLocal
+      }
+      indoorOutdoorBase.geometryKey = geometryKey
+      }
+      target.scale.copy(indoorOutdoorBase.scale)
+      const worldShift = new THREE.Vector3(shiftX, 0, shiftZ).applyQuaternion(target.quaternion)
+      target.position.copy(indoorOutdoorBase.position).add(worldShift)
+      if (target.userData.foundationMesh) {
+        const foundation = target.userData.foundationMesh
+        if (foundation.parent === target) {
+          // RPG 样板的基座是建筑组子对象，保持局部坐标。
+          foundation.position.set(0, 0.18, 0)
+        } else {
+          // 常规校园建筑的基座挂在 campus 根节点下，使用建筑世界平面坐标。
+          foundation.position.set(target.position.x, 0, target.position.z)
+        }
+      }
+    } else {
+      // 非程序化模型（含 RPG 样板手工建筑）暂保留原有包围盒缩放路径。
+      indoorOutdoorTarget.scale.x = indoorOutdoorBase.scale.x * localWidth / indoorOutdoorBase.width
+      indoorOutdoorTarget.scale.z = indoorOutdoorBase.scale.z * localDepth / indoorOutdoorBase.depth
+      const worldShift = new THREE.Vector3(shiftX, 0, shiftZ).applyQuaternion(indoorOutdoorTarget.quaternion)
+      indoorOutdoorTarget.position.copy(indoorOutdoorBase.position).add(worldShift)
+    }
+    indoorOutdoorTarget.updateMatrixWorld(true)
+
+    // 室外碰撞体与重建后的建筑轮廓同步；样板楼保留入口缺口，不能用整栋多边形封死门洞。
+    if (Number.isInteger(indoorOutdoorBase.collisionStart) && indoorOutdoorBase.collisionCount > 0 && outdoorCollisionWorld && rebuildOptions && Array.isArray(polygon) && polygon.length >= 3) {
+      const worldPolygon = polygon.map(point => {
+        const worldPoint = indoorOutdoorTarget.localToWorld(new THREE.Vector3(point.x, 0, point.z))
+        return { x: worldPoint.x, z: worldPoint.z }
+      })
+      const wallThickness = 0.28
+      const entranceEdgeIndex = Number(rebuildOptions?.entranceEdgeIndex ?? 0)
+      const entranceGapHalf = Math.max(0.85, (Number(rebuildOptions?.doorWidth || indoorOutdoorTarget.userData?.entrance?.width || 1.35) + 0.18) / 2)
+      const wallObstacles = []
+      const appendWallSegment = (start, end) => {
+        const dx = end.x - start.x, dz = end.z - start.z
+        const length = Math.hypot(dx, dz)
+        if (length < 0.15) return
+        const nx = -dz / length * wallThickness / 2
+        const nz = dx / length * wallThickness / 2
+        const corners = [
+          [start.x + nx, start.z + nz], [end.x + nx, end.z + nz],
+          [end.x - nx, end.z - nz], [start.x - nx, start.z - nz],
+        ]
+        const xs = corners.map(point => point[0]), zs = corners.map(point => point[1])
+        wallObstacles.push({
+          polygon: corners.map(([x, z]) => ({ x, z })),
+          holes: [],
+          minX: Math.min(...xs), maxX: Math.max(...xs),
+          minZ: Math.min(...zs), maxZ: Math.max(...zs),
+        })
+      }
+      worldPolygon.forEach((start, index) => {
+        const end = worldPolygon[(index + 1) % worldPolygon.length]
+        if (index === entranceEdgeIndex) {
+          const dx = end.x - start.x, dz = end.z - start.z
+          const length = Math.hypot(dx, dz)
+          const halfGap = Math.min(entranceGapHalf, length * 0.35)
+          const middle = { x: (start.x + end.x) / 2, z: (start.z + end.z) / 2 }
+          const before = { x: middle.x - dx / length * halfGap, z: middle.z - dz / length * halfGap }
+          const after = { x: middle.x + dx / length * halfGap, z: middle.z + dz / length * halfGap }
+          appendWallSegment(start, before)
+          appendWallSegment(after, end)
+        } else appendWallSegment(start, end)
+      })
+      const previousCollisionCount = indoorOutdoorBase.collisionCount
+      outdoorCollisionWorld.obstacles.splice(
+        indoorOutdoorBase.collisionStart,
+        previousCollisionCount,
+        ...wallObstacles,
+      )
+      const collisionCountDelta = wallObstacles.length - previousCollisionCount
+      if (collisionCountDelta) {
+        campus?.traverse(object => {
+          if (!Number.isInteger(object.userData?.collisionObstacleStart) ||
+              object === indoorOutdoorTarget ||
+              object.userData.collisionObstacleStart <= indoorOutdoorBase.collisionStart) return
+          object.userData.collisionObstacleStart += collisionCountDelta
+          const baseline = outdoorBuildingBaselines.get(object)
+          if (baseline && Number.isInteger(baseline.collisionStart)) baseline.collisionStart += collisionCountDelta
+        })
+      }
+      indoorOutdoorTarget.userData.collisionObstacleCount = wallObstacles.length
+      indoorOutdoorBase.collisionCount = wallObstacles.length
+      const baseline = outdoorBuildingBaselines.get(indoorOutdoorTarget)
+      if (baseline) baseline.collisionCount = wallObstacles.length
+      // 入口交互点跟随配置的入口边移动，避免扩建或拖动轮廓后仍提示旧门洞位置。
+      const entranceIndex = Math.max(0, Math.min(worldPolygon.length - 1, Number(rebuildOptions?.entranceEdgeIndex || 0)))
+      const entranceStart = worldPolygon[entranceIndex]
+      const entranceEnd = worldPolygon[(entranceIndex + 1) % worldPolygon.length]
+      const center = worldPolygon.reduce((sum, point) => ({ x: sum.x + point.x / worldPolygon.length, z: sum.z + point.z / worldPolygon.length }), { x: 0, z: 0 })
+      const middle = { x: (entranceStart.x + entranceEnd.x) / 2, z: (entranceStart.z + entranceEnd.z) / 2 }
+      const outwardLength = Math.hypot(middle.x - center.x, middle.z - center.z) || 1
+      // 入口交互点存为建筑局部坐标；旋转、缩放后仍可正确反算到世界位置。
+      const worldEntrance = new THREE.Vector3(
+        middle.x + (middle.x - center.x) / outwardLength * 1.15,
+        indoorOutdoorTarget.position.y,
+        middle.z + (middle.z - center.z) / outwardLength * 1.15,
+      )
+      const localEntrance = indoorOutdoorTarget.worldToLocal(worldEntrance)
+      indoorOutdoorTarget.userData.indoorEntrance = {
+        x: localEntrance.x,
+        z: localEntrance.z,
+        radius: 2.15,
+      }
+    } else if (indoorOutdoorBase.collisionIndex >= 0 && outdoorCollisionWorld?.obstacles[indoorOutdoorBase.collisionIndex]) {
+      if (rebuildOptions && Array.isArray(polygon) && polygon.length >= 3) {
+        const worldPolygon = polygon.map(point => {
+          const worldPoint = indoorOutdoorTarget.localToWorld(new THREE.Vector3(point.x, 0, point.z))
+          return { x: worldPoint.x, z: worldPoint.z }
+        })
+        const xs = worldPolygon.map(point => point.x)
+        const zs = worldPolygon.map(point => point.z)
+        outdoorCollisionWorld.obstacles[indoorOutdoorBase.collisionIndex] = {
+          polygon: worldPolygon,
+          holes: [],
+          minX: Math.min(...xs), maxX: Math.max(...xs),
+          minZ: Math.min(...zs), maxZ: Math.max(...zs),
+        }
+      } else {
+        const bounds = new THREE.Box3().setFromObject(indoorOutdoorTarget)
+        outdoorCollisionWorld.obstacles[indoorOutdoorBase.collisionIndex] = {
+          minX: bounds.min.x, maxX: bounds.max.x,
+          minZ: bounds.min.z, maxZ: bounds.max.z,
+        }
+      }
+    }
+    cameraRig?.setObstructionObjects([
+      ...(() => { const roots = []; campus?.traverse(object => { if (object.userData?.buildingId || object.userData?.objectType === 'building') roots.push(object) }); return roots })(),
+      ...loadedBuildingModels,
+    ])
+    return true
+  }
+
+  function enterIndoorBuilding(buildingId, options = {}) {
+    if (!campus || !buildingId || indoorGroup) return false
+    const target = campus.getObjectByName(String(buildingId)) || campus.children.find(object =>
+      String(object.userData?.buildingId || object.userData?.featureId || object.userData?.sceneObjectId || '') === String(buildingId))
+    if (!target) return false
+    let baseline = outdoorBuildingBaselines.get(target)
+    if (!baseline) {
+      const originalBounds = new THREE.Box3().setFromObject(target)
+      baseline = {
+        width: originalBounds.max.x - originalBounds.min.x,
+        depth: originalBounds.max.z - originalBounds.min.z,
+        bounds: { minX: originalBounds.min.x, maxX: originalBounds.max.x, minZ: originalBounds.min.z, maxZ: originalBounds.max.z },
+        position: target.position.clone(),
+        scale: target.scale.clone(),
+        collisionStart: target.userData?.collisionObstacleStart,
+        collisionCount: target.userData?.collisionObstacleCount,
+      }
+      outdoorBuildingBaselines.set(target, baseline)
+    }
+    target.position.copy(baseline.position)
+    target.scale.copy(baseline.scale)
+    target.updateMatrixWorld(true)
+    // 室内尺寸使用建筑自身局部坐标计算，避免旋转建筑的世界 AABB 被放大。
+    const localBounds = getObjectLocalBounds(THREE, target)
+    const bounds = new THREE.Box3().setFromObject(target)
+    indoorOutdoorTarget = target
+    if (!Number.isInteger(baseline.collisionIndex)) {
+      baseline.collisionIndex = outdoorCollisionWorld?.obstacles.findIndex(obstacle =>
+        !obstacle.circle && !obstacle.polygon &&
+        Math.abs(obstacle.minX - baseline.bounds.minX) < 0.001 &&
+        Math.abs(obstacle.maxX - baseline.bounds.maxX) < 0.001 &&
+        Math.abs(obstacle.minZ - baseline.bounds.minZ) < 0.001 &&
+        Math.abs(obstacle.maxZ - baseline.bounds.maxZ) < 0.001) ?? -1
+    }
+    const collisionIndex = baseline.collisionIndex
+    indoorOutdoorBase = {
+      width: baseline.width,
+      depth: baseline.depth,
+      bounds: baseline.bounds,
+      collisionIndex,
+      collisionStart: baseline.collisionStart,
+      collisionCount: baseline.collisionCount,
+      position: baseline.position.clone(),
+      scale: baseline.scale.clone(),
+    }
+    const localEntrancePoint = options.entrancePoint || target.userData?.indoorEntrance || null
+    const transformedFootprint = transformIndoorFootprint({
+      minX: localBounds.min.x, maxX: localBounds.max.x,
+      minZ: localBounds.min.z, maxZ: localBounds.max.z,
+    }, target.scale, localEntrancePoint)
+    const rebuildOptions = target.userData?.rebuildOptions
+    const entranceEdgeIndex = Number(rebuildOptions?.entranceEdgeIndex ?? 0)
+    const entranceEdgeStart = localBounds.isEmpty() ? null : (() => {
+      const points = [
+        { x: localBounds.min.x, z: localBounds.min.z },
+        { x: localBounds.max.x, z: localBounds.min.z },
+        { x: localBounds.max.x, z: localBounds.max.z },
+        { x: localBounds.min.x, z: localBounds.max.z },
+      ]
+      const start = points[entranceEdgeIndex % points.length]
+      const end = points[(entranceEdgeIndex + 1) % points.length]
+      const edgeLength = Math.hypot(end.x - start.x, end.z - start.z) || 1
+      return Math.hypot((end.x - start.x) * target.scale.x, (end.z - start.z) * target.scale.z) / edgeLength
+    })()
+    const footprint = {
+      id: String(buildingId),
+      name: options.name || target.userData?.name || target.name || '校园建筑',
+      bounds: transformedFootprint.bounds,
+    }
+    // 室内尺寸按建筑根节点缩放同步；室内生成坐标仍以建筑局部中心为原点。
+    const generationOptions = {
+      ...options,
+      floors: options.floors ?? options.floorsData?.length ?? target.userData?.floorCount ?? 1,
+      floorHeight: options.floorHeight ?? (target.userData?.floorHeight ?? 3.6) * Math.abs(target.scale.y),
+      doorWidth: options.doorWidth ?? ((rebuildOptions?.doorWidth || 1.28) * (entranceEdgeStart || Math.abs(target.scale.x))),
+      entrancePoint: transformedFootprint.entrancePoint,
+    }
+    const generated = createIndoorBuildingFromFootprint(footprint, generationOptions)
+    const definition = options.definition || (Array.isArray(options.floorsData) && options.floorsData.length
+      ? { ...generated, floors: options.floorsData, floorHeight: Number(options.floorHeight) || generated.floorHeight }
+      : generated)
+    return enterIndoorPrototype(definition)
+  }
+
+  function getIndoorBuildingDefinition() { return indoorBuilding ? JSON.parse(JSON.stringify(indoorBuilding)) : null }
+
+  function updateIndoorBuildingDefinition(definition) {
+    if (!indoorBuilding || !indoorGroup || !definition || definition.id !== indoorBuilding.id) return false
+    const errors = validateIndoorBuilding(definition)
+    if (errors.length) throw new TypeError(errors.join('；'))
+    syncOutdoorBuildingFootprint(definition)
+    const currentPosition = cameraRig.player.clone()
+    const previousFloor = indoorBuilding.floors.find(item => item.level === currentIndoorFloor)
+    const previousFloorBaseY = previousFloor ? (currentIndoorFloor - 1) * indoorBuilding.floorHeight : 0
+    const playerHeightOffset = currentPosition.y - previousFloorBaseY
+    indoorBuilding = definition
+    const levels = definition.floors.map(item => item.level)
+    const keepsCurrentFloor = levels.includes(currentIndoorFloor)
+    const nextLevel = keepsCurrentFloor ? currentIndoorFloor : levels[0]
+    const nextFloor = definition.floors.find(item => item.level === nextLevel)
+    const transitionPosition = keepsCurrentFloor
+      ? { x: currentPosition.x, z: currentPosition.z }
+      : { x: nextFloor.spawnPoint.x, z: nextFloor.spawnPoint.z }
+    buildIndoorFloor(nextLevel, transitionPosition)
+    // 楼层编辑可能改变层高或删除当前楼层；保留玩家相对楼板的高度，而不是沿用旧世界 Y 坐标。
+    const nextFloorBaseY = (nextLevel - 1) * definition.floorHeight
+    const nextHeightOffset = keepsCurrentFloor
+      ? Math.max(0.5, Math.min(definition.floorHeight - 0.25, playerHeightOffset))
+      : nextFloor.spawnPoint.y
+    cameraRig.player.y = nextFloorBaseY + nextHeightOffset
+    cameraRig.updateThirdPersonDesired()
+    callbacks.onIndoorStateChange?.({ active: true, floor: currentIndoorFloor, floors: levels, buildingId: indoorBuilding.id, buildingName: indoorBuilding.name, prototype: true, nearStairs: false, nearRoom: null, activeRoom: null })
+    requestFrame()
+    return true
+  }
+
+  function switchIndoorFloor(level) {
+    if (!indoorGroup || !indoorBuilding || !Number.isInteger(level) || level === currentIndoorFloor || stairTransition) return false
+    const transitionPosition = { x: cameraRig.player.x, z: cameraRig.player.z }
+    return buildIndoorFloor(level, transitionPosition)
+  }
+
+  function beginStairTransition(targetLevel) {
+    if (stairTransition || !indoorBuilding || !indoorGroup) return false
+    const target = indoorBuilding.floors.find(floor => floor.level === targetLevel)
+    if (!target) return false
+    const direction = Math.sign(targetLevel - currentIndoorFloor)
+    if (!direction) return false
+    const traversal = getStairTraversalPoints(indoorGroup.userData.stairPath, direction)
+    if (!traversal) return false
+    if (!isAtStairLanding(cameraRig.player, traversal.entry)) return false
+    const fromY = cameraRig.player.y
+    const horizontalDistance = Math.hypot(traversal.exit.x - traversal.entry.x, traversal.exit.z - traversal.entry.z)
+    const travelDistance = Math.hypot(horizontalDistance, indoorBuilding.floorHeight)
+    stairTransition = {
+      targetLevel,
+      fromX: traversal.entry.x,
+      toX: traversal.exit.x,
+      fromZ: traversal.entry.z,
+      toZ: traversal.exit.z,
+      fromY,
+      direction,
+      elapsed: 0, duration: Math.max(0.8, travelDistance / 5.5),
+    }
+    input.setMovementEnabled(false)
+    return true
+  }
+
+  function updateStairTransition(delta) {
+    if (!stairTransition) return
+    const transition = stairTransition
+    transition.elapsed = Math.min(transition.duration, transition.elapsed + delta)
+    const progress = transition.elapsed / transition.duration
+    // 楼梯几何为等高阶梯，按恒定进度沿楼梯轴线移动，避免缓入缓出造成悬浮感。
+    cameraRig.player.x = transition.fromX + (transition.toX - transition.fromX) * progress
+    const steppedRise = getStairStepHeight(progress, indoorBuilding.floorHeight)
+    cameraRig.player.y = transition.fromY + transition.direction * steppedRise
+    cameraRig.player.z = transition.fromZ + (transition.toZ - transition.fromZ) * progress
+    if (cameraRig.mode === 'firstPerson') cameraRig.updateFirstPersonDesired()
+    else cameraRig.updateThirdPersonDesired()
+    if (progress >= 1) {
+      stairTransition = null
+      buildIndoorFloor(transition.targetLevel, { x: transition.toX, z: transition.toZ })
+      input.setMovementEnabled(true)
+      if (pendingIndoorFloorTarget === currentIndoorFloor) pendingIndoorFloorTarget = null
+      else if (pendingIndoorFloorTarget !== null && indoorGroup?.userData.stairPoint) {
+        const nextPlan = planIndoorFloorRoute(indoorBuilding, currentIndoorFloor, pendingIndoorFloorTarget)
+        const nextTraversal = getStairTraversalPoints(indoorGroup.userData.stairPath, nextPlan?.transitions?.[0]?.direction)
+        if (nextTraversal) navigateIndoorTo(nextTraversal.entry)
+        else pendingIndoorFloorTarget = null
+      }
+    }
+  }
+
+  function exitIndoorPrototype() {
+    input?.setNavigationPath(null)
+    navigationWasActive = false
+    clearNavigationVisuals()
+    if (!indoorGroup || !outdoorState) return false
+    scene.remove(indoorGroup)
+    disposeObjectGroup(indoorGroup)
+    invalidateShadowMap()
+    indoorGroup = null
+    stairInteractionActive = false
+    nearIndoorRoom = null
+    nearIndoorExit = false
+    indoorPromptKey = ''
+    callbacks.onIndoorPromptChange?.({ visible: false })
+    activeIndoorRoom = null
+    roomReturnPosition = null
+    pendingRoomTransition = null
+    stairTransition = null
+    pendingIndoorFloorTarget = null
+    input.setMovementEnabled(true)
+    indoorBuilding = null
+    indoorOutdoorTarget = null
+    indoorOutdoorBase = null
+    currentIndoorFloor = null
+    campus.visible = outdoorState.visible
+    rainField?.setVisible(environmentConfig.weather === 'rain')
+    for (const item of outdoorState.loadedModelVisibility || []) item.model.visible = item.visible
+    scene.background = outdoorState.background
+    scene.fog = outdoorState.fog
+    nearOutdoorEntrance = false
+    nearOutdoorBuildingId = null
+    lastEntranceCheckPosition = null
+    callbacks.onIndoorPromptChange?.({ visible: false })
+    collisionWorld = outdoorState.collisionWorld
+    input.collisionWorld = collisionWorld
+    cameraRig.player.copy(outdoorState.player)
+    cameraRig.setMode(outdoorState.mode === 'overview' ? 'thirdPerson' : outdoorState.mode)
+    input.setMode(cameraRig.mode)
+    cameraRig.updateThirdPersonDesired()
+    outdoorState = null
+    callbacks.onIndoorStateChange?.({ active: false })
+    requestFrame()
+    return true
+  }
+
+  function setVirtualKey(key, pressed) {
+    input?.setVirtualKey(key, pressed)
+  }
+
+  async function loadPlayerCharacter(url, metadata = {}) {
+    if (!isBlankSandbox || !playerCharacterRuntime) throw new Error('当前场景不支持替换角色模型')
+    const sourceUrl = String(url || '').trim()
+    if (!sourceUrl) throw new TypeError('角色模型地址不能为空')
+    const gltf = await new GLTFLoader().loadAsync(sourceUrl)
+    if (disposed) {
+      disposeObjectGroup(gltf.scene)
+      return false
+    }
+    const result = playerCharacterRuntime.setModel(gltf.scene, gltf.animations || [], {
+      ...metadata,
+      sourceUrl,
+      assetId: metadata.assetId || sourceUrl,
+    })
+    input?.setPlayerDimensions?.(result.dimensions)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onPlayerCharacterChange?.(result)
+    return result
+  }
+
+  function setPlayerCharacterModel(model, animations = [], metadata = {}) {
+    if (!isBlankSandbox || !playerCharacterRuntime) throw new Error('当前场景不支持替换角色模型')
+    const result = playerCharacterRuntime.setModel(model, animations, metadata)
+    // 外部模型接管后清空预设标记；预设装配函数会在调用后重新写回。
+    playerCharacterPresetId = null
+    playerCharacterTargetHeight = result.dimensions?.height || playerCharacterTargetHeight
+    input?.setPlayerDimensions?.(result.dimensions)
+    invalidateShadowMap()
+    requestFrame()
+    callbacks.onPlayerCharacterChange?.(result)
+    return result
+  }
+
+  // 内置人物预设：与默认角色同一套人形结构与走跳动作，只换外观配色与性别体型。
+  function setPlayerCharacterPreset(presetId, options = {}) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    const preset = getPlayerPreset(presetId)
+    if (!preset) return null
+    const gender = options.gender === 'female' || options.gender === 'male'
+      ? options.gender
+      : (preset.gender || 'male')
+    const model = createPlayerPresetModel(THREE, presetId, { gender })
+    if (!model) return null
+    const height = Math.max(1.4, Math.min(2.6, Number(preset.height) || 1.8))
+    const result = setPlayerCharacterModel(model, [], {
+      assetId: 'preset:' + presetId,
+      targetHeight: height,
+      source: 'preset',
+    })
+    playerCharacterPresetId = presetId
+    playerCharacterTargetHeight = height
+    playerCharacterGender = gender
+    return result
+  }
+
+  // 性别切换：仅在当前为内置人物预设时重建；外部生成角色不改变外观。
+  function setPlayerCharacterGender(gender) {
+    if (!playerCharacterPresetId) return null
+    const presetId = playerCharacterPresetId
+    return setPlayerCharacterPreset(presetId, { gender })
+  }
+
+  // 人物微调：统一按目标身高重新装配（预设重建 / 外部角色按原始快照重挂）。
+  function setPlayerCharacterHeight(height) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    const target = Math.max(1.4, Math.min(2.6, Number(height)))
+    if (!Number.isFinite(target)) return null
+    if (playerCharacterPresetId) {
+      const presetId = playerCharacterPresetId
+      if (!getPlayerPreset(presetId)) return null
+      const model = createPlayerPresetModel(THREE, presetId)
+      if (!model) return null
+      const result = setPlayerCharacterModel(model, [], {
+        assetId: 'preset:' + presetId,
+        targetHeight: target,
+        source: 'preset',
+      })
+      playerCharacterPresetId = presetId
+      playerCharacterTargetHeight = target
+      return result
+    }
+    const snapshot = playerCharacterRuntime.serialize?.()
+    if (!snapshot) return null
+    const result = restorePlayerCharacterFromSnapshot({ ...snapshot, targetHeight: target })
+    if (result) playerCharacterTargetHeight = target
+    return result
+  }
+
+  function getPlayerCharacterPresetState() {
+    return {
+      presetId: playerCharacterPresetId,
+      targetHeight: playerCharacterTargetHeight,
+      gender: playerCharacterGender,
+    }
+  }
+
+  function setPlayerCharacterAnimation(state) {
+    const changed = playerCharacterRuntime?.setAnimationState(state) || false
+    if (changed) requestFrame()
+    return changed
+  }
+
+  function restorePlayerCharacterFallback() {
+    const restored = playerCharacterRuntime?.restoreFallback() || false
+    if (restored) {
+      playerCharacterPresetId = null
+      playerCharacterTargetHeight = 2.25
+      input?.setPlayerDimensions?.(playerCharacterRuntime.getInfo().dimensions)
+      invalidateShadowMap()
+      requestFrame()
+      callbacks.onPlayerCharacterChange?.(playerCharacterRuntime.getInfo())
+    }
+    return restored
+  }
+
+  // 角色存档：导出当前外部角色（默认角色返回 null），供沙盒快照持久化。
+  function serializePlayerCharacter() {
+    if (!isBlankSandbox) return null
+    return playerCharacterRuntime?.serialize?.() || null
+  }
+
+  // 从存档恢复外部角色：用 ObjectLoader 还原原始模型后按标准流程重挂。
+  function restorePlayerCharacterFromSnapshot(payload) {
+    if (!isBlankSandbox || !playerCharacterRuntime) return null
+    if (!payload?.object) return null
+    const model = new THREE.ObjectLoader().parse(payload.object)
+    return setPlayerCharacterModel(model, [], {
+      assetId: payload.assetId || 'snapshot-character',
+      targetHeight: payload.targetHeight || 2.25,
+      source: payload.source || 'snapshot',
+      prompt: payload.prompt || null,
+    })
+  }
+
+  function getPlayerCharacterInfo() {
+    return playerCharacterRuntime?.getInfo() || null
   }
 
   function setMode(mode) {
-    cameraRig?.setMode(mode)
-    input?.setMode(mode)
+    // 沙盒自由视角与首页近景跟随视角并存；thirdPerson 不再被强制归一化为 overview。
+    const nextMode = mode
+    cameraRig?.setMode(nextMode)
+    if (isBlankSandbox && nextMode === 'overview') focusSandboxOverview()
+    if (sandboxTransform && cameraRig?.camera) sandboxTransform.camera = cameraRig.camera
+    input?.setMode(nextMode)
+    input?.setMovementEnabled(chunkManagementActive ? false : (isBlankSandbox || nextMode !== 'overview'))
+    syncRenderQuality()
+    requestFrame()
+    if (nextMode !== 'overview' && !editorPreviewActive) void ensureCampusBuildingModelsLoaded()
+    loadedBuildingModels.forEach((model) => { model.visible = shouldShowBuildingModels() })
   }
 
-  function focusCampus() {
-    cameraRig?.focusCampus()
-    input?.resetPosition()
+  function setViewMode(mode) {
+    if (isBlankSandbox && !['free', '2.5d', '3d'].includes(mode)) return false
+    if (!isBlankSandbox && !['2.5d', '3d'].includes(mode)) return false
+    cameraRig?.setViewMode(mode)
+    if (isBlankSandbox) {
+      // 自由视角保持独立观察；2.5D/3D 复用首页第三人称近景跟随镜头。
+      setMode(mode === 'free' ? 'overview' : 'thirdPerson')
+    }
+    if (sandboxTransform && cameraRig?.camera) sandboxTransform.camera = cameraRig.camera
+    syncRenderQuality()
+    requestFrame()
+    if (mode === '3d' && !editorPreviewActive) void ensureCampusBuildingModelsLoaded()
+    loadedBuildingModels.forEach((model) => { model.visible = shouldShowBuildingModels() })
+    return true
+  }
+
+  function resetView() {
+    const spawn = isRpgSample ? campus?.userData.playerSpawn : mapPixelToWorld(...CAMPUS_PLAYER_SPAWN_PIXEL)
+    input?.resetPosition(spawn || { x: 0, z: 14 })
+
+    if (cameraRig?.mode === 'overview') {
+      // 总览只重置当前投影下的取景，不切换相机模式；优先按实际校园内容包络居中。
+      const bounds = isBlankSandbox
+        ? campus?.userData.sampleBounds
+        : campus?.userData.contentBounds
+      if (bounds) {
+        cameraRig.focusBounds(bounds.width, bounds.depth, bounds.centerX, bounds.centerZ)
+      } else {
+        cameraRig.focusBounds(160, 120)
+      }
+    } else if (cameraRig?.mode === 'firstPerson') {
+      // 第一人称保留当前模式和朝向，只将角色位置恢复到默认出生点。
+      cameraRig.updateFirstPersonDesired()
+    } else if (cameraRig?.mode === 'thirdPerson') {
+      // 跟随模式保留当前投影和跟随镜头参数，仅重置角色位置。
+      cameraRig.updateThirdPersonDesired()
+    }
+    requestFrame()
   }
 
   function dispose() {
+    disposed = true
     cancelAnimationFrame(frameId)
+    longTaskObserver?.disconnect()
+    longTaskObserver = null
+    disposeGpuTimerDiagnostics()
     resizeObserver?.disconnect()
     window.removeEventListener('keydown', onKeyDown)
+    sandboxRoadEditor?.dispose()
+    sandboxRoadEditor = null
+    cancelSandboxRoadDrawing()
+    cancelSandboxFootprintDrawing()
+    clearSandboxExpandMarkers()
+    renderer?.domElement?.removeEventListener('pointerdown', onScenePointerDown)
+    renderer?.domElement?.removeEventListener('pointerup', onScenePointerUp)
+    renderer?.domElement?.removeEventListener('pointerup', requestFrame)
+    renderer?.domElement?.removeEventListener('pointerdown', requestFrame)
+    renderer?.domElement?.removeEventListener('pointermove', onScenePointerMove)
+    renderer?.domElement?.removeEventListener('pointermove', requestFrame)
+    renderer?.domElement?.removeEventListener('wheel', requestFrame)
+    renderer?.domElement?.removeEventListener('pointerdown', onSandboxPlacementPointerDown, true)
+    renderer?.domElement?.removeEventListener('pointermove', onSandboxPlacementPointerMove, true)
+    renderer?.domElement?.removeEventListener('pointerdown', onSandboxPointerDown)
+    sandboxTransform?.detach()
+    sandboxTransform?.dispose()
+    sandboxTransform = null
+    clearSandboxSelectionHelper()
+    for (const id of sandboxModels.keys()) removeSandboxModelSpatialRegistration(id)
+    modelAnimationRuntime.dispose()
+    sandboxModels.clear()
+    sandboxSelectedModel = null
+    clearSelection()
+    clearNavigationVisuals()
+    clearRpgPreview()
+    generatedAssets.clear()
+    placementState = null
+    if (sandboxPlacementState) cancelSandboxModelPlacement()
+    clearSandboxPlacementFootprint()
+    activeHorizonGround = null
+    if (indoorGroup) { scene?.remove(indoorGroup); disposeObjectGroup(indoorGroup); indoorGroup = null }
     input?.dispose()
+    physicsRuntime?.dispose()
+    physicsRuntime = null
+    playerCharacterRuntime?.dispose()
+    playerCharacterRuntime = null
+    cameraRig?.dispose()
+    shadowSystem?.dispose()
+    shadowSystem = null
+    skyRuntime?.dispose()
+    skyRuntime = null
+    rainField?.dispose()
+    rainField = null
+    cloudLayer?.dispose()
+    cloudLayer = null
+    snowField?.dispose()
+    snowField = null
     scene?.traverse((object) => {
       object.geometry?.dispose?.()
-      if (Array.isArray(object.material)) object.material.forEach((m) => m.dispose())
-      else object.material?.dispose?.()
+      if (Array.isArray(object.material)) object.material.forEach(disposeMaterial)
+      else disposeMaterial(object.material)
     })
     renderer?.dispose()
     renderer?.domElement?.remove()
     initialized = false
   }
 
-  return { init, setMode, focusCampus, dispose, get initialized() { return initialized } }
+  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, captureSandboxThumbnail, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
 }

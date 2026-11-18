@@ -1,0 +1,24 @@
+name: Frontend CI
+
+on:
+  push:
+    branches: [feat/multi-campus-data-foundation, feat/object-model-protocol-p1, feat/img2threejs-procedural-mvp, feat/world-sandbox-conversational-model-editor, fix/sandbox-character-physics-continuity]
+  pull_request:
+    branches: [main, feat/multi-campus-data-foundation, feat/object-model-protocol-p1, feat/img2threejs-procedural-mvp]
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install dependencies
+        id: install
+        run: npm install
+      - name: Run unit tests
+        if: always() && steps.install.outcome == 'success'
+        run: npm test
+      - name: Build frontend
+        if: always() && steps.install.outcome == 'success'
+        run: npm run build
