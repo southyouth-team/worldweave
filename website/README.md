@@ -6,10 +6,11 @@ Worldweave（织界）的独立静态官网，放在 `website/` 文件夹里，�
 
 ```text
 website/
-  index.html     页面结构
-  styles.css     设计系统、布局、动效与响应式
-  main.js        导航、滚动动效、世界时间、画廊、终端切换
-  assets/        logo、favicon 与产品截图
+  index.html          落地页：真实与想象、世界时间、界面、CTA
+  how-it-works.html   详情页：能力、流程、架构、快速开始、路线图
+  styles.css          设计系统、布局、动效与响应式
+  main.js             导航、倾斜、世界时间、画廊、主题切换
+  assets/             logo、favicon 与产品截图
 ```
 
 ## 本地预览
@@ -60,8 +61,10 @@ location / {
 ## 说明
 
 - 默认亮色主题（产品首页同系的鼠尾草绿 + 玻璃），右上角可切换暗色；选择会写入 `localStorage`。
-- 页面内容和图片按需懒加载：区块使用 `content-visibility: auto`，首屏截图优先加载，其余图片使用 `loading="lazy"`。
+- 图片按需懒加载：首屏截图优先加载，其余产品图和页脚 logo 使用 `loading="lazy"`。
 - 首屏浏览器框会跟随鼠标方向倾斜；世界时间、画廊、快速开始都是可交互的。
+- 品牌叙事：真实或想象，都可以成为一个世界。
+- 两层结构：首页负责“真实或想象”的品牌叙事，`how-it-works.html` 负责地块、道路、Agent 构建循环、架构与路线图等机制内容。
 - 页面字体从 Google Fonts 加载（Space Grotesk、Noto Sans SC、Noto Serif SC）；如果部署环境无法访问 Google Fonts，会回退到系统中文字体，布局仍然可用。若需要完全离线，可把字体文件下载到 `assets/fonts/` 并改成 `@font-face`。
 - 产品截图为 demo 数据，仅用于展示界面。
 - 官网内容与主仓库保持一致；修改项目定位、版本号或链接时，记得同步 `index.html` 和根目录 `README.md`。
