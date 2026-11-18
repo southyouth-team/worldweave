@@ -208,6 +208,7 @@ export function createCampusScene(THREE, featureCollection = null, visualAssets 
   CAMPUS_AREAS.filter(area => area.type === 'sports' && area.rect).forEach(area => addSportsMarkings(area.rect, area.id))
 
   // 重要公共空间使用原创像素字牌标注，帮助玩家建立校园方位感。
+  // 只在空间图层确实包含对应区域时才标注，避免空白/发布沙盒场景残留旧校园地点标注。
   function addPixelLandmarkLabel(name, text, pixelX, pixelY, width = 10) {
     const canvas = document.createElement('canvas')
     canvas.width = 256
@@ -237,10 +238,16 @@ export function createCampusScene(THREE, featureCollection = null, visualAssets 
     sprite.userData.displayName = text
     root.add(sprite)
   }
-  addPixelLandmarkLabel('central-lake', '中央湖区', 545, 222, 10.5)
-  addPixelLandmarkLabel('west-lake', '西侧湖区', 220, 112, 8.5)
-  addPixelLandmarkLabel('north-east-sports', '运动场', 802, 105, 7.5)
-  addPixelLandmarkLabel('south-sports', '运动场', 475, 390, 8.5)
+  const areaIds = new Set(CAMPUS_AREAS.map(area => area.id))
+  const landmarkLabels = [
+    ['central-lake', 'central-lake', '中央湖区', 545, 222, 10.5],
+    ['west-lake', 'west-lake', '西侧湖区', 220, 112, 8.5],
+    ['north-east-sports-field', 'north-east-sports', '运动场', 802, 105, 7.5],
+    ['south-central-sports-field', 'south-sports', '运动场', 475, 390, 8.5],
+  ]
+  for (const [areaId, name, text, pixelX, pixelY, width] of landmarkLabels) {
+    if (areaIds.has(areaId)) addPixelLandmarkLabel(name, text, pixelX, pixelY, width)
+  }
 
   const wallPalette = [mats.wall, mats.wallPeach, mats.wallMint, mats.wallCream]
   function addCampusBuilding(item, index) {

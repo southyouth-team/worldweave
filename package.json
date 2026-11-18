@@ -1,5 +1,5 @@
 {
-  "name": "ncgxy-campus-map",
+  "name": "worldweave",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -19,5 +19,8 @@
     "@vitejs/plugin-vue": "^5.2.1",
     "vite": "^6.0.7",
     "vitest": "^2.1.8"
-  }
+  },
+  "description": "Worldweave（织界）— 源码公开的 AI 三维世界沙盒",
+  "license": "CC-BY-NC-SA-4.0",
+  "author": "Worldweave contributors"
 }

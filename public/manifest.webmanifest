@@ -1,11 +1,20 @@
 {
-  "name": "南昌工学院三维校园",
-  "short_name": "校园地图",
+  "name": "Worldweave · 织界",
+  "short_name": "织界",
+  "description": "源码公开的 AI 三维世界沙盒：等距地块编辑、AI 模型生成、发布审核与团队协作。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
   "orientation": "landscape",
-  "background_color": "#101b20",
-  "theme_color": "#101b20",
-  "lang": "zh-CN"
+  "background_color": "#e8f0ea",
+  "theme_color": "#e8f0ea",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
 }

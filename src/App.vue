@@ -1,25 +1,51 @@
 <script setup>
 import { computed, defineAsyncComponent, onMounted, onBeforeUnmount, ref } from 'vue'
+import * as THREE from 'three'
 import { createCampusEngine } from './three/engine/createCampusEngine.js'
+import { loadGlobalPublishedSnapshot, HOMEPAGE_SNAPSHOT_KEY } from './components/sandbox/homepageSnapshot.js'
+import { applyTextPlates } from './three/sandbox/textPlateRuntime.js'
+import { WEATHER_MODES } from './three/engine/weatherRuntime.js'
+import BrandLogo from './components/BrandLogo.vue'
+import { applyDocumentBranding, loadSiteSettings, siteSettings } from './site/siteSettings.js'
+import { currentUser, isAdmin, loadCurrentUser, logout } from './auth/authStore.js'
 const CampusPlanEditor = defineAsyncComponent(() => import('./editor/CampusPlanEditor.vue'))
 const IndoorFloorPlanEditor = defineAsyncComponent(() => import('./components/IndoorFloorPlanEditor.vue'))
 const BuildingTemplateWorkshop = defineAsyncComponent(() => import('./components/BuildingTemplateWorkshop.vue'))
 const AssetTemplateLab = defineAsyncComponent(() => import('./components/AssetTemplateLab.vue'))
 const WorldSandboxMvp = defineAsyncComponent(() => import('./components/WorldSandboxMvp.vue'))
+const AuthLoginPage = defineAsyncComponent(() => import('./components/AuthLoginPage.vue'))
+const AuthJoinPage = defineAsyncComponent(() => import('./components/AuthJoinPage.vue'))
+const AuthChangePasswordPage = defineAsyncComponent(() => import('./components/AuthChangePasswordPage.vue'))
+const AdminConsolePage = defineAsyncComponent(() => import('./components/AdminConsolePage.vue'))
 const currentRoute = window.location.pathname.replace(/\/+$/, '')
 const isAssetTemplateLabRoute = currentRoute === '/asset-template-lab'
 const isAssetWorkshopRoute = currentRoute === '/asset-workshop'
 const isSandboxRoute = currentRoute === '/sandbox' || currentRoute === '/world-sandbox-mvp'
+const isLoginRoute = currentRoute === '/login'
+const isJoinRoute = currentRoute === '/join'
+const isChangePasswordRoute = currentRoute === '/change-password'
+const isAdminRoute = currentRoute === '/admin'
+const isAuthPageRoute = isLoginRoute || isJoinRoute || isChangePasswordRoute
+// 不同入口共用同一个 index.html，标题和描述随当前页面与站点设置切换。
+applyDocumentBranding()
 const BuildingFootprintEditor = defineAsyncComponent(() => import('./components/BuildingFootprintEditor.vue'))
 import { loadCampusSceneData } from './three/scene/loadCampusSceneData.js'
 import { createSceneDocument } from './three/scene/sceneDocument.js'
-import { CAMPUS_BUILDING_FOOTPRINTS, CAMPUS_PLAN_REFERENCE, mapPixelToWorld } from './data/campus/campusLayout.js'
-import { buildCampusGeoJSON, getCampusSpatialLayers, mergeCampusSceneFeatureCollections } from './data/campus/campusGeoJSON.js'
-import { toCampusFeatureCollection } from './editor/campusFeatureCollection.js'
+import { CAMPUS_BUILDING_FOOTPRINTS } from './data/campus/campusLayout.js'
 import { expandIndoorBuilding } from './three/indoor/indoorBuildingDefinitions.js'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api/v1'
 const DEV_USER_ID = import.meta.env.VITE_DEV_USER_ID || 'map-editor-local'
+
+// 站点品牌配置：先按默认值渲染，再异步读取后端（失败则读本地缓存）并应用标题、meta 与 favicon。
+loadSiteSettings({ apiBase: API_BASE }).catch(error => console.warn('[SiteSettings] 读取站点配置失败', error))
+
+// 路由级访问控制：沙盒需要登录；改密页需要先登录。
+loadCurrentUser().then(user => {
+  const next = encodeURIComponent(currentRoute + window.location.search)
+  if (isSandboxRoute && !user) window.location.replace('/login?next=' + next)
+  if (isChangePasswordRoute && !user) window.location.replace('/login?next=' + next)
+})
 
 const viewport = ref(null)
 const appShell = ref(null)
@@ -39,13 +65,6 @@ const activeIndoorRoom = ref(null)
 const indoorPrompt = ref(null)
 const initialUrlParams = new URLSearchParams(window.location.search)
 const requestedBuildingId = initialUrlParams.get('buildingId')
-const returnPixelX = Number(initialUrlParams.get('returnX'))
-const returnPixelY = Number(initialUrlParams.get('returnY'))
-const returnPixelPosition = initialUrlParams.has('returnX') && initialUrlParams.has('returnY')
-  && Number.isFinite(returnPixelX) && Number.isFinite(returnPixelY)
-  ? { x: returnPixelX, y: returnPixelY }
-  : null
-const returnWorldPosition = returnPixelPosition ? mapPixelToWorld(returnPixelPosition.x, returnPixelPosition.y) : null
 const selectedBuildingId = ref(CAMPUS_BUILDING_FOOTPRINTS.some(item => item.id === requestedBuildingId) ? requestedBuildingId : (CAMPUS_BUILDING_FOOTPRINTS[0]?.id || ''))
 const indoorFloorCount = ref(3)
 const indoorEntryBusy = ref(false)
@@ -59,7 +78,11 @@ const indoorHistoryOpen = ref(false)
 const activeEditableFloor = computed(() => indoorDefinition.value?.floors?.find(floor => floor.level === indoorFloor.value) || null)
 const indoorBuildingId = computed(() => indoorDefinition.value?.id || selectedBuildingId.value)
 const initialView = new URLSearchParams(window.location.search).get('view')
-const isEditorRoute = window.location.pathname.replace(/\/+$/, '') === '/editor' || initialView === 'editor'
+// 旧的地图编辑器路由已废弃：编辑统一走 /world-sandbox-mvp
+if (window.location.pathname.replace(/\/+$/, '') === '/editor' || initialView === 'editor') {
+  window.location.replace('/world-sandbox-mvp')
+}
+const isEditorRoute = false
 const isCampusExplorer = !isEditorRoute
 const showEditor = ref(isEditorRoute)
 const editorViewMode = ref('2d')
@@ -76,8 +99,8 @@ const campusPlanDocument = ref(null)
 let engine
 
 const modes = computed(() => [
-  { id: 'overview', label: '总览', hint: viewMode.value === '2.5d' ? '平移浏览' : '自由观察' },
-  { id: 'thirdPerson', label: '跟随', hint: viewMode.value === '2.5d' ? '固定斜俯视漫游' : '角色漫游' },
+  { id: 'overview', label: '总览', hint: '全景地图' },
+  { id: 'thirdPerson', label: '跟随', hint: '跟随角色' },
   ...(viewMode.value === '3d' ? [{ id: 'firstPerson', label: '第一人称', hint: '沉浸漫游' }] : []),
 ])
 
@@ -336,12 +359,34 @@ function onExplorerHotkey(event) {
   switchMode(activeMode.value === 'firstPerson' ? 'thirdPerson' : 'firstPerson')
 }
 
+async function handleLogout() {
+  await logout()
+  window.location.assign('/login')
+}
+
 function focusCampus() {
   engine?.resetView()
 }
 
 function openAssetWorkshop() {
   window.location.assign('/asset-workshop')
+}
+
+// 首页的「编辑世界」入口：统一进入世界沙盒（旧地图编辑器已废弃）。
+function openSandboxEditor() {
+  window.location.assign('/world-sandbox-mvp')
+}
+
+// 首页基本信息：发布世界的模型数、地块数与发布时间。
+const publishedInfo = ref(null)
+const helpOpen = ref(false)
+
+function formatPublishedAt(value) {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('zh-CN', {
+    year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  })
 }
 
 function openBuildingFromPixelMap(payload) {
@@ -400,8 +445,7 @@ async function closeEditor() {
 }
 
 function toggleHelp() {
-  const panel = document.querySelector('.help-panel')
-  panel?.classList.toggle('is-visible')
+  helpOpen.value = !helpOpen.value
 }
 
 async function loadHomepagePlanDocument() {
@@ -433,44 +477,12 @@ async function loadHomepagePlanDocument() {
   }
 }
 
-function getShowcasePlanDocument() {
-  if (campusPlanDocument.value?.coordinateSystem === 'campus-plan-pixel') {
-    return campusPlanDocument.value
-  }
-  // 尚未保存过编辑文档时，直接把当前平面底图的统一空间图层转换成预览文档。
-  // 这样 2.5D 至少能完整展示现有建筑、道路和区域，而不是继续显示独立样板地图。
-  const layers = getCampusSpatialLayers()
-  const bounds = CAMPUS_PLAN_REFERENCE.mapBounds
-  return {
-    schemaVersion: 2,
-    coordinateSystem: 'campus-plan-pixel',
-    units: 'pixel',
-    workspaceBounds: {
-      minX: bounds.left,
-      minY: bounds.top,
-      maxX: bounds.right,
-      maxY: bounds.bottom,
-    },
-    areas: layers.areas,
-    roads: layers.roads,
-    buildings: layers.buildings.map(building => ({
-      ...building,
-      footprint: building.polygon,
-    })),
-  }
-}
-
 async function handleBrowserNavigation() {
   const route = window.location.pathname.replace(/\/+$/, '') || '/'
   const queryView = new URLSearchParams(window.location.search).get('view')
-  const nextIsEditor = route === '/editor' || queryView === 'editor'
-  if (nextIsEditor === showEditor.value) return
-
-  if (nextIsEditor) {
-    showEditor.value = true
-    editorViewMode.value = '2d'
-    engine?.exitIndoorPrototype()
-    engine?.clearRpgPreview()
+  // 旧地图编辑器已废弃，浏览历史回到 /editor 时同样转到世界沙盒
+  if (route === '/editor' || queryView === 'editor') {
+    window.location.replace('/world-sandbox-mvp')
     return
   }
 
@@ -485,6 +497,49 @@ async function handleBrowserNavigation() {
   engine?.setMode('overview')
 }
 
+// 首页环境：沿用沙盒发布的环境参数（时间、天气、风力、人工照明）
+function applyPublishedSandboxEnvironment(snapshot) {
+  if (!engine || !snapshot?.environment) return
+  const environment = snapshot.environment
+  const weather = String(environment.weather || 'clear')
+  const intensity = Number(environment.weatherIntensity)
+  const wind = Number(environment.wind)
+  engine.setEnvironment?.({
+    time: Number.isFinite(Number(environment.time)) ? Number(environment.time) : 14,
+    weather: environment.weatherEnabled !== false && weather === 'rain' ? 'rain' : 'clear',
+    wind: environment.windEnabled === false ? 0 : (Number.isFinite(wind) ? Math.min(1, Math.max(0, wind / 100)) : 0.2),
+    windDirection: environment.windDirection,
+    artificialLightingEnabled: environment.artificialLightingEnabled !== false,
+  })
+  const weatherMode = Object.prototype.hasOwnProperty.call(WEATHER_MODES, weather) ? weather : 'clear'
+  engine.setWeatherMode?.(weatherMode, Number.isFinite(intensity) ? Math.min(1, Math.max(0, intensity / 100)) : 0.5)
+}
+
+// 首页发布数据：把沙盒发布快照里的模型恢复到首页场景（只换内容，不动首页交互与相机）
+function restorePublishedSandboxModels(snapshot) {
+  if (!engine || !Array.isArray(snapshot?.models)) return 0
+  const loader = new THREE.ObjectLoader()
+  let restored = 0
+  for (const item of snapshot.models) {
+    try {
+      if (!item?.object) continue
+      const model = loader.parse(item.object)
+      model.name = item.name || model.name || '已发布模型'
+      applyTextPlates(THREE, model)
+      engine.addSandboxModel(model, {
+        name: model.name,
+        id: item.id ? String(item.id) : undefined,
+        position: { x: model.position.x, y: model.position.y, z: model.position.z },
+      })
+      restored += 1
+    } catch (error) {
+      console.warn('[HomepageSnapshot] 恢复发布模型失败', item?.id, error)
+    }
+  }
+  engine.selectSandboxModel?.(null)
+  return restored
+}
+
 onMounted(async () => {
   if (isSandboxRoute || isAssetWorkshopRoute || isAssetTemplateLabRoute) return
   updateViewportState()
@@ -492,34 +547,15 @@ onMounted(async () => {
   window.addEventListener('orientationchange', updateViewportState)
   window.addEventListener('keydown', onExplorerHotkey)
   window.addEventListener('popstate', handleBrowserNavigation)
+  window.addEventListener('storage', onHomepagePublishStorage)
   try {
-    // 校园探索与编辑器预览共用同一套校园空间数据；首页默认直接启动 2.5D 主场景。
-    if (!requestedBuildingId) await loadHomepagePlanDocument()
-    const planDocument = requestedBuildingId ? null : getShowcasePlanDocument()
-    const editorCollection = planDocument?.featureCollection?.type === 'FeatureCollection'
-      ? planDocument.featureCollection
-      : toCampusFeatureCollection(planDocument || {})
-    // 边界、出入口和基础装饰由基础数据提供；编辑器数据按 ID 覆盖，并应用删除标记。
-    const campusFeatureCollection = mergeCampusSceneFeatureCollections(buildCampusGeoJSON(), {
-      ...editorCollection,
-      deletedFeatureIds: [...new Set([...(editorCollection.deletedFeatureIds || []), ...(planDocument?.deletedFeatureIds || [])].map(String))],
-    })
-    let assetManifest = null
-    let buildingTemplates = []
-    try {
-      const templateResponse = await fetch(API_BASE + '/assets/building-templates')
-      if (templateResponse.ok) {
-        const templatePayload = await templateResponse.json()
-        buildingTemplates = (templatePayload.templates || []).filter(item => item.status === 'ready')
-      }
-    } catch (templateError) {
-      console.warn('[BuildingTemplates] 独立模板库暂不可用，使用内置模板回退', templateError)
-    }
-    try {
-      const assetResponse = await fetch(API_BASE + '/assets/visual-assets/manifest')
-      if (assetResponse.ok) assetManifest = await assetResponse.json()
-    } catch (assetError) {
-      console.warn('[CampusVisualAsset] 正式资产清单暂不可用，使用程序化建筑回退', assetError)
+    // 首页 3D 内容全部来自 MVP 发布：世界区块、环境参数与模型都从发布快照恢复；
+    // 没有发布数据时使用 MVP 默认空白世界，不再加载任何旧校园内容。
+    const publishedSnapshot = await loadGlobalPublishedSnapshot({ apiBase: API_BASE })
+    const publishedWorld = publishedSnapshot?.world || null
+    const worldBounds = {
+      width: Number(publishedWorld?.chunkSize?.width) > 0 ? Number(publishedWorld.chunkSize.width) : 54,
+      depth: Number(publishedWorld?.chunkSize?.depth) > 0 ? Number(publishedWorld.chunkSize.depth) : 42,
     }
     engine = createCampusEngine(viewport.value, {
       onObjectSelected: (object) => { selectedObject.value = object },
@@ -552,8 +588,24 @@ onMounted(async () => {
         errorMessage.value = error?.message || '三维场景初始化失败'
         loading.value = false
       },
-    }, { sceneType: 'campus', isometricRpg: true, viewMode: viewMode.value, initialPlayerPosition: returnWorldPosition, deferInitialFocus: Boolean(requestedBuildingId), featureCollection: campusFeatureCollection, assetManifest, buildingTemplates, assetBaseUrl: API_BASE })
+    }, { sceneType: 'blank-sandbox', isometricRpg: true, viewMode: viewMode.value, worldBounds })
     await engine.init()
+    if (publishedWorld) {
+      const restoredWorld = engine.restoreSandboxWorld?.(publishedWorld)
+      if (!restoredWorld) console.warn('[HomepageSnapshot] 世界区块恢复失败，保留默认区块')
+    }
+    if (publishedSnapshot) {
+      const restored = restorePublishedSandboxModels(publishedSnapshot)
+      console.info('[HomepageSnapshot] 首页已加载发布内容，模型数：' + restored)
+      applyPublishedSandboxEnvironment(publishedSnapshot)
+      publishedInfo.value = {
+        chunks: Array.isArray(publishedWorld?.chunks) ? publishedWorld.chunks.length : 1,
+        models: restored,
+        publishedAtText: formatPublishedAt(publishedSnapshot.publishedAt || publishedSnapshot.savedAt),
+      }
+    }
+    // 发布世界尺寸可能与默认区块不同，恢复后按实际世界范围重新取景。
+    engine.setMode(activeMode.value)
     if (requestedBuildingId && CAMPUS_BUILDING_FOOTPRINTS.some(item => item.id === requestedBuildingId)) await enterSelectedBuilding()
   } catch (error) {
     errorMessage.value = error?.message || '三维场景初始化失败'
@@ -561,17 +613,28 @@ onMounted(async () => {
   }
 })
 
+// 另一个标签页发布/清除首页数据时，自动重新加载以渲染最新内容
+function onHomepagePublishStorage(event) {
+  if (event?.key && event.key !== HOMEPAGE_SNAPSHOT_KEY) return
+  window.location.reload()
+}
+
 onBeforeUnmount(() => {
   window.removeEventListener('resize', updateViewportState)
   window.removeEventListener('orientationchange', updateViewportState)
   window.removeEventListener('keydown', onExplorerHotkey)
   window.removeEventListener('popstate', handleBrowserNavigation)
+  window.removeEventListener('storage', onHomepagePublishStorage)
   engine?.dispose()
 })
 </script>
 
 <template>
-  <BuildingTemplateWorkshop v-if="isAssetWorkshopRoute" />
+  <AuthLoginPage v-if="isLoginRoute" />
+  <AuthJoinPage v-else-if="isJoinRoute" />
+  <AuthChangePasswordPage v-else-if="isChangePasswordRoute" />
+  <AdminConsolePage v-else-if="isAdminRoute" />
+  <BuildingTemplateWorkshop v-else-if="isAssetWorkshopRoute" />
   <WorldSandboxMvp v-else-if="isSandboxRoute" />
   <AssetTemplateLab v-else-if="isAssetTemplateLabRoute" />
   <main v-else ref="appShell" :class="['app-shell', { 'is-overview': activeMode === 'overview', 'is-mobile': isMobile, 'is-rpg-sample': isCampusExplorer } ]">
@@ -581,50 +644,87 @@ onBeforeUnmount(() => {
     <template v-if="!showEditor || editorViewMode === '3d'">
     <header class="topbar">
       <div class="brand-lockup">
-        <div class="brand-mark">NC</div>
+        <BrandLogo class="brand-mark" />
         <div>
-          <div class="brand-title">南昌工学院</div>
-          <div class="brand-subtitle">NANCHANG INSTITUTE OF TECHNOLOGY · 3D CAMPUS</div>
+          <div class="brand-title">{{ siteSettings.brandName }}</div>
+          <div class="brand-subtitle">{{ siteSettings.brandSubtitle }}</div>
         </div>
       </div>
       <div class="showcase-actions">
-        <span class="topbar-status"><span class="status-dot"></span> {{ indoorPrototypeActive ? '室内空间样板 · 非实测布局' : (showEditor ? '地图编辑器 · 3D 预览' : '南昌工学院 · 校园探索') }}</span>
-        <button class="showcase-back asset-workshop-entry" @click="openAssetWorkshop">AI 素材工坊</button>
-        <button v-if="showEditor" class="showcase-back" @click="closeEditor">返回校园探索</button>
-        <button v-else class="showcase-back editor-entry" @click="openEditor">打开地图编辑器</button>
+        <!-- 管理员：成员管理、发布审核与站点设置，不提供模型编辑入口 -->
+        <template v-if="isAdmin">
+          <a class="showcase-back admin-entry" href="/admin">成员管理</a>
+          <a class="showcase-back settings-entry" href="/admin?view=settings" aria-label="站点设置" title="站点设置">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <path d="M3 5h9M16 5h1M3 10h3M10 10h7M3 15h11M18 15h-1" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+              <circle cx="14" cy="5" r="1.8" fill="currentColor" />
+              <circle cx="7" cy="10" r="1.8" fill="currentColor" />
+              <circle cx="16" cy="15" r="1.8" fill="currentColor" />
+            </svg>
+          </a>
+          <a class="showcase-back account-entry" href="/admin" :title="currentUser.username">
+            {{ currentUser.displayName || currentUser.username }}
+          </a>
+          <button class="showcase-back logout-entry" @click="handleLogout">退出</button>
+        </template>
+        <!-- 团队成员：沙盒编辑与素材工具 -->
+        <template v-else-if="currentUser">
+          <button class="showcase-back asset-workshop-entry" @click="openAssetWorkshop">AI 素材工坊</button>
+          <button class="showcase-back sandbox-editor-entry" @click="openSandboxEditor">编辑世界</button>
+          <a class="showcase-back account-entry" href="/change-password" :title="currentUser.username">
+            {{ currentUser.displayName || currentUser.username }}
+          </a>
+          <button class="showcase-back logout-entry" @click="handleLogout">退出</button>
+        </template>
+        <!-- 未登录访客：只保留申请加入与登录，不显示任何编辑入口 -->
+        <template v-else>
+          <a class="showcase-back login-entry" href="/login">登录</a>
+          <a class="showcase-back sandbox-editor-entry join-entry" href="/join">申请加入团队</a>
+        </template>
       </div>
     </header>
 
-    <section class="intro-card">
-      <div class="eyebrow">CAMPUS EXPLORER / 01</div>
-      <h1>探索校园<br /><span>从这里开始</span></h1>
-      <p>将平面图中的建筑、道路和功能区域映射为斜视角校园场景；建筑体量为程序化预览，不代表真实立面。</p>
-      <div class="intro-rule"><span></span></div>
-      <div class="intro-foot">INTERACTIVE CAMPUS MAP</div>
-    </section>
-
-    <nav class="mode-switcher view-mode-switcher" aria-label="展示模式切换">
-      <button :class="['mode-button', { active: viewMode === '2.5d' }]" @click="switchViewMode('2.5d')">
-        <span class="mode-label">2.5D</span>
-        <span class="mode-hint">等距像素视图</span>
-      </button>
-      <button :class="['mode-button', { active: viewMode === '3d' }]" @click="switchViewMode('3d')">
-        <span class="mode-label">3D</span>
-        <span class="mode-hint">透视立体视图</span>
-      </button>
-    </nav>
-
-    <nav class="mode-switcher camera-mode-switcher" aria-label="相机控制模式">
-      <button
-        v-for="mode in modes"
-        :key="mode.id"
-        :class="['mode-button', { active: activeMode === mode.id }]"
-        @click="switchMode(mode.id)"
-      >
-        <span class="mode-label">{{ mode.label }}</span>
-        <span class="mode-hint">{{ mode.hint }}</span>
-      </button>
-    </nav>
+    <footer class="world-dock">
+      <section class="dock-info">
+        <span class="dock-state"><span class="status-dot"></span>{{ publishedInfo ? '已发布世界' : '尚未发布' }}</span>
+        <strong class="dock-title">{{ publishedInfo ? '三维世界' : '空白世界' }}</strong>
+        <span v-if="publishedInfo" class="dock-meta">
+          {{ publishedInfo.chunks }} 个地块，{{ publishedInfo.models }} 个模型<template v-if="publishedInfo.publishedAtText"> · 更新于 {{ publishedInfo.publishedAtText }}</template>
+        </span>
+        <a v-else-if="!currentUser" class="dock-link" href="/join">申请加入团队，发布你的世界</a>
+        <button v-else-if="currentUser.role !== 'admin'" class="dock-link" @click="openSandboxEditor">进入编辑世界，发布你的世界</button>
+      </section>
+      <div class="dock-controls">
+        <div class="dock-group-wrap">
+          <span class="dock-group-label">视图</span>
+          <nav class="mode-switcher view-mode-switcher" aria-label="展示模式切换">
+            <button :class="['mode-button', { active: viewMode === '2.5d' }]" @click="switchViewMode('2.5d')">
+              <span class="mode-label">2.5D</span>
+            </button>
+            <button :class="['mode-button', { active: viewMode === '3d' }]" @click="switchViewMode('3d')">
+              <span class="mode-label">3D</span>
+            </button>
+          </nav>
+        </div>
+        <div class="dock-group-wrap">
+          <span class="dock-group-label">镜头</span>
+          <nav class="mode-switcher camera-mode-switcher" aria-label="相机控制模式">
+            <button
+              v-for="mode in modes"
+              :key="mode.id"
+              :class="['mode-button', { active: activeMode === mode.id }]"
+              @click="switchMode(mode.id)"
+            >
+              <span class="mode-label">{{ mode.label }}</span>
+            </button>
+          </nav>
+        </div>
+        <div class="dock-actions">
+          <button class="dock-icon-button dock-help" aria-label="操作说明" @click="toggleHelp">?</button>
+          <button class="dock-icon-button dock-reset" aria-label="重置视角" @click="focusCampus">重置</button>
+        </div>
+      </div>
+    </footer>
 
     <div v-if="isMobile && activeMode !== 'overview'" class="mobile-controls" aria-label="触屏移动控制">
       <div class="virtual-pad">
@@ -640,19 +740,19 @@ onBeforeUnmount(() => {
     <div v-if="isMobile && activeMode !== 'overview' && isPortrait" class="rotate-device-hint">
       <div class="rotate-icon">↻</div>
       <strong>请将手机横向放置</strong>
-      <span>横屏可获得完整校园视野与操作空间</span>
+      <span>横屏可获得完整世界视野与操作空间</span>
     </div>
 
-    <aside class="control-card">
+    <aside class="control-card" :class="{ 'is-open': helpOpen }">
       <div class="control-heading">
-        <span>操作指南</span>
-        <button class="help-toggle" aria-label="显示操作指南" @click="toggleHelp">?</button>
+        <span>操作</span>
+        <button class="help-toggle" aria-label="关闭操作说明" @click="toggleHelp">×</button>
       </div>
       <div class="help-panel is-visible">
         <template v-if="activeMode === 'overview'">
           <template v-if="viewMode === '2.5d'">
             <div class="control-row"><kbd>鼠标左键 / 右键拖动</kbd><span>平移地图，不会旋转</span></div>
-            <div class="control-row"><kbd>滚轮</kbd><span>放大 / 缩小校园</span></div>
+            <div class="control-row"><kbd>滚轮</kbd><span>放大 / 缩小世界</span></div>
             <div v-if="isMobile" class="control-row"><kbd>单指拖动</kbd><span>平移地图</span></div>
             <div v-if="isMobile" class="control-row"><kbd>双指操作</kbd><span>缩放 / 平移地图</span></div>
           </template>
@@ -663,7 +763,7 @@ onBeforeUnmount(() => {
             <div v-if="isMobile" class="control-row"><kbd>单指拖动</kbd><span>旋转观察角度</span></div>
             <div v-if="isMobile" class="control-row"><kbd>双指操作</kbd><span>缩放 / 平移视野</span></div>
           </template>
-          <div class="control-row"><kbd>重置视角</kbd><span>恢复校园初始构图</span></div>
+          <div class="control-row"><kbd>重置视角</kbd><span>回到初始构图</span></div>
         </template>
         <template v-else-if="activeMode === 'thirdPerson'">
           <div class="control-row"><kbd>W A S D</kbd><span>控制角色移动</span></div>
@@ -682,12 +782,7 @@ onBeforeUnmount(() => {
       <div class="control-foot">方向以当前镜头朝向为基准</div>
     </aside>
 
-    <div class="bottom-bar">
-      <div class="coordinates"><span class="coordinate-dot"></span> CAMPUS / NANCHANG · CHINA</div>
-    </div>
-    <button class="reset-button" aria-label="重置视角" @click="focusCampus"><span>↗</span> 重置视角</button>
-
-    <div v-if="indoorPrototypeActive" class="indoor-floor-hud"><strong>{{ indoorBuildingName }}</strong><span>{{ indoorFloor }} 楼 · 共 {{ indoorFloors.length }} 层</span><small>靠近楼梯后按 E 上楼或下楼</small><button @click="closeEditor">返回校园</button></div>
+    <div v-if="indoorPrototypeActive" class="indoor-floor-hud"><strong>{{ indoorBuildingName }}</strong><span>{{ indoorFloor }} 楼 · 共 {{ indoorFloors.length }} 层</span><small>靠近楼梯后按 E 上楼或下楼</small><button @click="closeEditor">返回世界</button></div>
     <aside v-if="indoorPrototypeActive && indoorEditorOpen" class="indoor-layout-editor">
       <header><strong>室内空间编辑器</strong><small>建筑 {{ indoorBuildingId }} · {{ indoorFloor }}F</small></header>
       <div class="indoor-editor-actions"><button @click="addIndoorFloor">＋ 增加楼层</button><button :disabled="indoorFloors.length <= 1" @click="removeIndoorFloor">删除当前层</button><button @click="addIndoorRoom">＋ 添加房间</button></div>
@@ -726,11 +821,11 @@ onBeforeUnmount(() => {
     <div v-if="indoorPrompt" class="indoor-interaction-prompt">{{ indoorPrompt.text }}</div>
     <div v-if="loading" class="loading-screen">
       <div class="loader"></div>
-      <div>正在加载南昌工学院校园</div>
+      <div>正在加载世界</div>
       <span>INITIALIZING SCENE</span>
     </div>
     <aside v-if="selectedObject && !showEditor" style="position:absolute;right:24px;top:110px;z-index:12;min-width:190px;padding:14px 16px;background:rgba(255,255,255,.94);border:1px solid #d7ded7;border-radius:6px;color:#34443b;box-shadow:0 8px 24px rgba(30,50,40,.12)">
-      <div style="font-size:10px;letter-spacing:1px;color:#7a887e">{{ selectedObject.interaction ? '已选中室内交互对象' : '已选中校园对象' }}</div>
+      <div style="font-size:10px;letter-spacing:1px;color:#7a887e">{{ selectedObject.interaction ? '已选中室内交互对象' : '已选中对象' }}</div>
       <strong style="display:block;margin-top:8px;font-size:13px">{{ selectedObject.name }}</strong>
       <div style="margin-top:7px;font-size:10px;color:#6d7b71">类型：{{ selectedObject.objectType || '未分类' }}</div>
       <template v-if="selectedObject.interaction">

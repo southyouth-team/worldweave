@@ -36,8 +36,8 @@ async function bootstrap() {
 
   if (config.get<string>('NODE_ENV') !== 'production') {
     const swaggerConfig = new DocumentBuilder()
-      .setTitle('Campus Map API')
-      .setDescription('Multi-campus map platform API')
+      .setTitle('Worldweave API')
+      .setDescription('Source-available AI-assisted 3D world sandbox API')
       .setVersion('1.0')
       .build();
     SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, swaggerConfig));

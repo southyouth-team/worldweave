@@ -2071,6 +2071,25 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     return sandboxModels.get(String(id)) || null
   }
 
+  // 发布申请用的缩略图：立即渲染后同步读取当前 WebGL 画布，避免 drawingBuffer 被清空。
+  function captureSandboxThumbnail(maxWidth = 640) {
+    if (!renderer || !scene || !cameraRig?.camera) return null
+    try {
+      renderer.render(scene, cameraRig.camera)
+      const source = renderer.domElement
+      const scale = Math.min(1, Number(maxWidth) > 0 ? Number(maxWidth) / Math.max(1, source.width) : 1)
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.max(1, Math.round(source.width * scale))
+      canvas.height = Math.max(1, Math.round(source.height * scale))
+      const context = canvas.getContext('2d')
+      if (!context) return null
+      context.drawImage(source, 0, 0, canvas.width, canvas.height)
+      return canvas.toDataURL('image/jpeg', 0.68)
+    } catch {
+      return null
+    }
+  }
+
   function serializeSandboxModel(id) {
     const key = String(id)
     const model = sandboxModels.get(key)
@@ -3303,7 +3322,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     // 基础空间图层已为校园建筑注册精确墙段/footprint 碰撞；GLB 仅替换视觉模型，
     // 不得再用 GLB 世界 AABB 叠加粗碰撞，否则不规则建筑外侧空地也会被封住。
     const canonicalBuildingIds = new Set((spatialLayers?.buildings || []).map(building => String(building.id)))
-    if (!isRpgSample && spatialLayers) {
+    if (!isRpgSample && spatialLayers && options.skipSceneAudit !== true) {
       const sceneAudit = auditCampusSceneFeatureCoverage(spatialLayers, campus)
       callbacks.onSceneAudit?.(sceneAudit)
       if (sceneAudit.errorCount > 0) console.warn('[CampusSceneAudit] 检测到场景装配异常', sceneAudit)
@@ -5628,5 +5647,5 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     initialized = false
   }
 
-  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
+  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, captureSandboxThumbnail, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
 }

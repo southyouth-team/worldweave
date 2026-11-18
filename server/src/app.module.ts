@@ -9,6 +9,9 @@ import { LayersModule } from './modules/layers/layers.module';
 import { MapsModule } from './modules/maps/maps.module';
 import { AssetsModule } from './modules/assets/assets.module';
 import { ScenesModule } from './modules/scenes/scenes.module';
+import { SiteSettingsModule } from './modules/site-settings/site-settings.module';
+import { AuthModule } from './modules/auth/auth.module';
+import { PublishRequestsModule } from './modules/publish-requests/publish-requests.module';
 
 @Module({
   imports: [
@@ -48,6 +51,9 @@ import { ScenesModule } from './modules/scenes/scenes.module';
     FeaturesModule,
     AssetsModule,
     ScenesModule,
+    SiteSettingsModule,
+    AuthModule,
+    PublishRequestsModule,
   ],
 })
 export class AppModule {}

@@ -18,10 +18,14 @@ import {
   listBuiltinAssets,
 } from './sandbox/assetLibraryUi.js'
 import ProceduralModelEditor from './ProceduralModelEditor.vue'
+import BrandLogo from './BrandLogo.vue'
+import { siteSettings } from '../site/siteSettings.js'
+import { currentUser, isAdmin, loadCurrentUser, logout } from '../auth/authStore.js'
 import { WEATHER_MODES } from '../three/engine/weatherRuntime.js'
 import { analyzeHumanoidModel, buildHumanoidRetryPrompt } from '../three/sandbox/humanoidValidation.js'
 import { captureModelViews } from '../three/sandbox/visualQcCapture.js'
 import { buildComparisonSheet } from '../three/sandbox/comparisonSheet.js'
+import { listMyPublishRequests, submitPublishRequest } from '../publish/publishRequests.js'
 import { applyTextPlates, getPartTextSpec, updateTextPlate } from '../three/sandbox/textPlateRuntime.js'
 import { PLAYER_PRESETS } from '../three/characters/playerPresets.js'
 import { isAnyStretchableRoadModel, isPolylineRoadModel } from '../three/sandbox/roadEndpointMath.js'
@@ -84,6 +88,11 @@ function selectSandboxViewMode(mode) {
   if (!['free', '2.5d', '3d'].includes(mode)) return
   if (engine?.setViewMode?.(mode) === false) return
   sandboxViewMode.value = mode
+}
+
+async function handleLogout() {
+  await logout()
+  window.location.assign('/login')
 }
 const STORAGE_KEY = 'world-sandbox-mvp:workspace:v1'
 // 人物模型独立存档：与沙盒场景分开，可单独保存/恢复/删除，不随沙盒一起被覆盖。
@@ -1307,126 +1316,100 @@ async function generateAiPlayerCharacter() {
   }
   characterBusy.value = true
   message.value = '正在通过 AI 生成角色模型…'
+  // 立刻打开角色编辑工作台：生成进度直接显示在对话/进度卡里
+  editorOpen.value = true
+  editorMode.value = 'character'
+  isDraftModel.value = false
+  editingModel.value = null
+  editHistory.value = []
+  editError.value = ''
+  modelChatMessages.value = []
+  generationProgress.value = [{
+    stage: 'character',
+    label: '正在生成角色模型',
+    detail: 'AI 正在生成完整的人形角色源码',
+    status: 'active',
+  }]
+  appendModelChat('user', prompt, { type: 'stage' })
   try {
     let model = null
     let analysis = null
     let characterSource = ''
     // 最多两次：首轮失败后把具体失败指标作为纠正提示再生成一次。
     for (let attempt = 0; attempt < 2; attempt += 1) {
-      if (attempt > 0) message.value = '生成结果不像人形（' + analysis.reasons.join('；') + '），正在自动重试…'
+      if (attempt > 0) {
+        message.value = '生成结果不像人形（' + analysis.reasons.join('；') + '），正在自动重试…'
+        updateGenerationProgress({
+          stage: 'character-retry',
+          label: `人形检查未通过，自动重试（${attempt + 1}/2）`,
+          detail: analysis.reasons.join('；').slice(0, 300),
+          status: 'active',
+        })
+      }
       const promptText = attempt === 0
         ? prompt + HUMANOID_PROMPT_SUFFIX
         : prompt + HUMANOID_PROMPT_SUFFIX + buildHumanoidRetryPrompt(analysis)
+      message.value = '正在请求 AI 生成角色源码…'
+      updateGenerationProgress({ stage: 'character-request', label: '请求角色生成', detail: '提交角色描述与人形约束', status: 'active' })
       const generatedCode = await requestGeneratedCharacterCode(promptText)
       message.value = 'AI 已返回模型源码，正在隔离 Worker 中构建…'
+      updateGenerationProgress({ stage: 'character-build', label: '构建角色模型', detail: '隔离 Worker 中执行生成源码', status: 'active' })
       model = await executeProceduralModel(generatedCode, { timeoutMs: 60000 })
       characterSource = generatedCode
+      updateGenerationProgress({ stage: 'character-humanoid', label: '人形检查', detail: '检查头/躯干/四肢比例与完整性', status: 'active' })
       analysis = analyzeHumanoidModel(THREE, model)
       if (analysis.humanoid) break
     }
     if (!analysis?.humanoid) {
-      message.value = '两次生成的结果都不像人形（' + (analysis?.reasons?.join('；') || '未知原因') + '），已取消应用。请换一种描述再试，例如“一个站立的人形角色，身高约 2 米，穿蓝色上衣”。'
+      const reason = '两次生成的结果都不像人形（' + (analysis?.reasons?.join('；') || '未知原因') + '），已取消应用。请换一种描述再试，例如“一个站立的人形角色，身高约 2 米，穿蓝色上衣”。'
+      message.value = reason
+      editError.value = reason
+      generationProgress.value = generationProgress.value.map(item => item.status === 'active'
+        ? { ...item, status: 'failed' } : item)
+      appendModelChat('assistant', reason, { type: 'stage' })
       return
     }
-    // 角色视觉质检 + 自动修正（最多两轮）；复检以修改前的截图为基线
-    let characterVisualReport = null
-    let characterBaseline = null
-    let characterRepairRounds = 0
-    for (let round = 0; round <= 2; round += 1) {
-      let screenshots
-      try {
-        message.value = round === 0 ? '正在对本角色做视觉质检…' : `正在复检修正后的角色（第 ${round} 轮）…`
-        screenshots = await captureModelViews(THREE, model)
-        let reviewScreenshots = screenshots
-        try {
-          const sheet = await buildComparisonSheet(screenshots, { title: '角色视觉质检' })
-          if (sheet) reviewScreenshots = [{ label: 'comparison-sheet', imageDataUrl: sheet }]
-        } catch {
-          // 退回多张截图
-        }
-        let baselinePayload = characterBaseline
-        if (characterBaseline) {
-          try {
-            const baselineSheet = await buildComparisonSheet(characterBaseline, { title: '角色修改前基线' })
-            if (baselineSheet) baselinePayload = [{ label: 'baseline-comparison-sheet', imageDataUrl: baselineSheet }]
-          } catch {
-            // 退回原基线截图
-          }
-        }
-        const inspectResponse = await fetch(API_BASE + '/assets/ai-image/inspect-procedural-object', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
-          body: JSON.stringify({
-            prompt,
-            objectType: '第三人称玩家角色',
-            screenshots: reviewScreenshots,
-            baselineScreenshots: baselinePayload || undefined,
-          }),
-        })
-        const inspectBody = await inspectResponse.json().catch(() => ({}))
-        if (!inspectResponse.ok) break
-        characterVisualReport = inspectBody.data || inspectBody.result || inspectBody
-      } catch {
-        break
-      }
-      if (characterVisualReport.passed === true) break
-      const actionable = (characterVisualReport.issues || []).filter(item =>
-        ['critical', 'major'].includes(item.severity) && item.repairInstruction,
-      )
-      if (round === 2 || !actionable.length) break
-      message.value = `视觉质检发现 ${actionable.length} 个问题，正在自动修正角色（${round + 1}/2）…`
-      try {
-        const instruction = [
-          '这是角色视觉质检后的定向修复。请根据以下可观察问题做最小必要修改，不要整体重建模型，不要修改无关部件，保留模型身份、现有稳定 componentId、参数、能力声明和交互结构。',
-          ...actionable.map((item, index) => `${index + 1}. [${item.componentId || '整体模型'}] ${item.issue}。修复要求：${item.repairInstruction}`),
-        ].join('\n')
-        const repairResponse = await fetch(API_BASE + '/assets/ai-image/modify-procedural-object', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'X-Dev-User-Id': DEV_USER_ID },
-          body: JSON.stringify({
-            source: characterSource,
-            parameters: [],
-            parameterValues: {},
-            parts: [],
-            environmentBindings: [],
-            modelCapabilityManifest: null,
-            geometryDiagnostics: null,
-            selectedPartId: '',
-            instruction,
-            objectType: '第三人称玩家角色',
-          }),
-        })
-        const repairBody = await repairResponse.json().catch(() => ({}))
-        if (!repairResponse.ok) break
-        const repairResult = repairBody.data || repairBody.result || repairBody
-        if (!repairResult?.generatedCode) break
-        const repaired = await executeProceduralModel(repairResult.generatedCode, { timeoutMs: 60000 })
-        const repairedAnalysis = analyzeHumanoidModel(THREE, repaired)
-        if (!repairedAnalysis.humanoid) break
-        characterBaseline = screenshots
-        characterSource = repairResult.generatedCode
-        model = repaired
-        characterRepairRounds += 1
-      } catch {
-        break
-      }
-    }
+    generationProgress.value = generationProgress.value.map(item => item.status === 'active' ? { ...item, status: 'done' } : item)
+    appendModelChat('assistant', '人形检查通过。可在左侧预览、右侧对话继续调整；保存后应用到玩家。', { type: 'stage' })
+    // 角色也进入和模型一样的编辑工作台：先建好可编辑草稿，再做视觉质检（含自动修正）
     model.name = 'AI 玩家角色'
-    const info = engine.setPlayerCharacterModel(model, [], {
-      assetId: 'ai-character-' + Date.now().toString(36),
-      targetHeight: 2.25,
-      source: 'ai-procedural',
+    model.userData.proceduralModelSource = characterSource
+    model.userData.proceduralModelConfig = {
+      protocol: 'threejs-procedural-v1',
+      generator: 'img2threejs-procedural-character',
+      objectType: '第三人称玩家角色',
+      visualStyle: 'stylized',
       prompt,
-    })
-    savePlayerCharacterToStorage({ silent: true })
-    const visualNote = characterVisualReport
-      ? (characterVisualReport.passed === true
-        ? `视觉质检通过${characterRepairRounds ? '（自动修正 ' + characterRepairRounds + ' 轮后）' : ''}`
-        : `视觉质检仍有问题：${characterVisualReport.summary || '存在待调整项'}`)
-      : ''
-    message.value = `AI 角色已加载并通过人形检查：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。已单独保存人物模型，刷新后自动恢复${visualNote ? '；' + visualNote : ''}。`
+      generatedAt: new Date().toISOString(),
+    }
+    model.userData.proceduralModelParameterValues = modelParameterDefaults(model.userData.proceduralModelParameters || [])
+    model.userData.proceduralModelParts = Array.isArray(model.userData.proceduralModelParts) ? model.userData.proceduralModelParts : []
+    model.userData.proceduralModelEnvironmentBindings = Array.isArray(model.userData.proceduralModelEnvironmentBindings)
+      ? model.userData.proceduralModelEnvironmentBindings : []
+    model.userData.proceduralModelCapabilityManifest = model.userData.proceduralModelCapabilityManifest
+      && typeof model.userData.proceduralModelCapabilityManifest === 'object'
+      ? model.userData.proceduralModelCapabilityManifest
+      : { version: 1, parameters: model.userData.proceduralModelParameters, capabilities: {} }
+    editingModel.value = model
+    isDraftModel.value = true
+    await nextTick()
+    message.value = 'AI 角色已生成，正在做视觉质检…'
+    const characterReport = await runModelVisualQualityControl(prompt, { includeReferenceImage: false })
+    const finalAnalysis = analyzeHumanoidModel(THREE, editingModel.value || model)
+    if (!finalAnalysis.humanoid) {
+      appendModelChat('assistant', '视觉修正后的人形检查未通过：' + (finalAnalysis.reasons?.join('；') || '未知原因'), { type: 'stage' })
+      message.value = '角色已生成，但视觉修正后不像人形；请继续对话调整，或关闭放弃。'
+    } else {
+      message.value = characterReport?.passed === true
+        ? 'AI 角色已生成并通过人形与视觉检查；可在编辑页继续调整，保存后应用到玩家。'
+        : 'AI 角色已生成并通过人形检查；视觉质检仍有提示，可在编辑页继续调整，保存后应用到玩家。'
+    }
   } catch (error) {
     message.value = 'AI 角色生成失败：' + (error?.message || '未知错误')
+    editError.value = message.value
+    generationProgress.value = generationProgress.value.map(item => item.status === 'active'
+      ? { ...item, status: 'failed' } : item)
+    appendModelChat('assistant', message.value, { type: 'stage' })
   } finally {
     characterBusy.value = false
   }
@@ -1533,8 +1516,14 @@ function openModelEditor(payload) {
 }
 
 function closeModelEditor() {
+  const wasCharacter = editorMode.value === 'character'
   editorOpen.value = false
   editingModel.value = null
+  if (wasCharacter) {
+    isDraftModel.value = false
+    message.value = '已关闭角色编辑，未应用到玩家'
+    return
+  }
   if (isDraftModel.value) {
     isDraftModel.value = false
     message.value = '已取消创建，模型未加入沙盒'
@@ -1544,6 +1533,26 @@ function closeModelEditor() {
 function saveEditorModel() {
   const model = editingModel.value
   if (!model) return
+  // 角色草稿：保存即应用到玩家角色并单独存档
+  if (editorMode.value === 'character') {
+    const analysis = analyzeHumanoidModel(THREE, model)
+    if (!analysis.humanoid) {
+      message.value = '角色当前不像人形（' + (analysis.reasons?.join('；') || '未知原因') + '），已阻止应用。请继续对话调整。'
+      return
+    }
+    const info = engine.setPlayerCharacterModel(model, [], {
+      assetId: 'ai-character-' + Date.now().toString(36),
+      targetHeight: 2.25,
+      source: 'ai-procedural',
+      prompt: model.userData.proceduralModelConfig?.prompt || characterPrompt.value,
+    })
+    savePlayerCharacterToStorage({ silent: true })
+    editorOpen.value = false
+    editingModel.value = null
+    isDraftModel.value = false
+    message.value = `AI 角色已应用到玩家：高度 ${info.dimensions?.height?.toFixed(2) || '—'}，碰撞半径 ${info.dimensions?.colliderRadius?.toFixed(2) || '—'}。已单独保存人物模型，刷新后自动恢复。`
+    return
+  }
   if (isDraftModel.value) {
     const collisionReport = analyzeModelCollisionCompleteness(model)
     model.userData.proceduralModelCollisionAnalysis = collisionReport
@@ -2022,34 +2031,40 @@ function removeSelectedWorldChunks() {
   return failures.length === 0
 }
 
+function buildSandboxSnapshot() {
+  if (!engine) return null
+  const models = engine.getSandboxModels().flatMap(({ id, name }) => {
+    const model = engine.getSandboxModel(id)
+    const object = engine.serializeSandboxModel?.(id) ?? model?.toJSON?.()
+    return model && object ? [{ id, name: model.name || name, object }] : []
+  })
+  return {
+    version: 4,
+    world: engine.getSandboxWorldState(),
+    savedAt: new Date().toISOString(),
+    environment: {
+      time: Number(time.value),
+      timeEnabled: timeEnabled.value,
+      weather: weather.value,
+      weatherIntensity: Number(weatherIntensity.value),
+      weatherEnabled: weatherEnabled.value,
+      // rainEnabled 是旧存档的遗留字段，仅为向下兼容保留写入
+      rainEnabled: weather.value === 'rain',
+      wind: Number(wind.value),
+      windEnabled: windEnabled.value,
+      windDirection: { ...sandboxWindDirection },
+      artificialLightingEnabled: artificialLightingEnabled.value,
+    },
+    selectedModelId: selected?.userData?.sandboxModelId || null,
+    models,
+  }
+}
+
 function saveSandbox() {
   if (!engine) return false
   try {
-    const models = engine.getSandboxModels().flatMap(({ id, name }) => {
-      const model = engine.getSandboxModel(id)
-      const object = engine.serializeSandboxModel?.(id) ?? model?.toJSON?.()
-      return model && object ? [{ id, name: model.name || name, object }] : []
-    })
-    const snapshot = {
-      version: 4,
-      world: engine.getSandboxWorldState(),
-      savedAt: new Date().toISOString(),
-      environment: {
-        time: Number(time.value),
-        timeEnabled: timeEnabled.value,
-        weather: weather.value,
-        weatherIntensity: Number(weatherIntensity.value),
-        weatherEnabled: weatherEnabled.value,
-        // rainEnabled 是旧存档的遗留字段，仅为向下兼容保留写入
-        rainEnabled: weather.value === 'rain',
-        wind: Number(wind.value),
-        windEnabled: windEnabled.value,
-        windDirection: { ...sandboxWindDirection },
-        artificialLightingEnabled: artificialLightingEnabled.value,
-      },
-      selectedModelId: selected?.userData?.sandboxModelId || null,
-      models,
-    }
+    const snapshot = buildSandboxSnapshot()
+    if (!snapshot) return false
     const serialized = JSON.stringify(snapshot)
     localStorage.setItem(STORAGE_KEY, serialized)
     saveStatus.value = '已保存 · ' + new Date(snapshot.savedAt).toLocaleTimeString()
@@ -2060,6 +2075,51 @@ function saveSandbox() {
     saveStatus.value = '保存失败'
     message.value = '沙盒保存失败：' + reason
     return false
+  }
+}
+
+// 发布申请：成员只能提交冻结快照，管理员审核通过后才会写入首页。
+const publishNote = ref('')
+const publishSubmitting = ref(false)
+const publishStatus = ref('')
+const myPublishRequests = ref([])
+const latestPublishRequest = computed(() => myPublishRequests.value[0] || null)
+
+async function loadMyPublishRequests() {
+  try {
+    myPublishRequests.value = await listMyPublishRequests()
+  } catch {
+    // 未登录或后端不可用时保持空列表，不阻塞编辑器
+  }
+}
+
+function publishStatusLabel(status) {
+  return { pending: '待审核', approved: '已发布', rejected: '已驳回', stale: '已过期' }[status] || status
+}
+
+async function submitSandboxPublishRequest() {
+  const snapshot = buildSandboxSnapshot()
+  if (!snapshot) {
+    publishStatus.value = '提交失败：沙盒尚未就绪'
+    return
+  }
+  publishSubmitting.value = true
+  publishStatus.value = ''
+  try {
+    const thumbnailDataUrl = engine?.captureSandboxThumbnail?.(720) || null
+    await submitPublishRequest({
+      snapshot,
+      note: publishNote.value.trim(),
+      thumbnailDataUrl,
+    })
+    publishNote.value = ''
+    publishStatus.value = '已提交发布申请，等待管理员审核。'
+    message.value = publishStatus.value
+    await loadMyPublishRequests()
+  } catch (error) {
+    publishStatus.value = '提交发布申请失败：' + (error?.message || '未知错误')
+  } finally {
+    publishSubmitting.value = false
   }
 }
 
@@ -2341,6 +2401,9 @@ function executeTask() {
 }
 onMounted(async () => {
   disposed = false
+  // 确保拿到当前会话用户；未登录时由 App.vue 路由守卫跳转登录页。
+  if (!currentUser.value) await loadCurrentUser()
+  loadMyPublishRequests()
   try {
     engine = createCampusEngine(viewport.value, {
       onReady: () => { worldState.value = engine?.getSandboxWorldState?.() || null; message.value = '空白沙盒已就绪，可生成模型并放置到场景中。' },
@@ -2427,8 +2490,11 @@ onBeforeUnmount(() => {
       <span>浸入比例 {{ Math.round(playerWaterState.characterImmersionRatio * 100) }}%</span>
     </div>
     <header class="world-mvp__header">
-      <div class="world-mvp__brand"><strong>WORLD SANDBOX</strong><span>空白世界 · AI 模型构建与交互</span></div>
-      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">世界空间</button><button :class="{ active: managementMode === 'environment' }" @click="setManagementMode('environment')">环境管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a href="/">返回地图</a></div>
+      <div class="world-mvp__brand">
+        <BrandLogo class="world-mvp__mark" />
+        <div><strong>{{ siteSettings.sandboxBrandName }}</strong><span>{{ siteSettings.sandboxBrandSubtitle }}</span></div>
+      </div>
+      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">世界空间</button><button :class="{ active: managementMode === 'environment' }" @click="setManagementMode('environment')">环境管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a v-if="isAdmin" href="/admin?view=settings">站点设置</a><a v-if="isAdmin" href="/admin">成员管理</a><a v-if="currentUser" href="/">返回首页</a><a v-if="currentUser" href="/change-password">{{ currentUser.displayName || currentUser.username }}</a><a href="/" @click.prevent="handleLogout">退出登录</a></div>
     </header>
 
     <section v-if="managementMode === 'chunks' && !placement.active" class="world-mvp__chunk-manager">
@@ -2597,6 +2663,15 @@ onBeforeUnmount(() => {
             <span>地块数量</span>
             <strong>{{ worldState?.chunks?.length || 1 }} 块</strong>
           </div>
+          <textarea v-model="publishNote" class="world-mvp__publish-note" rows="2" maxlength="1000" placeholder="给管理员说明这次发布的内容（可选）"></textarea>
+          <button class="world-mvp__publish-submit" :disabled="publishSubmitting" @click="submitSandboxPublishRequest">{{ publishSubmitting ? '提交中…' : '申请发布到首页' }}</button>
+          <p v-if="publishStatus" class="world-mvp__message">{{ publishStatus }}</p>
+          <div v-if="latestPublishRequest" class="world-mvp__publish-state">
+            最近一次申请：{{ publishStatusLabel(latestPublishRequest.status) }}
+            <span v-if="latestPublishRequest.createdAt"> · {{ new Date(latestPublishRequest.createdAt).toLocaleString('zh-CN', { hour12: false }) }}</span>
+            <span v-if="latestPublishRequest.reviewNote"> · {{ latestPublishRequest.reviewNote }}</span>
+          </div>
+          <p class="world-mvp__message">提交后由管理员审核；通过后首页才会切换到这份冻结版本。成员的编辑不会直接影响首页。</p>
         </section>
         <section v-if="managementMode === 'model'">
           <h2>内置素材</h2>
@@ -2675,7 +2750,7 @@ onBeforeUnmount(() => {
         </section>
         <section v-if="managementMode === 'sandbox'">
           <h2>场景信息</h2>
-          <p class="world-mvp__message">已加载南昌工学院校园空间底图，校园建筑、道路、湖泊和公共区域作为场景环境。</p>
+          <p class="world-mvp__message">空白沙盒世界：地面区块、环境与模型都来自当前沙盒，不再加载校园底图。</p>
         </section>
 
         <section v-if="managementMode === 'sandbox'">
@@ -2725,7 +2800,7 @@ onBeforeUnmount(() => {
       :mode="editorMode"
       :progress="generationProgress"
       :messages="modelChatMessages"
-      :busy="aiBusy || editBusy"
+      :busy="aiBusy || editBusy || characterBusy"
       :error="editError"
       :can-undo="editHistory.length > 0"
       @undo="undoModelEdit"
@@ -2740,135 +2815,275 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
-.world-mvp { position:relative; width:100%; height:100vh; min-height:600px; overflow:hidden; color:#e8efed; background:#111a20; font-family:Inter,"Microsoft YaHei",sans-serif; }
-.world-mvp__viewport { position:absolute; inset:0; }
-.world-mvp__physics-debug { position:absolute; z-index:4; left:18px; top:82px; display:flex; flex-direction:column; gap:4px; max-width:min(520px,calc(100vw - 36px)); padding:10px 12px; border:1px solid rgba(255,190,110,.5); border-radius:8px; color:#f6ead9; background:rgba(35,25,16,.9); font:11px/1.45 ui-monospace,monospace; overflow-wrap:anywhere; pointer-events:none; }
-.world-mvp__physics-debug strong { color:#ffc27d; }
-.world-mvp__water-status { position:absolute; z-index:3; left:18px; bottom:22px; display:flex; align-items:center; gap:10px; padding:9px 12px; border:1px solid rgba(117,190,210,.4); border-radius:8px; color:#d8f4fa; background:rgba(9,32,42,.84); box-shadow:0 8px 24px rgba(0,0,0,.2); font-size:11px; pointer-events:none; }
-.world-mvp__water-status strong { color:#8ed7e8; }
-.world-mvp__viewport :deep(canvas) { display:block; width:100%; height:100%; }
-.world-mvp__header { position:absolute; z-index:2; top:0; left:0; right:0; height:62px; display:flex; align-items:center; justify-content:space-between; padding:0 20px; border-bottom:1px solid rgba(255,255,255,.1); background:rgba(13,22,28,.78); backdrop-filter:blur(14px); }
-.world-mvp__brand strong,.world-mvp__brand span { display:block; }
-.world-mvp__brand strong { font-size:13px; letter-spacing:1.1px; }
-.world-mvp__brand span { margin-top:4px; color:#8e9fa3; font-size:10px; }
-.world-mvp__header-actions { display:flex; align-items:center; gap:9px; }
-.world-mvp__view-switch { display:flex; align-items:center; gap:3px; padding:3px; border:1px solid rgba(165,201,177,.25); border-radius:8px; background:rgba(0,0,0,.16); }
-.world-mvp__view-switch button { padding:6px 8px; border-color:transparent; white-space:nowrap; }
-.world-mvp__view-switch button.active { border-color:#a5c9b1; color:#c6e4ce; background:rgba(165,201,177,.16); }
-.world-mvp__chunk-manager { position:absolute; z-index:4; top:76px; right:14px; width:min(420px,calc(100vw - 28px)); max-height:42vh; overflow:auto; padding:12px; border:1px solid rgba(255,255,255,.14); border-radius:10px; background:rgba(12,21,27,.9); box-shadow:0 12px 34px rgba(0,0,0,.28); backdrop-filter:blur(12px); }
-.world-mvp__chunk-manager-head { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; }
-.world-mvp__chunk-manager-head > div:first-child { display:grid; gap:4px; }
-.world-mvp__chunk-manager-head b { color:#e5efe8; font-size:12px; }
-.world-mvp__chunk-manager-head span { color:#a9bbb3; font-size:10px; line-height:1.5; }
-.world-mvp__chunk-manager-actions { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
-.world-mvp__chunk-manager-actions > span { color:#c6e4ce; font-size:10px; }
-.world-mvp__chunk-manager-actions .danger { border-color:rgba(230,139,126,.5); color:#ffc1b6; }
-.world-mvp__chunk-manager-actions .danger:disabled { opacity:.35; }
-.world-mvp__chunk-manager-selected { display:flex; flex-wrap:wrap; align-items:center; gap:7px; margin-top:9px; padding-top:8px; border-top:1px solid rgba(255,255,255,.09); color:#b7c9bf; font-size:10px; }
-.world-mvp__chunk-manager-selected b { color:#dce8df; }
-.world-mvp__chunk-manager-selected span { padding:3px 6px; border:1px solid rgba(165,201,177,.25); border-radius:5px; background:rgba(165,201,177,.08); }
-.world-mvp__chunk-manager-selected small { color:#9eafad; }
-.world-mvp__chunk-manager-expand { margin-top:9px; padding-top:8px; border-top:1px solid rgba(255,255,255,.09); display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
-.world-mvp__chunk-manager-size { display:flex; align-items:baseline; gap:6px; color:#b7c9bf; font-size:10px; }
-.world-mvp__chunk-manager-size strong { color:#dce8df; font-size:12px; }
-.world-mvp__chunk-manager-expand-actions { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
-.world-mvp__chunk-manager-expand-actions span { color:#9eafad; font-size:10px; }
-.world-mvp__open-chunk-manager { width:100%; margin-top:12px; padding:13px!important; border-color:rgba(165,201,177,.42)!important; text-align:left; color:#d5eadb!important; background:rgba(165,201,177,.08)!important; }
-.world-mvp__open-chunk-manager span { display:block; margin-top:5px; color:#9eafad; font-size:10px; }
-.world-mvp__map-toolbar { display:flex; align-items:center; justify-content:space-between; margin:9px 0 6px; color:#9eafae; font-size:10px; }
-.world-mvp__map-toolbar div { display:flex; gap:5px; }
-.world-mvp__map-toolbar button { width:27px; height:25px; padding:0; font-size:15px; }
-.world-mvp__chunk-map-viewport { max-width:100%; max-height:260px; overflow:auto; border:1px solid rgba(255,255,255,.1); border-radius:9px; background:radial-gradient(ellipse at center,rgba(91,124,109,.12),rgba(13,23,29,.45)); }
-.world-mvp__chunk-map { display:block; max-width:none; }
-.world-mvp__chunk-map-item { cursor:pointer; }
-.world-mvp__chunk-map-item rect { fill:#526b60; fill-opacity:.82; stroke:rgba(204,226,210,.35); stroke-width:1.3; transition:fill .15s,stroke .15s; }
-.world-mvp__chunk-map-item:hover rect { fill:#708c78; }
-.world-mvp__chunk-map-item.active rect { fill:#8cad91; stroke:#e2f4df; stroke-width:2.5; }
-.world-mvp__chunk-map-item.anchor rect { fill:#405b51; stroke:#9eb9a8; stroke-dasharray:3 2; }
-.world-mvp__chunk-map-item text { fill:#f0f5ef; font-size:10px; pointer-events:none; }
-.world-mvp__selected-chunk { display:flex; flex-direction:column; gap:4px; margin-top:9px; padding:9px; border-radius:8px; background:rgba(165,201,177,.08); color:#dce8df; font-size:10px; }
-.world-mvp__selected-chunk div { display:flex; justify-content:space-between; gap:8px; }
-.world-mvp__selected-chunk small { color:#a8b8b3; }
-.world-mvp .world-mvp__reclaim-button { width:100%; margin-top:8px; border-color:rgba(230,139,126,.4); color:#efb0a6; }
-.world-mvp__reclaim-feedback { margin-top:9px; padding:10px; border:1px solid rgba(255,255,255,.12); border-radius:8px; font-size:10px; line-height:1.5; }
-.world-mvp__reclaim-feedback.error { border-color:rgba(230,139,126,.45); background:rgba(130,47,42,.16); color:#ffd1c9; }
-.world-mvp__reclaim-feedback.success { border-color:rgba(130,190,145,.4); background:rgba(53,103,68,.16); color:#c8ebd0; }
-.world-mvp__reclaim-feedback p { margin:5px 0; }
-.world-mvp__reclaim-feedback ul { margin:5px 0 0; padding-left:17px; color:#f4c4bb; }
-.world-mvp__save-status { color:#a9bbb3; font-size:10px; }
-.world-mvp .world-mvp__save-button { border-color:#8fbea0; color:#14251c; background:#a5c9b1; font-weight:700; }
-.world-mvp a,.world-mvp button { border:1px solid rgba(255,255,255,.13); border-radius:7px; padding:8px 10px; color:#dce7e3; background:rgba(255,255,255,.06); text-decoration:none; cursor:pointer; font:inherit; font-size:11px; }
-.world-mvp button:hover,.world-mvp a:hover { border-color:#a5c9b1; background:rgba(165,201,177,.13); }
-.world-mvp button:disabled { opacity:.35; cursor:not-allowed; }
-.world-mvp__placement-status.is-blocked { color:#ff918b; }
-.world-mvp__panel { position:absolute; z-index:2; top:78px; left:14px; bottom:48px; width:290px; overflow:auto; padding:0 14px 14px; border:1px solid rgba(255,255,255,.1); border-radius:11px; background:rgba(16,27,34,.91); box-shadow:0 14px 42px rgba(0,0,0,.22); backdrop-filter:blur(16px); }
-.world-mvp__panel section { padding:15px 0; border-bottom:1px solid rgba(255,255,255,.09); }
-.world-mvp__world-size { display:flex; align-items:center; justify-content:space-between; margin:8px 0; padding:9px; border:1px solid rgba(165,201,177,.22); border-radius:7px; background:rgba(165,201,177,.05); }
-.world-mvp__world-size span,.world-mvp__world-note { color:#9eafad; font-size:10px; }
-.world-mvp__world-size strong { color:#c6e4ce; font-size:13px; font-variant-numeric:tabular-nums; }
-.world-mvp__expand-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; align-items:center; }
-.world-mvp__expand-grid button { padding:8px 3px; font-size:10px; }
-.world-mvp__world-center { text-align:center; color:#c6e4ce; font-size:10px; }
-.world-mvp__world-note { display:block; margin-top:8px; line-height:1.5; }
-.world-mvp__panel h2 { margin:0 0 12px; font-size:12px; }
-.world-mvp__model-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:6px; }
-.world-mvp__model-note { display:block; margin-top:4px; color:#9eafad; font-size:9px; line-height:1.45; }
-.world-mvp .world-mvp__demo-button { width:100%; margin-top:7px; border-color:rgba(165,201,177,.45); color:#c6e4ce; }
-.world-mvp__selected-context { margin-top:10px; padding:10px; border:1px solid rgba(165,201,177,.32); border-radius:8px; background:rgba(165,201,177,.055); }
-.world-mvp__selected-heading span,.world-mvp__selected-heading strong { display:block; }
-.world-mvp__selected-heading span { color:#8e9fa3; font-size:10px; }
-.world-mvp__selected-heading strong { margin-top:5px; color:#e5efe8; font-size:12px; overflow-wrap:anywhere; }
-.world-mvp__selected-context .world-mvp__message { min-height:0; margin:7px 0; }
-.world-mvp__primary-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
-.world-mvp__primary-actions button:last-child { grid-column:1 / -1; }
-.world-mvp__transform-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
-.world-mvp__secondary-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
-.world-mvp__empty-selection { margin:10px 0 0; padding:10px; border:1px dashed rgba(255,255,255,.14); border-radius:7px; color:#9eafad; font-size:10px; line-height:1.6; }
-.world-mvp__tools { display:grid; grid-template-columns:repeat(3,1fr); gap:5px; margin-top:8px; }
-.world-mvp__operation-panel { min-height:100%; }
-.world-mvp__operation-name { display:block; margin:5px 0 10px; color:#e5efe8; font-size:13px; overflow-wrap:anywhere; }
-.world-mvp__operation-panel .world-mvp__message { margin:8px 0 12px; line-height:1.65; }
-.world-mvp__footprint-info { display:grid; gap:5px; margin:12px 0; padding:10px; border:1px solid rgba(165,201,177,.28); border-radius:8px; background:rgba(165,201,177,.07); }
-.world-mvp__footprint-info span { color:#aabbb4; font-size:10px; }
-.world-mvp__footprint-info strong { color:#c6e4ce; font-size:14px; font-variant-numeric:tabular-nums; }
-.world-mvp__footprint-info small { color:#81958d; font-size:9px; }
-.world-mvp__placement-status { margin:12px 0; color:#c6e4ce; font-size:10px; line-height:1.6; }
-.world-mvp__placement-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
-.world-mvp__placement-expand { margin-top:14px; padding-top:12px; border-top:1px solid rgba(255,255,255,.09); }
-.world-mvp__placement-expand > span { display:block; margin-bottom:8px; color:#aabbb4; font-size:10px; }
-.world-mvp__placement-expand .world-mvp__expand-grid button { padding:6px 3px; }
-.world-mvp__placement-actions button:first-child { grid-column:1 / -1; border-color:#8fbea0; color:#14251c; background:#a5c9b1; font-weight:700; }
-.world-mvp__placement-actions button:disabled { color:#dce7e3; background:rgba(255,255,255,.06); }
-.world-mvp__placement { margin-top:9px; padding:10px; border:1px solid rgba(165,201,177,.35); border-radius:8px; background:rgba(165,201,177,.08); }
-.world-mvp__placement strong { display:block; color:#c6e4ce; font-size:11px; }
-.world-mvp__placement p { margin:7px 0; color:#b4c1c1; font-size:10px; line-height:1.55; }
-.world-mvp__placement .world-mvp__tools { grid-template-columns:repeat(2,1fr); }
-.world-mvp button.active { border-color:#a5c9b1; color:#c6e4ce; background:rgba(165,201,177,.16); }
-.world-mvp__list { display:grid; gap:4px; max-height:100px; overflow:auto; margin-top:8px; }
-.world-mvp__list button { text-align:left; }
-.world-mvp__field { display:grid; gap:8px; margin:12px 0; color:#b4c1c1; font-size:11px; }
-.world-mvp__field span { display:flex; justify-content:space-between; }
-.world-mvp__field b { color:#e1ebe4; }
-.world-mvp__toggle { display:flex; align-items:center; gap:8px; margin:10px 0; color:#b4c1c1; font-size:11px; }
-.world-mvp__toggle input { accent-color:#a5c9b1; }
-.world-mvp__toggle b { margin-left:auto; color:#e1ebe4; font-size:10px; font-weight:500; }
-.world-mvp__field input[type=range] { width:100%; accent-color:#a5c9b1; }
-.world-mvp__field select { padding:8px; border:1px solid rgba(255,255,255,.14); border-radius:7px; color:#e4ece8; background:#1b2a32; }
-.world-mvp__command { display:flex; gap:6px; }
-.world-mvp__command input { min-width:0; flex:1; padding:9px; border:1px solid rgba(255,255,255,.14); border-radius:7px; outline:none; color:#e8efed; background:#1a2931; font:inherit; font-size:11px; }
-.world-mvp__command button { border-color:#a5c9b1; color:#14251c; background:#a5c9b1; font-weight:700; }
-.world-mvp__message { min-height:34px; color:#c5d8cb; font-size:10px; line-height:1.6; }
-.world-mvp__examples { display:flex; flex-wrap:wrap; gap:5px; }
-.world-mvp__examples button { padding:5px 7px; font-size:9px; }
-.world-mvp__help { position:absolute; right:14px; bottom:12px; padding:8px 11px; border:1px solid rgba(255,255,255,.1); border-radius:7px; color:#c7d2d0; background:rgba(16,27,34,.75); font-size:10px; }
-@media(max-width:680px) {
-  .world-mvp__header { height:54px; padding:0 10px; }
-  .world-mvp__header-actions { gap:5px; overflow-x:auto; }
-  .world-mvp__view-switch button { padding:5px 6px; font-size:9px; }
-  .world-mvp__panel { top:auto; left:8px; right:8px; bottom:8px; width:auto; max-height:52vh; padding:0 12px 10px; }
-  .world-mvp__help { display:none; }
-  .world-mvp__chunk-manager { top:62px; right:8px; width:calc(100vw - 16px); max-height:45vh; padding:10px; }
-  .world-mvp__chunk-manager-actions { gap:5px; }
-  .world-mvp__chunk-manager-actions button { padding:7px 8px; font-size:10px; }
+.world-mvp {
+  --ws-pine-950: #0b2019;
+  --ws-pine-900: #102a22;
+  --ws-pine-800: #16382c;
+  --ws-pine-700: #1f4a3a;
+  --ws-chalk: #f2efe3;
+  --ws-cream: #e8ddc3;
+  --ws-sage: #a9b8a6;
+  --ws-sage-dim: #7e9586;
+  --ws-brick: #c2553c;
+  --ws-brick-deep: #a34531;
+  --ws-line: rgba(242, 239, 227, 0.16);
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  min-height: 600px;
+  overflow: hidden;
+  color: var(--ws-chalk);
+  background: var(--ws-pine-950);
+  font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+}
+.world-mvp__viewport { position: absolute; inset: 0; }
+.world-mvp__physics-debug { position: absolute; z-index: 4; left: 18px; top: 82px; display: flex; flex-direction: column; gap: 4px; max-width: min(520px, calc(100vw - 36px)); padding: 10px 12px; border: 1px solid rgba(194, 85, 60, 0.5); border-radius: 2px; color: #f6ead9; background: rgba(35, 25, 16, 0.92); font: 11px/1.45 ui-monospace, monospace; overflow-wrap: anywhere; pointer-events: none; }
+.world-mvp__physics-debug strong { color: #ffc27d; }
+.world-mvp__water-status { position: absolute; z-index: 3; left: 18px; bottom: 22px; display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid rgba(142, 215, 232, 0.4); border-radius: 2px; color: #d8f4fa; background: rgba(9, 32, 42, 0.9); font-size: 11px; pointer-events: none; }
+.world-mvp__water-status strong { color: #8ed7e8; }
+.world-mvp__viewport :deep(canvas) { display: block; width: 100%; height: 100%; }
+.world-mvp__header { position: absolute; z-index: 2; top: 0; left: 0; right: 0; height: 65px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-top: 3px solid var(--ws-brick); border-bottom: 1px solid var(--ws-line); background: var(--ws-pine-950); }
+.world-mvp__brand { display: flex; align-items: center; gap: 10px; }
+.world-mvp__mark { width: 30px; height: 30px; flex: none; }
+.world-mvp__brand strong, .world-mvp__brand span { display: block; }
+.world-mvp__brand strong { font-family: 'Noto Serif SC', 'Songti SC', serif; font-size: 15px; font-weight: 700; letter-spacing: 1px; }
+.world-mvp__brand span { margin-top: 3px; color: var(--ws-sage); font-size: 10.5px; letter-spacing: 0.3px; }
+.world-mvp__header-actions { display: flex; align-items: center; gap: 9px; }
+.world-mvp__view-switch { display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--ws-line); border-radius: 2px; background: var(--ws-pine-900); }
+.world-mvp__view-switch button { padding: 6px 8px; border-color: transparent; white-space: nowrap; }
+.world-mvp__view-switch button.active { border-color: var(--ws-brick); color: #fff7ee; background: var(--ws-brick); }
+.world-mvp__chunk-manager { position: absolute; z-index: 4; top: 79px; right: 14px; width: min(420px, calc(100vw - 28px)); max-height: 42vh; overflow: auto; padding: 12px; border: 1px solid var(--ws-line); border-radius: 2px; background: var(--ws-pine-900); }
+.world-mvp__chunk-manager-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.world-mvp__chunk-manager-head > div:first-child { display: grid; gap: 4px; }
+.world-mvp__chunk-manager-head b { color: var(--ws-chalk); font-size: 12px; }
+.world-mvp__chunk-manager-head span { color: var(--ws-sage); font-size: 10px; line-height: 1.5; }
+.world-mvp__chunk-manager-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.world-mvp__chunk-manager-actions > span { color: var(--ws-cream); font-size: 10px; }
+.world-mvp__chunk-manager-actions .danger { border-color: rgba(230, 139, 126, 0.5); color: #ffc1b6; }
+.world-mvp__chunk-manager-actions .danger:disabled { opacity: 0.35; }
+.world-mvp__chunk-manager-selected { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--ws-line); color: var(--ws-sage); font-size: 10px; }
+.world-mvp__chunk-manager-selected b { color: var(--ws-chalk); }
+.world-mvp__chunk-manager-selected span { padding: 3px 6px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.05); }
+.world-mvp__chunk-manager-selected small { color: var(--ws-sage-dim); }
+.world-mvp__chunk-manager-expand { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--ws-line); display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.world-mvp__chunk-manager-size { display: flex; align-items: baseline; gap: 6px; color: var(--ws-sage); font-size: 10px; }
+.world-mvp__chunk-manager-size strong { color: var(--ws-cream); font-size: 12px; font-variant-numeric: tabular-nums; }
+.world-mvp__chunk-manager-expand-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.world-mvp__chunk-manager-expand-actions span { color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__open-chunk-manager { width: 100%; margin-top: 12px; padding: 13px !important; border-color: var(--ws-line) !important; text-align: left; color: var(--ws-chalk) !important; background: transparent !important; }
+.world-mvp__open-chunk-manager span { display: block; margin-top: 5px; color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__map-toolbar { display: flex; align-items: center; justify-content: space-between; margin: 9px 0 6px; color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__map-toolbar div { display: flex; gap: 5px; }
+.world-mvp__map-toolbar button { width: 27px; height: 25px; padding: 0; font-size: 15px; }
+.world-mvp__chunk-map-viewport { max-width: 100%; max-height: 260px; overflow: auto; border: 1px solid var(--ws-line); border-radius: 2px; background: var(--ws-pine-950); }
+.world-mvp__chunk-map { display: block; max-width: none; }
+.world-mvp__chunk-map-item { cursor: pointer; }
+.world-mvp__chunk-map-item rect { fill: #3f5a4c; fill-opacity: 0.88; stroke: rgba(232, 221, 195, 0.32); stroke-width: 1.3; transition: fill 0.15s, stroke 0.15s; }
+.world-mvp__chunk-map-item:hover rect { fill: #54725f; }
+.world-mvp__chunk-map-item.active rect { fill: var(--ws-brick); stroke: var(--ws-cream); stroke-width: 2.5; }
+.world-mvp__chunk-map-item.anchor rect { fill: var(--ws-pine-700); stroke: var(--ws-sage); stroke-dasharray: 3 2; }
+.world-mvp__chunk-map-item text { fill: var(--ws-chalk); font-size: 10px; pointer-events: none; }
+.world-mvp__selected-chunk { display: flex; flex-direction: column; gap: 4px; margin-top: 9px; padding: 9px; border-radius: 2px; background: rgba(242, 239, 227, 0.05); color: var(--ws-chalk); font-size: 10px; }
+.world-mvp__selected-chunk div { display: flex; justify-content: space-between; gap: 8px; }
+.world-mvp__selected-chunk small { color: var(--ws-sage); }
+.world-mvp .world-mvp__reclaim-button { width: 100%; margin-top: 8px; border-color: rgba(230, 139, 126, 0.4); color: #efb0a6; }
+.world-mvp__reclaim-feedback { margin-top: 9px; padding: 10px; border: 1px solid var(--ws-line); border-radius: 2px; font-size: 10px; line-height: 1.5; }
+.world-mvp__reclaim-feedback.error { border-color: rgba(230, 139, 126, 0.45); background: rgba(130, 47, 42, 0.16); color: #ffd1c9; }
+.world-mvp__reclaim-feedback.success { border-color: rgba(130, 190, 145, 0.4); background: rgba(53, 103, 68, 0.16); color: #c8ebd0; }
+.world-mvp__reclaim-feedback p { margin: 5px 0; }
+.world-mvp__reclaim-feedback ul { margin: 5px 0 0; padding-left: 17px; color: #f4c4bb; }
+.world-mvp__save-status { color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp .world-mvp__save-button { border-color: var(--ws-brick); color: #fff7ee; background: var(--ws-brick); font-weight: 600; }
+.world-mvp a, .world-mvp button { border: 1px solid var(--ws-line); border-radius: 2px; padding: 8px 10px; color: var(--ws-chalk); background: transparent; text-decoration: none; cursor: pointer; font: inherit; font-size: 11px; transition: background 0.16s ease, border-color 0.16s ease; }
+.world-mvp button:hover, .world-mvp a:hover { border-color: rgba(242, 239, 227, 0.34); background: rgba(242, 239, 227, 0.07); }
+.world-mvp button:disabled { opacity: 0.35; cursor: not-allowed; }
+.world-mvp button:focus-visible, .world-mvp a:focus-visible, .world-mvp input:focus-visible, .world-mvp select:focus-visible { outline: 2px solid var(--ws-cream); outline-offset: 2px; }
+.world-mvp__placement-status.is-blocked { color: #ff918b; }
+.world-mvp__panel { position: absolute; z-index: 2; top: 81px; left: 14px; bottom: 48px; width: 290px; overflow: auto; padding: 0 14px 14px; border: 1px solid var(--ws-line); border-radius: 2px; background: var(--ws-pine-800); }
+.world-mvp__panel section { padding: 15px 0; border-bottom: 1px solid var(--ws-line); }
+.world-mvp__world-size { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; padding: 9px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.04); }
+.world-mvp__world-size span, .world-mvp__world-note { color: var(--ws-sage); font-size: 10px; }
+.world-mvp__world-size strong { color: var(--ws-cream); font-size: 13px; font-variant-numeric: tabular-nums; }
+.world-mvp__expand-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 5px; align-items: center; }
+.world-mvp__expand-grid button { padding: 8px 3px; font-size: 10px; }
+.world-mvp__world-center { text-align: center; color: var(--ws-cream); font-size: 10px; }
+.world-mvp__world-note { display: block; margin-top: 8px; line-height: 1.5; }
+.world-mvp__panel h2 { margin: 0 0 12px; font-family: 'Noto Serif SC', 'Songti SC', serif; font-size: 14px; font-weight: 700; letter-spacing: 0.6px; color: var(--ws-chalk); }
+.world-mvp__model-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px; }
+.world-mvp__model-note { display: block; margin-top: 4px; color: var(--ws-sage-dim); font-size: 9px; line-height: 1.45; }
+.world-mvp .world-mvp__demo-button { width: 100%; margin-top: 7px; border-color: var(--ws-line); color: var(--ws-cream); }
+.world-mvp__selected-context { margin-top: 10px; padding: 10px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.04); }
+.world-mvp__selected-heading span, .world-mvp__selected-heading strong { display: block; }
+.world-mvp__selected-heading span { color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__selected-heading strong { margin-top: 5px; color: var(--ws-chalk); font-size: 12px; overflow-wrap: anywhere; }
+.world-mvp__selected-context .world-mvp__message { min-height: 0; margin: 7px 0; }
+.world-mvp__primary-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.world-mvp__primary-actions button:last-child { grid-column: 1 / -1; }
+.world-mvp__transform-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.world-mvp__secondary-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.world-mvp__empty-selection { margin: 10px 0 0; padding: 10px; border: 1px dashed var(--ws-line); border-radius: 2px; color: var(--ws-sage-dim); font-size: 10px; line-height: 1.6; }
+.world-mvp__tools { display: grid; grid-template-columns: repeat(3, 1fr); gap: 5px; margin-top: 8px; }
+.world-mvp__operation-panel { min-height: 100%; }
+.world-mvp__operation-name { display: block; margin: 5px 0 10px; color: var(--ws-chalk); font-size: 13px; overflow-wrap: anywhere; }
+.world-mvp__operation-panel .world-mvp__message { margin: 8px 0 12px; line-height: 1.65; }
+.world-mvp__footprint-info { display: grid; gap: 5px; margin: 12px 0; padding: 10px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.04); }
+.world-mvp__footprint-info span { color: var(--ws-sage); font-size: 10px; }
+.world-mvp__footprint-info strong { color: var(--ws-cream); font-size: 14px; font-variant-numeric: tabular-nums; }
+.world-mvp__footprint-info small { color: var(--ws-sage-dim); font-size: 9px; }
+.world-mvp__placement-status { margin: 12px 0; color: var(--ws-cream); font-size: 10px; line-height: 1.6; }
+.world-mvp__placement-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.world-mvp__placement-expand { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--ws-line); }
+.world-mvp__placement-expand > span { display: block; margin-bottom: 8px; color: var(--ws-sage); font-size: 10px; }
+.world-mvp__placement-expand .world-mvp__expand-grid button { padding: 6px 3px; }
+.world-mvp__placement-actions button:first-child { grid-column: 1 / -1; border-color: var(--ws-brick); color: #fff7ee; background: var(--ws-brick); font-weight: 600; }
+.world-mvp__placement-actions button:disabled { color: var(--ws-chalk); background: transparent; }
+.world-mvp__placement { margin-top: 9px; padding: 10px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.04); }
+.world-mvp__placement strong { display: block; color: var(--ws-cream); font-size: 11px; }
+.world-mvp__placement p { margin: 7px 0; color: var(--ws-sage); font-size: 10px; line-height: 1.55; }
+.world-mvp__placement .world-mvp__tools { grid-template-columns: repeat(2, 1fr); }
+.world-mvp button.active { border-color: var(--ws-brick); color: #f8e9e4; background: rgba(194, 85, 60, 0.2); }
+.world-mvp__list { display: grid; gap: 4px; max-height: 100px; overflow: auto; margin-top: 8px; }
+.world-mvp__list button { text-align: left; }
+.world-mvp__field { display: grid; gap: 8px; margin: 12px 0; color: var(--ws-sage); font-size: 11px; }
+.world-mvp__field span { display: flex; justify-content: space-between; }
+.world-mvp__field b { color: var(--ws-chalk); }
+.world-mvp__toggle { display: flex; align-items: center; gap: 8px; margin: 10px 0; color: var(--ws-sage); font-size: 11px; }
+.world-mvp__toggle input { accent-color: var(--ws-brick); }
+.world-mvp__toggle b { margin-left: auto; color: var(--ws-chalk); font-size: 10px; font-weight: 500; }
+.world-mvp__field input[type=range] { width: 100%; accent-color: var(--ws-brick); }
+.world-mvp select { padding: 8px; border: 1px solid var(--ws-line); border-radius: 2px; color: var(--ws-chalk); background: var(--ws-pine-900); font: inherit; font-size: 11px; }
+.world-mvp input[type=file] { width: 100%; padding: 6px; border: 1px solid var(--ws-line); border-radius: 2px; color: var(--ws-sage); background: var(--ws-pine-900); font-size: 10px; }
+.world-mvp input[type=file]::file-selector-button { margin-right: 8px; padding: 5px 8px; border: 1px solid var(--ws-line); border-radius: 2px; color: var(--ws-chalk); background: transparent; cursor: pointer; font: inherit; font-size: 10px; }
+.world-mvp__panel, .world-mvp__chunk-manager, .world-mvp__list, .world-mvp__chunk-map-viewport { scrollbar-width: thin; scrollbar-color: var(--ws-pine-700) transparent; }
+.world-mvp__panel::-webkit-scrollbar, .world-mvp__chunk-manager::-webkit-scrollbar, .world-mvp__list::-webkit-scrollbar, .world-mvp__chunk-map-viewport::-webkit-scrollbar { width: 8px; height: 8px; }
+.world-mvp__panel::-webkit-scrollbar-thumb, .world-mvp__chunk-manager::-webkit-scrollbar-thumb, .world-mvp__list::-webkit-scrollbar-thumb, .world-mvp__chunk-map-viewport::-webkit-scrollbar-thumb { background: var(--ws-pine-700); border-radius: 0; }
+.world-mvp__panel::-webkit-scrollbar-track, .world-mvp__chunk-manager::-webkit-scrollbar-track, .world-mvp__list::-webkit-scrollbar-track, .world-mvp__chunk-map-viewport::-webkit-scrollbar-track { background: transparent; }
+.world-mvp__command { display: flex; gap: 6px; }
+.world-mvp__command input { min-width: 0; flex: 1; padding: 9px; border: 1px solid var(--ws-line); border-radius: 2px; outline: none; color: var(--ws-chalk); background: var(--ws-pine-900); font: inherit; font-size: 11px; }
+.world-mvp__command button { border-color: var(--ws-brick); color: #fff7ee; background: var(--ws-brick); font-weight: 600; }
+.world-mvp__message { min-height: 34px; color: var(--ws-sage); font-size: 10px; line-height: 1.6; }
+.world-mvp__examples { display: flex; flex-wrap: wrap; gap: 5px; }
+.world-mvp__examples button { padding: 5px 7px; font-size: 9px; }
+.world-mvp__help { position: absolute; right: 14px; bottom: 12px; padding: 8px 11px; border: 1px solid var(--ws-line); border-radius: 2px; color: var(--ws-sage); background: var(--ws-pine-900); font-size: 10px; }
+@media (max-width: 680px) {
+  .world-mvp__header { height: 57px; padding: 0 10px; }
+  .world-mvp__header-actions { gap: 5px; overflow-x: auto; }
+  .world-mvp__view-switch button { padding: 5px 6px; font-size: 9px; }
+  .world-mvp__panel { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: 52vh; padding: 0 12px 10px; }
+  .world-mvp__help { display: none; }
+  .world-mvp__chunk-manager { top: 65px; right: 8px; width: calc(100vw - 16px); max-height: 45vh; padding: 10px; }
+  .world-mvp__chunk-manager-actions { gap: 5px; }
+  .world-mvp__chunk-manager-actions button { padding: 7px 8px; font-size: 10px; }
+}
+/* Liquid glass 主题：浅色磨砂玻璃 + 薄荷青强调色 */
+.world-mvp {
+  --ws-chalk: #0f2e26;
+  --ws-cream: #0b3d32;
+  --ws-sage: #3f5a4e;
+  --ws-sage-dim: #5d7a6c;
+  --ws-brick: #1f9d78;
+  --ws-brick-deep: #187a5d;
+  --ws-line: rgba(15, 46, 38, 0.14);
+  --ws-pine-950: transparent;
+  --ws-pine-900: rgba(255, 255, 255, 0.3);
+  --ws-pine-800: rgba(255, 255, 255, 0.46);
+  --ws-pine-700: rgba(255, 255, 255, 0.6);
+  background: transparent;
+  color: var(--ws-chalk);
+}
+.world-mvp__header {
+  top: 14px;
+  left: 14px;
+  right: 14px;
+  height: 60px;
+  padding: 0 14px;
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 18px;
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.5), rgba(255, 255, 255, 0.24));
+  backdrop-filter: blur(26px) saturate(1.7);
+  -webkit-backdrop-filter: blur(26px) saturate(1.7);
+  box-shadow: 0 24px 60px rgba(24, 64, 48, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.92);
+}
+.world-mvp__brand strong { font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 14.5px; font-weight: 700; letter-spacing: 0.4px; color: var(--ws-chalk); }
+.world-mvp__brand span { color: var(--ws-sage); }
+.world-mvp__panel,
+.world-mvp__chunk-manager {
+  background: linear-gradient(160deg, rgba(255, 255, 255, 0.54), rgba(255, 255, 255, 0.26));
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  border-radius: 20px;
+  backdrop-filter: blur(28px) saturate(1.8);
+  -webkit-backdrop-filter: blur(28px) saturate(1.8);
+  box-shadow: 0 24px 60px rgba(24, 64, 48, 0.16), inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  color: var(--ws-chalk);
+}
+.world-mvp__panel { top: 88px; bottom: 20px; }
+.world-mvp__chunk-manager { top: 86px; }
+.world-mvp__panel h2 { font-family: 'Noto Sans SC', 'Microsoft YaHei', sans-serif; font-size: 13px; font-weight: 700; letter-spacing: 0.3px; color: var(--ws-chalk); }
+.world-mvp a,
+.world-mvp button {
+  border: 1px solid rgba(15, 46, 38, 0.16);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.36);
+  color: var(--ws-chalk);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+}
+.world-mvp a:hover,
+.world-mvp button:hover { border-color: rgba(15, 46, 38, 0.24); background: rgba(255, 255, 255, 0.6); }
+.world-mvp button.active { border-color: rgba(31, 157, 120, 0.4); background: rgba(127, 240, 200, 0.3); color: #0b3d32; }
+.world-mvp__view-switch { border-color: rgba(255, 255, 255, 0.65); border-radius: 14px; background: rgba(255, 255, 255, 0.24); }
+.world-mvp__view-switch button { background: transparent; border-color: transparent; border-radius: 11px; }
+.world-mvp__view-switch button.active { border-color: transparent; background: linear-gradient(135deg, #7ff0c8, #6fd8e6); color: #073b2e; box-shadow: 0 8px 18px rgba(63, 214, 164, 0.26), inset 0 1px 0 rgba(255, 255, 255, 0.5); }
+.world-mvp .world-mvp__save-button { border-color: transparent; background: linear-gradient(135deg, #7ff0c8, #6fd8e6); color: #073b2e; font-weight: 700; box-shadow: 0 10px 22px rgba(63, 214, 164, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.55); }
+.world-mvp .world-mvp__save-button:hover { background: linear-gradient(135deg, #93f7d4, #82e4ef); }
+.world-mvp select,
+.world-mvp__command input {
+  background: rgba(255, 255, 255, 0.34);
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  border-radius: 12px;
+  color: var(--ws-chalk);
+}
+.world-mvp input[type=file] { background: rgba(255, 255, 255, 0.3); border: 1px solid rgba(255, 255, 255, 0.65); border-radius: 12px; color: var(--ws-sage); }
+.world-mvp input[type=file]::file-selector-button { border: 1px solid rgba(15, 46, 38, 0.16); border-radius: 9px; color: var(--ws-chalk); background: rgba(255, 255, 255, 0.45); }
+.world-mvp__world-size,
+.world-mvp__selected-context,
+.world-mvp__footprint-info,
+.world-mvp__placement,
+.world-mvp__chunk-manager-selected span {
+  background: rgba(255, 255, 255, 0.26);
+  border-color: rgba(255, 255, 255, 0.6);
+  border-radius: 12px;
+}
+.world-mvp__chunk-manager-selected span { border-radius: 9px; }
+.world-mvp__publish-note { width: 100%; box-sizing: border-box; padding: 8px 10px; border: 1px solid rgba(255, 255, 255, 0.65); border-radius: 12px; background: rgba(255, 255, 255, 0.34); color: var(--ws-chalk); font: inherit; font-size: 11px; resize: vertical; }
+.world-mvp__publish-note:focus { outline: 2px solid rgba(31, 157, 120, 0.35); border-color: rgba(31, 157, 120, 0.4); }
+.world-mvp__publish-submit { width: 100%; margin-top: 7px; }
+.world-mvp__publish-state { margin-top: 7px; color: var(--ws-sage); font-size: 10px; line-height: 1.6; }
+.world-mvp__chunk-map-viewport { background: rgba(255, 255, 255, 0.2); border-color: rgba(255, 255, 255, 0.6); border-radius: 12px; }
+.world-mvp__chunk-map-item rect { fill: rgba(15, 46, 38, 0.35); stroke: rgba(255, 255, 255, 0.7); }
+.world-mvp__chunk-map-item:hover rect { fill: rgba(15, 46, 38, 0.5); }
+.world-mvp__chunk-map-item.active rect { fill: #35c99b; stroke: #ffffff; }
+.world-mvp__chunk-map-item.anchor rect { fill: rgba(15, 46, 38, 0.22); stroke: rgba(15, 46, 38, 0.55); }
+.world-mvp__chunk-map-item text { fill: #0f2e26; }
+.world-mvp__help { background: rgba(255, 255, 255, 0.38); border-color: rgba(255, 255, 255, 0.65); border-radius: 12px; color: var(--ws-sage); }
+.world-mvp__toggle input,
+.world-mvp__field input[type=range] { accent-color: #1f9d78; }
+.world-mvp__placement-actions button:first-child,
+.world-mvp__command button { border-color: transparent; background: linear-gradient(135deg, #7ff0c8, #6fd8e6); color: #073b2e; font-weight: 700; }
+.world-mvp__reclaim-feedback { border-radius: 12px; }
+.world-mvp__physics-debug { border-radius: 12px; }
+.world-mvp__water-status { border-radius: 12px; }
+.world-mvp__panel,
+.world-mvp__chunk-manager,
+.world-mvp__list,
+.world-mvp__chunk-map-viewport { scrollbar-width: thin; scrollbar-color: rgba(15, 46, 38, 0.28) transparent; }
+.world-mvp__panel::-webkit-scrollbar-thumb,
+.world-mvp__chunk-manager::-webkit-scrollbar-thumb,
+.world-mvp__list::-webkit-scrollbar-thumb,
+.world-mvp__chunk-map-viewport::-webkit-scrollbar-thumb { background: rgba(15, 46, 38, 0.28); }
+@media (max-width: 680px) {
+  .world-mvp__header { top: 8px; left: 8px; right: 8px; height: 56px; padding: 0 10px; border-radius: 16px; }
+  .world-mvp__panel { top: auto; bottom: 8px; border-radius: 18px; }
+  .world-mvp__chunk-manager { top: 72px; border-radius: 18px; }
 }
 </style>
