@@ -3025,6 +3025,7 @@ html.is-scrolling .serif-accent {
   }
 
   .hero {
+    min-height: auto;
     padding-top: 124px;
   }
 
@@ -3270,7 +3271,7 @@ html.is-scrolling .serif-accent {
   }
 
   .hero h1 {
-    font-size: clamp(2.85rem, 12.5vw, 4.1rem);
+    font-size: clamp(2.6rem, 11.5vw, 4.1rem);
     letter-spacing: -0.055em;
   }
 
@@ -3657,11 +3658,50 @@ html.is-scrolling .serif-accent {
 
 @media (max-width: 340px) {
   .hero h1 {
-    font-size: 2.35rem;
+    font-size: 2.2rem;
+  }
+
+  .brand-text {
+    font-size: 12px;
   }
 
   .brand-text small {
     display: none;
+  }
+
+  .brand {
+    gap: 8px;
+  }
+
+  .brand img {
+    width: 30px;
+    height: 30px;
+  }
+
+  .header-inner {
+    gap: 8px;
+    padding: 0 10px;
+  }
+
+  .header-actions {
+    gap: 6px;
+  }
+
+  .github-link {
+    width: 34px;
+    min-height: 34px;
+    padding: 0;
+    justify-content: center;
+  }
+
+  .github-link .star-mark {
+    display: none;
+  }
+
+  .theme-toggle {
+    width: 34px;
+    padding: 0;
+    justify-content: center;
   }
 }
 
@@ -4499,6 +4539,105 @@ html.is-scrolling .serif-accent {
 
 :root[data-theme="light"] .theme-sun {
   display: grid;
+}
+
+@media (max-width: 960px) {
+  .door-grid {
+    grid-template-columns: 1fr;
+    gap: 16px;
+  }
+
+  .door-visual {
+    height: clamp(210px, 44vw, 280px);
+  }
+
+  .agent-loop {
+    flex-wrap: wrap;
+    gap: 10px 16px;
+  }
+
+  .agent-loop > a {
+    margin-left: 0;
+  }
+}
+
+@media (max-width: 640px) {
+  .door-body {
+    padding: 21px 21px 23px;
+  }
+
+  .door-body p {
+    font-size: 13px;
+  }
+
+  .door-visual {
+    height: 195px;
+  }
+
+  .agent-loop {
+    padding: 14px 16px;
+  }
+
+  .loop-steps {
+    gap: 6px;
+    font-size: 9px;
+  }
+
+  .loop-steps i {
+    width: 10px;
+  }
+}
+
+@media (min-width: 961px) and (max-height: 820px) {
+  .hero {
+    padding-top: 110px;
+    padding-bottom: 24px;
+  }
+
+  .lede {
+    margin: 22px 0 26px;
+  }
+
+  .hero-meta {
+    margin-top: 24px;
+  }
+
+  .hero-bottom {
+    padding-top: 24px;
+  }
+}
+
+@media (max-width: 960px) and (max-height: 520px) and (orientation: landscape) {
+  .hero {
+    min-height: auto;
+    padding: 92px 0 24px;
+  }
+
+  .hero-inner {
+    grid-template-columns: 1fr;
+    gap: 20px;
+  }
+
+  .hero h1 {
+    font-size: clamp(2rem, 5.6vw, 2.9rem);
+  }
+
+  .kicker {
+    margin-bottom: 14px;
+  }
+
+  .lede,
+  .hero-meta,
+  .hero-stage,
+  .hero-bottom {
+    display: none;
+  }
+
+  .hero-actions .btn {
+    min-height: 42px;
+    padding: 0 15px;
+    font-size: 12px;
+  }
 }
 
 /* ---------- scroll-linked motion (Chromium / Edge) ---------- */
