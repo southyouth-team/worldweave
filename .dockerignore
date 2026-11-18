@@ -2,7 +2,8 @@ node_modules
 dist
 .git
 .github
-server
+server/**
+!server/src/shared/**
 public/__recovery__
 docs
 *.log

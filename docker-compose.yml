@@ -39,7 +39,7 @@ services:
     ports:
       - "3001:3001"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/v1/published-homepage"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/api/v1/published-homepage"]
       interval: 10s
       timeout: 5s
       retries: 20

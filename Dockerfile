@@ -1,7 +1,9 @@
 FROM node:24-alpine AS build
 WORKDIR /app
 COPY package.json package-lock.json ./
-RUN npm ci
+ENV NPM_CONFIG_REGISTRY=https://registry.npmjs.org
+ENV NPM_CONFIG_REPLACE_REGISTRY_HOST=always
+RUN npm ci --no-audit --no-fund
 COPY . .
 ARG VITE_API_BASE_URL=http://localhost:3001/api/v1
 ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
