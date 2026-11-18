@@ -37,7 +37,7 @@ async function bootstrap() {
   if (config.get<string>('NODE_ENV') !== 'production') {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('Worldweave API')
-      .setDescription('Source-available AI-assisted 3D world sandbox API')
+      .setDescription('Source-available AI world builder API')
       .setVersion('1.0')
       .build();
     SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, swaggerConfig));

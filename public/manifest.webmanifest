@@ -1,7 +1,7 @@
 {
   "name": "Worldweave · 织界",
   "short_name": "织界",
-  "description": "源码公开的 AI 三维世界沙盒：等距地块编辑、AI 模型生成、发布审核与团队协作。",
+  "description": "源码公开的 AI 世界构建器：等距地块编辑、AI 模型生成、发布审核与团队协作。",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

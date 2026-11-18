@@ -13,12 +13,23 @@
   <a href="https://github.com/southyouth-team/worldweave/actions/workflows/backend-ci.yml"><img alt="Backend CI" src="https://github.com/southyouth-team/worldweave/actions/workflows/backend-ci.yml/badge.svg?branch=main" /></a>
 </p>
 
-**源码公开的 AI 三维世界沙盒。**
-Worldweave 把地块化 2.5D / 3D 世界编辑、AI 程序化模型生成、发布审核和团队协作放在同一个工作台里。校园只是内置示例场景——它同样可以用于园区、展场、乐园或任何等距世界。
+**源码公开的 AI 世界构建器。**
+Worldweave 不是地图查看器，而是一个世界构建器：从一个地块开始，扩展边界、铺设道路、放置或生成建筑，调节这个世界的环境时间，然后把完成的版本发布成别人可以走进去探索的 3D 世界。校园只是内置示例场景——同一个工作台可以用于园区、展场、乐园或任何等距世界。
 
-> Source-available AI-assisted isometric world sandbox. Campus is a demo, not a limit.
+> Source-available AI world builder. Start with a plot, shape a world, give it time, and publish it for others to explore.
 
 > 本项目使用 **CC BY-NC-SA 4.0**：允许非商业使用、修改和分发，要求署名并以相同协议共享；禁止商业用途。它不是 OSI 认证的开源许可证。商业使用需单独授权。
+
+## 什么是 Worldweave
+
+Worldweave 把「搭建、生成、拥有时间、发布与协作」放在同一个工作台里：
+
+- **搭建**：从一块地块开始扩展世界，铺路、放置模型、编辑占地轮廓和地块边界。
+- **生成**：用对话和参考图让 AI 分阶段生成建筑与场景模型，部件可继续局部微调。
+- **世界时间**：每个世界有自己的环境时间——时刻决定日出日落与光照，天气、风力和人工照明可以独立调整。
+- **发布**：成员提交冻结版本，管理员用 3D 视图审核模型与位置，通过后首页切换成这份世界，访客可以直接走进去探索。
+
+> 当前“世界时间”是可调的环境时间（时刻 / 天气 / 光照 / 风），不是完整的历史或事件模拟；季节循环、昼夜自动推进和事件脚本在路线图中。
 
 ## 界面预览
 
@@ -41,6 +52,7 @@ Worldweave 把地块化 2.5D / 3D 世界编辑、AI 程序化模型生成、发�
 
 ## 目录
 
+- [什么是 Worldweave](#什么是-worldweave)
 - [功能](#功能)
 - [架构](#架构)
 - [技术栈](#技术栈)
