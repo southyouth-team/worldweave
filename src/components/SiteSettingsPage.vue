@@ -107,7 +107,7 @@
             </div>
             <div class="logo-actions">
               <button type="button" class="btn primary-ghost" @click="triggerLogoUpload">上传 logo</button>
-              <button type="button" class="btn" :disabled="!form.logoDataUrl" @click="useDefaultLogo">使用默认印章</button>
+              <button type="button" class="btn" :disabled="!form.logoDataUrl" @click="useDefaultLogo">使用默认 logo</button>
               <span class="logo-meta">{{ logoSizeLabel }}</span>
             </div>
             <input ref="logoInput" type="file" accept="image/svg+xml,image/png,image/jpeg,image/webp" hidden @change="onLogoFile" />
@@ -223,7 +223,7 @@ const previewUrl = computed(() => {
   if (typeof location !== 'undefined' && location.origin) return location.origin + '/'
   return 'https://campus.example/'
 })
-const logoSizeLabel = computed(() => form.logoDataUrl ? Math.max(1, Math.ceil(dataUrlByteLength(form.logoDataUrl) / 1024)) + ' KB' : '当前使用默认印章')
+const logoSizeLabel = computed(() => form.logoDataUrl ? Math.max(1, Math.ceil(dataUrlByteLength(form.logoDataUrl) / 1024)) + ' KB' : '当前使用默认 logo')
 
 function setStatus(text, type = 'info') {
   status.value = text
@@ -314,7 +314,7 @@ function onLogoFile(event) {
 
 function useDefaultLogo() {
   form.logoDataUrl = null
-  setStatus('已选择默认印章，保存后生效。', 'info')
+  setStatus('已选择默认 logo，保存后生效。', 'info')
 }
 </script>
 

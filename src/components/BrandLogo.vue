@@ -1,6 +1,6 @@
 <template>
   <span class="brand-logo" role="img" :aria-label="siteSettings.brandName">
-    <img v-if="resolvedSrc" :src="resolvedSrc" :alt="siteSettings.brandName" />
+    <img v-if="resolvedSrc && !imageFailed" :src="resolvedSrc" :alt="siteSettings.brandName" @error="imageFailed = true" />
     <svg v-else viewBox="0 0 40 40" aria-hidden="true">
       <defs>
         <linearGradient :id="gradientId" x1="0" y1="0" x2="1" y2="1">
@@ -17,15 +17,20 @@
 </template>
 
 <script setup>
-import { computed } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { siteSettings } from '../site/siteSettings.js'
 
 const props = defineProps({
-  // 传 null 表示强制使用默认印章；不传则读取已保存的站点 logo。
+  // 传 null 表示强制使用默认 logo；不传则读取已保存的站点 logo。
   src: { type: String, default: undefined },
 })
 const gradientId = 'brand-seal-' + Math.random().toString(36).slice(2, 8)
-const resolvedSrc = computed(() => (props.src !== undefined ? props.src : siteSettings.logoDataUrl))
+const imageFailed = ref(false)
+const defaultLogoSrc = '/brand-logo.png'
+const resolvedSrc = computed(() => (
+  props.src !== undefined ? (props.src || defaultLogoSrc) : (siteSettings.logoDataUrl || defaultLogoSrc)
+))
+watch(resolvedSrc, () => { imageFailed.value = false })
 </script>
 
 <style scoped>

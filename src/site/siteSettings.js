@@ -116,7 +116,7 @@ export function applyDocumentBranding(pathname) {
     icon.setAttribute('type', 'image/svg+xml')
     document.head.appendChild(icon)
   }
-  icon.setAttribute('href', siteSettings.logoDataUrl || '/favicon.svg')
+  icon.setAttribute('href', siteSettings.logoDataUrl || '/brand-logo.png')
 }
 
 function setNamedMeta(name, content) {
