@@ -541,6 +541,46 @@
     })
   })
 
+  /* ---------- in-page how-it-works tabs ---------- */
+  const howTabs = [...document.querySelectorAll('[data-how-tab]')]
+  const howPanels = [...document.querySelectorAll('[data-how-panel]')]
+
+  function selectHowPanel(key, options = {}) {
+    if (!howTabs.length) return
+    const activeTab = howTabs.find((tab) => tab.dataset.howTab === key)
+    if (!activeTab) return
+
+    howTabs.forEach((tab) => {
+      const selected = tab === activeTab
+      tab.setAttribute('aria-selected', String(selected))
+      tab.tabIndex = selected ? 0 : -1
+      if (selected && options.focus) tab.focus()
+    })
+
+    howPanels.forEach((panel) => {
+      const active = panel.dataset.howPanel === key
+      panel.hidden = !active
+      if (!active) return
+      // A hidden panel never intersects the reveal observer; reveal its
+      // contents once it becomes the active tab.
+      panel.querySelectorAll('[data-reveal]').forEach((el) => el.classList.add('is-visible'))
+    })
+  }
+
+  howTabs.forEach((tab, index) => {
+    tab.addEventListener('click', () => selectHowPanel(tab.dataset.howTab))
+    tab.addEventListener('keydown', (event) => {
+      if (!['ArrowRight', 'ArrowLeft', 'Home', 'End'].includes(event.key)) return
+      event.preventDefault()
+      let next = index
+      if (event.key === 'ArrowRight') next = (index + 1) % howTabs.length
+      if (event.key === 'ArrowLeft') next = (index - 1 + howTabs.length) % howTabs.length
+      if (event.key === 'Home') next = 0
+      if (event.key === 'End') next = howTabs.length - 1
+      selectHowPanel(howTabs[next].dataset.howTab, { focus: true })
+    })
+  })
+
   /* ---------- quick start tabs + copy ---------- */
   const startTabs = [...document.querySelectorAll('[data-start-tab]')]
   const startPanels = [...document.querySelectorAll('[data-start-panel]')]
