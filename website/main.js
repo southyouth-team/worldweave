@@ -39,8 +39,36 @@
   const progress = document.querySelector('[data-progress]')
   const navToggle = document.querySelector('[data-nav-toggle]')
   const navLinks = document.querySelector('#nav-links')
+  const buildSection = document.querySelector('[data-build]')
+  const buildProgress = document.querySelector('[data-build-progress]')
+  const buildStatus = document.querySelector('[data-build-status]')
   let scrollTicking = false
   let headerIdleTimer = 0
+  let lastBuildPercent = -1
+  let buildTop = 0
+  let buildScrollLength = 1
+
+  function measureBuild() {
+    if (!buildSection) return
+    const rect = buildSection.getBoundingClientRect()
+    buildTop = rect.top + (window.scrollY || 0)
+    buildScrollLength = Math.max(1, rect.height - window.innerHeight)
+  }
+
+  function updateBuildProgress() {
+    if (!buildSection) return
+    const progress = Math.max(0, Math.min(1, ((window.scrollY || 0) - buildTop) / buildScrollLength))
+    const stage = progress < 0.3 ? '0' : progress < 0.64 ? '1' : '2'
+    if (buildSection.dataset.stage !== stage) {
+      buildSection.dataset.stage = stage
+      if (buildStatus) buildStatus.textContent = stage === '0' ? 'PLOT' : stage === '1' ? 'ROAD' : 'WORLD'
+    }
+    const percent = Math.round(progress * 100)
+    if (percent !== lastBuildPercent) {
+      lastBuildPercent = percent
+      if (buildProgress) buildProgress.textContent = String(percent).padStart(2, '0')
+    }
+  }
 
   function updateScrollUI() {
     const y = window.scrollY || 0
@@ -59,8 +87,9 @@
     }
     if (progress) {
       const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight)
-      root.style.setProperty('--scroll-progress', String(Math.min(1, y / max)))
+      progress.style.transform = `scaleX(${Math.min(1, y / max)})`
     }
+    updateBuildProgress()
     scrollTicking = false
   }
 
@@ -71,7 +100,15 @@
   }
 
   window.addEventListener('scroll', requestScrollUI, { passive: true })
-  window.addEventListener('resize', requestScrollUI)
+  window.addEventListener('resize', () => {
+    measureBuild()
+    requestScrollUI()
+  })
+  measureBuild()
+  document.fonts?.ready?.then(() => {
+    measureBuild()
+    requestScrollUI()
+  })
   updateScrollUI()
 
   function closeNav() {
@@ -475,15 +512,6 @@
       url: 'worldweave /admin / publish',
       title: '审核不是看一张缩略图，而是走进去看提交的世界。',
       note: '模型、位置、地块范围和说明都跟着冻结快照一起提交。',
-      width: 1280,
-      height: 800,
-    },
-    admin: {
-      src: 'assets/admin.webp',
-      alt: 'Worldweave 管理后台，包含加入申请、发布审核、团队成员和站点设置',
-      url: 'worldweave /admin',
-      title: '成员、申请、发布、站点设置，都在同一套后台里。',
-      note: '管理员专注管理与审核，不进入模型编辑器。',
       width: 1280,
       height: 800,
     },
