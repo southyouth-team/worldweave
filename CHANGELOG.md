@@ -1,3 +1,14 @@
+# Changelog
+
+## 2026-11-18 — Worldweave v0.1.0
+
+- 品牌统一为 Worldweave（织界），新增 README、截图、SECURITY、CONTRIBUTING、NOTICE、CODE_OF_CONDUCT 与 CC BY-NC-SA 4.0 许可证。
+- 新增账号体系：管理员/团队成员、加入申请、审核建号、启停用、重置密码、首次登录改密、httpOnly 会话与登录限流。
+- 新增发布申请与审核：成员提交冻结快照，管理员 3D 预览模型/位置后发布，旧待审版本自动过期；首页读取全局发布版本。
+- 新增站点设置（品牌/标题/SEO/logo/浏览器预览）、管理后台侧边菜单、项目「关于」与首页 GitHub Star 入口。
+- 新增 Docker Compose（PostGIS + API + Nginx 前端）、前后端 CI 覆盖 main/mvp、Issue/PR 模板。
+- 修复既有前端物理基线测试，前端 1144 项、后端 128 项测试全部通过；清理临时 Trace 文件与运行期上传数据。
+
 ## 2026-11-06 — ObjectSculpt 编辑器快捷键与历史合并
 
 - 增加 Ctrl/⌘+Z 撤销、Ctrl/⌘+Shift+Z 与 Ctrl+Y 重做；输入框、文本域、下拉框和可编辑内容区不拦截原生编辑快捷键。

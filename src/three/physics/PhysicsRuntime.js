@@ -362,6 +362,7 @@ export class PhysicsRuntime {
       actualVelocity: { ...entry.actualVelocity },
       lastStepMovement: { ...entry.lastStepMovement },
       grounded: entry.grounded === true,
+      groundedStepCount: entry.groundedStepCount || 0,
       contactCount: entry.contactCount || 0,
       wallContactCount: entry.wallContactCount || 0,
       stepCount: this.stepCount,

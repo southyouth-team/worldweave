@@ -1,0 +1,12 @@
+node_modules
+dist
+.git
+.github
+server
+public/__recovery__
+docs
+*.log
+.env
+.superpowers
+.claude
+**/.DS_Store

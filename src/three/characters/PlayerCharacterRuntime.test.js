@@ -191,7 +191,7 @@ describe('PlayerCharacterRuntime', () => {
     const updater = anchor.userData.updateAnimation
     const runtime = new PlayerCharacterRuntime(THREE, anchor)
     anchor.userData.updateAnimation.call(anchor, true, 1, 0, 0, false, 0.42)
-    expect(updater).toHaveBeenCalledWith(true, 1, 0, 0, 0.42)
+    expect(updater).toHaveBeenCalledWith(true, 1, 0, 0, expect.closeTo(0.42, 5), false)
     runtime.dispose()
   })
 
@@ -253,7 +253,7 @@ describe('PlayerCharacterRuntime gait presentation', () => {
     const runtime = new PlayerCharacterRuntime(THREE, anchor)
 
     anchor.userData.updateAnimation.call(anchor, true, 1, 0, 0, false, 1)
-    expect(updater).toHaveBeenCalledWith(true, 1, 0, 0, 1)
+    expect(updater).toHaveBeenCalledWith(true, 1, 0, 0, 1, false)
 
     updater.mockClear()
     anchor.userData.updateAnimation.call(anchor, true, 1 + 1 / 60, 0, 0, false, 0.42)

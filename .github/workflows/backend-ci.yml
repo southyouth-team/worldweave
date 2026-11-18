@@ -2,18 +2,10 @@ name: Backend CI
 
 on:
   push:
-    branches:
-      - feat/multi-campus-data-foundation
-      - feat/object-model-protocol-p1
-      - feat/img2threejs-procedural-mvp
-      - feat/world-sandbox-conversational-model-editor
+    branches: [main, mvp]
   pull_request:
-    branches:
-      - main
-      - feat/multi-campus-data-foundation
-      - feat/object-model-protocol-p1
-      - feat/img2threejs-procedural-mvp
-      - feat/world-sandbox-conversational-model-editor
+    branches: [main, mvp]
+  workflow_dispatch:
 
 jobs:
   backend:
@@ -43,13 +35,17 @@ jobs:
       DB_PASSWORD: postgres
       DB_NAME: ncgxy_campus_map
       DB_SSL: "false"
+      AUTH_ALLOW_DEV_HEADER: "true"
+      ASSET_STORAGE_DIR: ./uploads
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: server/package-lock.json
       - name: Install dependencies
-        run: npm install
+        run: npm ci
       - name: Build NestJS
         run: npm run build
       - name: Run backend unit tests

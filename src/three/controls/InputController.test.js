@@ -526,15 +526,18 @@ describe('InputController Rapier character movement', () => {
 
   it('routes manual movement and gravity through the Rapier character controller', () => {
     const { controller, cameraRig, collisionWorld } = createController()
-    const { calls } = attachPhysics(controller, cameraRig.player)
+    const { calls, setState } = attachPhysics(controller, cameraRig.player)
+    setState({ grounded: false })
     controller.keys.add('w')
 
     controller.update(0.05)
+    controller.beforeFixedStep({ delta: 1 / 60 })
 
     expect(calls.velocities).toHaveLength(1)
     expect(calls.velocities[0].velocity.x).toBeCloseTo(0)
-    expect(calls.velocities[0].velocity.y).toBeCloseTo(-2)
+    expect(calls.velocities[0].velocity.y).toBeCloseTo(0)
     expect(calls.velocities[0].velocity.z).toBeCloseTo(9)
+    expect(calls.accelerations.at(-1).acceleration.y).toBeCloseTo(-24)
     expect(cameraRig.player).toMatchObject({ x: 0, y: 1.7, z: 0 })
     expect(collisionWorld.move).not.toHaveBeenCalled()
     expect(cameraRig.updateThirdPersonDesired).toHaveBeenCalledOnce()
@@ -574,6 +577,7 @@ describe('InputController Rapier character movement', () => {
     const { controller, cameraRig } = createController()
     const { calls, setState } = attachPhysics(controller, cameraRig.player)
     setState({ grounded: false, verticalVelocity: -1 })
+    controller.verticalVelocity = -1
 
     controller.update(0.05)
     expect(calls.velocities).toHaveLength(0)
@@ -590,6 +594,7 @@ describe('InputController Rapier character movement', () => {
     controller.setNavigationPath([{ x: 0, z: 0 }, { x: 0, z: 2 }])
 
     controller.update(0.05)
+    controller.beforeFixedStep({ delta: 1 / 60 })
 
     expect(calls.velocities).toHaveLength(1)
     expect(calls.velocities[0].velocity.z).toBeCloseTo(5.5)

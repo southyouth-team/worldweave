@@ -294,6 +294,7 @@ export class InputController {
   }
 
   exitPointerLock() {
+    if (typeof document === 'undefined') return
     if (document.pointerLockElement === this.domElement) document.exitPointerLock?.()
   }
 

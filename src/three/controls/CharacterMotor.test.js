@@ -75,7 +75,9 @@ describe('CharacterMotor', () => {
     expect(motor.grounded).toBe(true)
   })
   it('advances jump buffering only when fixed simulation ticks are consumed', () => {
-    const { motor } = createMotor()
+    const { motor, state } = createMotor()
+    state.grounded = false
+    motor.coyoteTimeRemaining = 0
     motor.jumpPlayer()
     const initial = motor.jumpBufferRemaining
     // Render frames that do not produce a physics tick do not touch Motor timers.

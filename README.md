@@ -1,3 +1,5 @@
+<p align="center"><img src="public/brand-logo.png" alt="Worldweave logo" width="96" /></p>
+
 # Worldweave · 织界
 
 <p>
@@ -7,6 +9,8 @@
   <img alt="NestJS" src="https://img.shields.io/badge/NestJS-11-e0234e" />
   <img alt="PostgreSQL" src="https://img.shields.io/badge/PostgreSQL-16%2B%20%7C%20PostGIS-336791" />
   <img alt="Node.js" src="https://img.shields.io/badge/Node.js-20.19%2B-339933" />
+  <a href="https://github.com/southyouth-team/worldweave/actions/workflows/frontend-ci.yml"><img alt="Frontend CI" src="https://github.com/southyouth-team/worldweave/actions/workflows/frontend-ci.yml/badge.svg?branch=main" /></a>
+  <a href="https://github.com/southyouth-team/worldweave/actions/workflows/backend-ci.yml"><img alt="Backend CI" src="https://github.com/southyouth-team/worldweave/actions/workflows/backend-ci.yml/badge.svg?branch=main" /></a>
 </p>
 
 **源码公开的 AI 三维世界沙盒。**
@@ -167,6 +171,16 @@ npm run start:dev
 后端默认监听 <http://localhost:3001>，API 前缀 `/api/v1`，开发环境 Swagger 在 <http://localhost:3001/api/docs>。
 
 开发环境首次启动会自动创建管理员 `admin / Admin@12345`，并强制首次登录改密。**生产环境必须设置 `ADMIN_USERNAME` / `ADMIN_PASSWORD`。**
+
+### Docker Compose（推荐体验）
+
+```bash
+docker compose up --build
+```
+
+打开 <http://localhost:8080/>，默认管理员 `admin / Admin@12345`（可通过 `ADMIN_PASSWORD` 覆盖）。数据库和上传目录使用 Compose volumes 持久化。
+
+> Compose 默认使用 `NODE_ENV=development` 以自动执行 migration 和创建初始管理员；正式部署请改为 production，并显式执行迁移、设置强密码和 `AUTH_ALLOW_DEV_HEADER=false`。
 
 ### 主要入口
 
