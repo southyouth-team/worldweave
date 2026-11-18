@@ -7,6 +7,7 @@ import { applyTextPlates } from './three/sandbox/textPlateRuntime.js'
 import { WEATHER_MODES } from './three/engine/weatherRuntime.js'
 import BrandLogo from './components/BrandLogo.vue'
 import { applyDocumentBranding, loadSiteSettings, siteSettings } from './site/siteSettings.js'
+import { PROJECT } from './site/projectInfo.js'
 import { currentUser, isAdmin, loadCurrentUser, logout } from './auth/authStore.js'
 const CampusPlanEditor = defineAsyncComponent(() => import('./editor/CampusPlanEditor.vue'))
 const IndoorFloorPlanEditor = defineAsyncComponent(() => import('./components/IndoorFloorPlanEditor.vue'))
@@ -681,6 +682,10 @@ onBeforeUnmount(() => {
           <a class="showcase-back login-entry" href="/login">登录</a>
           <a class="showcase-back sandbox-editor-entry join-entry" href="/join">申请加入团队</a>
         </template>
+        <a class="showcase-back github-star-entry" :href="PROJECT.repoUrl" target="_blank" rel="noreferrer" :title="'在 GitHub 上 Star ' + PROJECT.name">
+          <span class="github-star-icon" aria-hidden="true">★</span>
+          <span class="github-star-label">Star</span>
+        </a>
       </div>
     </header>
 

@@ -21,6 +21,7 @@
           </button>
           <button :class="{ active: view === 'users' }" @click="setView('users')">团队成员</button>
           <button :class="{ active: view === 'settings' }" @click="setView('settings')">站点设置</button>
+          <button :class="{ active: view === 'about' }" @click="setView('about')">关于</button>
         </nav>
         <div class="admin-account">
           <strong>{{ currentUser?.displayName || currentUser?.username || '管理员' }}</strong>
@@ -38,7 +39,7 @@
             <h1>{{ viewTitle }}</h1>
             <p>{{ viewDescription }}</p>
           </div>
-          <button v-if="view !== 'settings'" class="btn" :disabled="loadingView" @click="refreshView">刷新</button>
+          <button v-if="view !== 'settings' && view !== 'about'" class="btn" :disabled="loadingView" @click="refreshView">刷新</button>
         </header>
 
         <p v-if="error" class="admin-error" role="alert">{{ error }}</p>
@@ -192,6 +193,10 @@
         <template v-else-if="view === 'settings'">
           <SiteSettingsPage embedded />
         </template>
+
+        <template v-else-if="view === 'about'">
+          <AboutPanel />
+        </template>
       </section>
     </div>
 
@@ -252,6 +257,7 @@ import { computed, onMounted, ref } from 'vue'
 import BrandLogo from './BrandLogo.vue'
 import SnapshotPreview3D from './SnapshotPreview3D.vue'
 import SiteSettingsPage from './SiteSettingsPage.vue'
+import AboutPanel from './AboutPanel.vue'
 import {
   adminApproveApplication,
   adminListApplications,
@@ -286,7 +292,7 @@ const publishTabs = [
 ]
 
 const initialView = new URLSearchParams(typeof location !== 'undefined' ? location.search : '').get('view')
-const view = ref(initialView === 'settings' ? 'settings' : 'overview')
+const view = ref(['settings', 'about'].includes(initialView) ? initialView : 'overview')
 const applicationTab = ref('pending')
 const publishTab = ref('pending')
 const applications = ref([])
@@ -314,7 +320,7 @@ const loadingView = computed(() => {
   if (view.value === 'applications') return loadingApplications.value
   if (view.value === 'users') return loadingUsers.value
   if (view.value === 'publish') return loadingPublish.value
-  if (view.value === 'settings') return false
+  if (view.value === 'settings' || view.value === 'about') return false
   return loadingOverview.value
 })
 const viewTitle = computed(() => ({
@@ -323,6 +329,7 @@ const viewTitle = computed(() => ({
   publish: '发布审核',
   users: '团队成员',
   settings: '站点设置',
+  about: '关于',
 }[view.value] || '概览'))
 const viewDescription = computed(() => ({
   overview: '待处理事项与当前首页版本。',
@@ -330,6 +337,7 @@ const viewDescription = computed(() => ({
   publish: '审核成员提交的沙盒版本，通过后切换首页内容。',
   users: '管理成员角色、启用状态和密码。',
   settings: '配置首页与沙盒的品牌、标题、图标和 SEO。',
+  about: '项目信息、仓库地址与开源许可证。',
 }[view.value] || ''))
 
 onMounted(async () => {
@@ -360,14 +368,14 @@ async function setView(nextView) {
   view.value = nextView
   if (typeof history !== 'undefined' && typeof location !== 'undefined') {
     const url = new URL(location.href)
-    if (nextView === 'settings') url.searchParams.set('view', 'settings')
+    if (nextView === 'settings' || nextView === 'about') url.searchParams.set('view', nextView)
     else url.searchParams.delete('view')
     history.replaceState({}, '', url)
   }
   if (nextView === 'applications') await loadApplications()
   else if (nextView === 'users') await loadUsers()
   else if (nextView === 'publish') await loadPublishRequests()
-  else if (nextView === 'settings') return
+  else if (nextView === 'settings' || nextView === 'about') return
   else await loadOverview()
 }
 

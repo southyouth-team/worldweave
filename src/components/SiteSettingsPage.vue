@@ -114,6 +114,8 @@
           </div>
           <small v-if="errors.logoDataUrl" class="error">{{ errors.logoDataUrl }}</small>
         </section>
+
+        <AboutPanel />
       </div>
 
       <aside class="settings-preview">
@@ -187,6 +189,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import BrandLogo from './BrandLogo.vue'
+import AboutPanel from './AboutPanel.vue'
 import {
   DEFAULT_SITE_SETTINGS,
   MAX_LOGO_BYTES,

@@ -86,6 +86,9 @@ button { font: inherit; }
 .sandbox-editor-entry:hover { background: linear-gradient(135deg, #93f7d4, #82e4ef); border-color: transparent; }
 .settings-entry { width: 34px; padding: 0; display: grid; place-items: center; color: var(--glass-ink-soft); }
 .settings-entry svg { width: 15px; height: 15px; }
+.github-star-entry { display: inline-flex; align-items: center; justify-content: center; gap: 5px; text-decoration: none; color: var(--glass-ink); }
+.github-star-icon { color: #c58a2e; font-size: 13px; line-height: 1; }
+.github-star-label { font-weight: 600; }
 .admin-entry,
 .account-entry,
 .login-entry,
@@ -151,6 +154,8 @@ kbd { min-width: 48px; padding: 3px 6px; border: 1px solid rgba(255, 255, 255, 0
   .showcase-actions { gap: 6px; }
   .showcase-back { padding: 7px 10px; font-size: 11px; }
   .asset-workshop-entry { display: none; }
+  .github-star-label { display: none; }
+  .github-star-entry { width: 32px; padding: 7px 0; }
   .world-dock { left: 8px; right: 8px; bottom: 8px; flex-direction: column; align-items: stretch; gap: 8px; }
   .dock-info { flex: none; max-width: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 8px 12px; border-radius: 14px; }
   .dock-state { font-size: 9.5px; }
