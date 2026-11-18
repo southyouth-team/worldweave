@@ -1,3 +1,28 @@
+/* Self-hosted, subsetted variable fonts. Licenses live in assets/fonts/licenses/. */
+@font-face {
+  font-family: "Space Grotesk";
+  src: url("assets/fonts/space-grotesk-var.woff2") format("woff2");
+  font-weight: 300 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Sans SC";
+  src: url("assets/fonts/noto-sans-sc-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Noto Serif SC";
+  src: url("assets/fonts/noto-serif-sc-var.woff2") format("woff2");
+  font-weight: 200 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 /* =========================================================
    Worldweave — official site
    Dark, woven, a little editorial.
@@ -612,12 +637,18 @@ html.is-scrolling .serif-accent {
 
 .hero {
   position: relative;
-  min-height: 100svh;
+  min-height: auto;
   padding: 150px 0 34px;
   display: flex;
   flex-direction: column;
   justify-content: center;
   overflow: hidden;
+}
+
+@media (min-width: 1024px) and (hover: hover) and (pointer: fine) {
+  .hero {
+    min-height: 100svh;
+  }
 }
 
 .hero-bg {
@@ -1742,6 +1773,7 @@ html.is-scrolling .serif-accent {
 
 .time-stage {
   position: relative;
+  width: 100%;
   min-height: 520px;
   aspect-ratio: 16 / 8.6;
   border-radius: 20px;
@@ -3463,7 +3495,8 @@ html.is-scrolling .serif-accent {
   }
 
   .time-stage {
-    min-height: 390px;
+    width: 100%;
+    min-height: 0;
     aspect-ratio: 4 / 5;
   }
 
