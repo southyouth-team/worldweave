@@ -29,7 +29,8 @@ import { listMyPublishRequests, submitPublishRequest } from '../publish/publishR
 import { applyTextPlates, getPartTextSpec, updateTextPlate } from '../three/sandbox/textPlateRuntime.js'
 import { PLAYER_PRESETS } from '../three/characters/playerPresets.js'
 import { isAnyStretchableRoadModel, isPolylineRoadModel } from '../three/sandbox/roadEndpointMath.js'
-import { localizePolygon, polygonBounds } from '../three/sandbox/footprintPolygon.js'
+import { localizePolygon, polygonArea, polygonBounds } from '../three/sandbox/footprintPolygon.js'
+import { fitModelToFootprint } from '../three/sandbox/footprintFit.js'
 import { buildFootprintPromptSuffix } from './sandbox/footprintPrompt.js'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api/v1'
@@ -51,11 +52,13 @@ const aiBusy = ref(false)
 // 生成模型前在地块上勾绘的占地：none / area（底面贴合）/ space（空间占据）
 const footprintRegionMode = ref('none')
 const footprintPoints = ref([])
+const footprintDrawing = ref(false)
 const footprintSelfIntersecting = ref(false)
 const footprintSizeLabel = computed(() => {
   if (footprintPoints.value.length < 3) return ''
   const bounds = polygonBounds(footprintPoints.value)
-  return `${bounds.width.toFixed(1)} × ${bounds.depth.toFixed(1)} m`
+  const area = polygonArea(footprintPoints.value)
+  return `${bounds.width.toFixed(1)} × ${bounds.depth.toFixed(1)} m，约 ${area.toFixed(1)} m²`
 })
 const characterPrompt = ref('一名完整的现代风格 3D 游戏角色，人体比例自然，包含头部、躯干、双臂、双腿、手掌和鞋子，适合第三人称视角观察')
 const characterBusy = ref(false)
@@ -360,21 +363,56 @@ function deleteSelected() {
   message.value = '已删除模型组'
 }
 
-// ---- 生成模型前划定占地：矩形起步，拖角点/加断点改形状（和道路端点编辑同一套手感） ----
+// ---- 生成模型前勾绘占地：在地面逐点点击画出多边形，再让模型底面贴合 ----
 function handleFootprintDrawingChange(payload) {
   footprintPoints.value = Array.isArray(payload?.points) ? payload.points : []
+  footprintDrawing.value = payload?.drawing === true
   footprintSelfIntersecting.value = payload?.selfIntersecting === true
+}
+
+function toggleFootprintEnabled(event) {
+  const enabled = Boolean(event?.target?.checked)
+  if (enabled) {
+    footprintRegionMode.value = footprintRegionMode.value === 'none' ? 'area' : footprintRegionMode.value
+    message.value = '已开启占地轮廓：点「勾绘占地轮廓」在地面逐点画多边形'
+  } else {
+    footprintRegionMode.value = 'none'
+    clearFootprint()
+    message.value = '已关闭占地轮廓，生成时不再限制模型底面'
+  }
 }
 
 function startFootprintDrawing() {
   if (footprintRegionMode.value === 'none') {
     footprintRegionMode.value = 'area'
   }
-  if (engine?.beginSandboxFootprintDrawing?.()) {
-    footprintPoints.value = engine.getSandboxFootprintDrawingState?.().points || []
-    message.value = '已创建矩形占地：拖黄色角点改形状，拖蓝色中心整体移动；「添加断点」可拖出凹凸'
+  if (engine?.beginSandboxFootprintSketch?.()) {
+    footprintPoints.value = []
+    footprintDrawing.value = true
+    footprintSelfIntersecting.value = false
+    message.value = '正在勾绘占地：逐点点击地面加顶点，双击或点「完成轮廓」闭合；Backspace 撤销上一点，Esc 取消'
   } else {
-    message.value = '无法创建占地：请先关闭选址或精细调整'
+    message.value = '无法勾绘占地：请先关闭选址或精细调整'
+  }
+}
+
+function finishFootprintDrawing() {
+  const result = engine?.finishSandboxFootprintSketch?.()
+  if (result?.ok) {
+    footprintDrawing.value = false
+    message.value = `占地轮廓已完成（${result.points} 个顶点）：生成时模型底面会贴合或收进这块区域`
+    return
+  }
+  if (result?.reason === 'too-few-points') message.value = '至少需要 3 个顶点才能闭合成占地轮廓'
+  else if (result?.reason === 'self-intersecting') message.value = '轮廓有交叉（红色边），请撤销上一点或重新勾绘'
+  else message.value = '当前不在勾绘状态'
+}
+
+function undoFootprintPoint() {
+  if (engine?.undoSandboxFootprintSketchPoint?.()) {
+    message.value = '已撤销上一个顶点'
+  } else {
+    message.value = '没有可撤销的顶点'
   }
 }
 
@@ -395,6 +433,7 @@ function removeFootprintBreakpoint() {
 function clearFootprint() {
   engine?.clearSandboxFootprintRegion?.()
   footprintPoints.value = []
+  footprintDrawing.value = false
   footprintSelfIntersecting.value = false
 }
 
@@ -1018,6 +1057,9 @@ async function generateAiModelStaged({ prompt, generationPrompt, objectType, use
   try {
     const staged = await runStagedModelGeneration({ prompt, generationPrompt, objectType, useFootprint, footprintLocal })
     const group = staged.model
+    const footprintFit = useFootprint
+      ? fitModelToFootprint(group, footprintLocal.points, footprintRegionMode.value)
+      : null
     group.userData.proceduralModelParameterValues = modelParameterDefaults(group.userData.proceduralModelParameters || [])
     group.userData.proceduralModelParts = Array.isArray(group.userData.proceduralModelParts) ? group.userData.proceduralModelParts : []
     group.userData.proceduralModelEnvironmentBindings = Array.isArray(group.userData.proceduralModelEnvironmentBindings)
@@ -1045,6 +1087,7 @@ async function generateAiModelStaged({ prompt, generationPrompt, objectType, use
         mode: footprintRegionMode.value,
         points: footprintLocal.points.map(point => ({ ...point })),
       }
+      group.userData.sandboxFootprintFit = footprintFit
     }
     editingModel.value = group
     persistModelChatHistory(group)
@@ -1079,7 +1122,16 @@ async function generateAiModel() {
   const prompt = aiPrompt.value.trim()
   if ((!prompt && !referenceImageDataUrl.value) || aiBusy.value) return
   const footprintMode = footprintRegionMode.value
-  const useFootprint = footprintMode !== 'none' && footprintPoints.value.length >= 3
+  const wantsFootprint = footprintMode !== 'none'
+  const useFootprint = wantsFootprint && footprintPoints.value.length >= 3
+  if (wantsFootprint && !useFootprint) {
+    message.value = '已开启占地轮廓：请先点「勾绘占地轮廓」画至少 3 个顶点并完成轮廓'
+    return
+  }
+  if (useFootprint && footprintDrawing.value) {
+    message.value = '占地轮廓还没闭合：请点「完成轮廓」或双击最后一个顶点'
+    return
+  }
   if (useFootprint && footprintSelfIntersecting.value) {
     message.value = '占地区域轮廓有交叉（红色边），请先拖动黄色顶点调整或重画'
     return
@@ -1189,6 +1241,9 @@ async function generateAiModel() {
       timeoutMs: 60000,
       onProgress: updateGenerationProgress,
     })
+    const footprintFit = useFootprint
+      ? fitModelToFootprint(group, footprintLocal.points, footprintMode)
+      : null
     group.userData.proceduralModelParameterValues = modelParameterDefaults(group.userData.proceduralModelParameters || [])
     group.userData.proceduralModelConfig = {
       protocol: 'threejs-procedural-v1',
@@ -1209,6 +1264,7 @@ async function generateAiModel() {
         mode: footprintMode,
         points: footprintLocal.points.map(point => ({ x: point.x, z: point.z })),
       }
+      group.userData.sandboxFootprintFit = footprintFit
     }
     group.userData.interactionRadius = Number(group.userData.interactionRadius) || 4.5
     editingModel.value = group
@@ -2607,25 +2663,38 @@ onBeforeUnmount(() => {
               <input type="file" accept="image/png,image/jpeg,image/webp" @change="onReferenceImageChange">
             </div>
             <label class="world-mvp__toggle" style="margin-top:7px"><input v-model="stagedGenerationEnabled" type="checkbox"><span>分阶段生成（体块 → 结构 → 材质，更准但更慢）</span></label>
-            <div class="world-mvp__command" style="margin-top:7px">
-              <select v-model="footprintRegionMode">
-                <option value="none">不限定占地</option>
-                <option value="area">占地区域（底面贴合轮廓）</option>
-                <option value="space">空间占据（划定占用范围）</option>
+            <label class="world-mvp__toggle" style="margin-top:7px">
+              <input type="checkbox" :checked="footprintRegionMode !== 'none'" @change="toggleFootprintEnabled">
+              <span>勾绘占地轮廓（先在地面画多边形，再让生成模型底面匹配）</span>
+            </label>
+            <div v-if="footprintRegionMode !== 'none'" class="world-mvp__command" style="margin-top:7px">
+              <select v-model="footprintRegionMode" aria-label="占地约束方式">
+                <option value="area">底面贴合轮廓（铺满区域）</option>
+                <option value="space">空间占据（不超出区域）</option>
               </select>
             </div>
-            <div class="world-mvp__tools world-mvp__secondary-actions" style="margin-top:7px">
-              <button v-if="!footprintPoints.length" @click="startFootprintDrawing">创建占地区域</button>
+            <div v-if="footprintRegionMode !== 'none'" class="world-mvp__tools world-mvp__secondary-actions" style="margin-top:7px">
+              <template v-if="footprintDrawing">
+                <button @click="finishFootprintDrawing">完成轮廓</button>
+                <button @click="undoFootprintPoint">撤销上一点</button>
+                <button @click="clearFootprint">取消勾绘</button>
+              </template>
+              <template v-else-if="!footprintPoints.length">
+                <button @click="startFootprintDrawing">勾绘占地轮廓</button>
+              </template>
               <template v-else>
-                <button @click="startFootprintDrawing">重新创建</button>
+                <button @click="startFootprintDrawing">重新勾绘</button>
                 <button @click="addFootprintBreakpoint">添加断点</button>
                 <button @click="removeFootprintBreakpoint">删除断点</button>
                 <button @click="clearFootprint">清除区域</button>
               </template>
             </div>
-            <small v-if="footprintPoints.length" class="world-mvp__message">
-              已创建占地区域（{{ footprintPoints.length }} 个点）：拖黄色角点改形状，拖蓝色中心整体移动
-              <template v-if="footprintSizeLabel">（约 {{ footprintSizeLabel }}）</template>
+            <small v-if="footprintDrawing" class="world-mvp__message">
+              正在勾绘：已点 {{ footprintPoints.length }} 个顶点。继续点击地面加点；双击最后一个点或按 Enter 闭合，Backspace 撤销，Esc 取消。
+            </small>
+            <small v-else-if="footprintPoints.length" class="world-mvp__message">
+              已勾绘占地（{{ footprintPoints.length }} 个顶点）：拖黄色顶点改形状，拖蓝色中心整体移动
+              <template v-if="footprintSizeLabel">（{{ footprintSizeLabel }}）</template>
             </small>
             <small v-if="footprintSelfIntersecting" class="world-mvp__message">轮廓有交叉（红色边），请拖动顶点调整或清除重画</small>
           </section>

@@ -2783,10 +2783,17 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
 
   function removeFootprintListeners() {
     const target = footprintEventTarget()
-    if (!target) return
-    target.removeEventListener('pointerdown', onFootprintEditPointerDown, true)
-    target.removeEventListener('pointermove', onFootprintEditPointerMove, true)
-    target.removeEventListener('pointerup', onFootprintEditPointerUp, true)
+    if (target) {
+      target.removeEventListener('pointerdown', onFootprintEditPointerDown, true)
+      target.removeEventListener('pointermove', onFootprintEditPointerMove, true)
+      target.removeEventListener('pointerup', onFootprintEditPointerUp, true)
+      target.removeEventListener('pointerdown', onFootprintSketchPointerDown, true)
+      target.removeEventListener('pointermove', onFootprintSketchPointerMove, true)
+      target.removeEventListener('pointerleave', onFootprintSketchPointerLeave, true)
+    }
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('keydown', onFootprintSketchKeyDown)
+    }
   }
 
   function disposeFootprintPreview() {
@@ -2855,10 +2862,10 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     state.centerHandle = null
     state.fillMesh = null
     const editing = state.phase === 'editing'
-    state.selfIntersecting = editing && points.length >= 4 && polygonSelfIntersects(points)
+    state.selfIntersecting = points.length >= 4 && polygonSelfIntersects(points)
     const y = 0.12
-    if (editing && points.length >= 3) {
-      // 完成后才铺填充面；轮廓自交时换橙色提示
+    if (points.length >= 3) {
+      // 绘制中也显示半透明填充，完成后加深；轮廓自交时换橙色提示
       const positions = []
       for (const triangle of triangulatePolygon(points)) {
         for (const point of triangle) positions.push(point.x, 0.02, point.z)
@@ -2868,7 +2875,7 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
       const fill = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({
         color: state.selfIntersecting ? '#e6a06b' : '#6cc08d',
         transparent: true,
-        opacity: 0.45,
+        opacity: editing ? 0.45 : 0.18,
         depthWrite: false,
         side: THREE.DoubleSide,
       }))
@@ -2894,6 +2901,22 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
         mesh.renderOrder = 6
         preview.add(mesh)
       }
+    }
+    if (state.phase === 'drawing' && state.hover && points.length) {
+      // 橡皮筋预览：从最后一个标点连到当前指针位置
+      const last = points[points.length - 1]
+      const positions = [last.x, 0.06, last.z, state.hover.x, 0.06, state.hover.z]
+      const geometry = new THREE.BufferGeometry()
+      geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3))
+      const line = new THREE.LineSegments(geometry, new THREE.LineBasicMaterial({
+        color: '#f0d98a',
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+      }))
+      line.name = 'footprint-rubber-band'
+      line.renderOrder = 7
+      preview.add(line)
     }
     if (editing) {
       // 顶点手柄：拖动只改这个点
@@ -3026,6 +3049,164 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     requestFrame()
   }
 
+  // ---- 自由勾绘：点击地面逐点加顶点，完成后闭合成可编辑多边形 ----
+  function attachFootprintEditListeners() {
+    const target = footprintEventTarget()
+    target?.addEventListener('pointerdown', onFootprintEditPointerDown, true)
+    target?.addEventListener('pointermove', onFootprintEditPointerMove, true)
+    target?.addEventListener('pointerup', onFootprintEditPointerUp, true)
+  }
+
+  function removeFootprintSketchListeners() {
+    const target = footprintEventTarget()
+    if (!target) return
+    target.removeEventListener('pointerdown', onFootprintSketchPointerDown, true)
+    target.removeEventListener('pointermove', onFootprintSketchPointerMove, true)
+    target.removeEventListener('pointerleave', onFootprintSketchPointerLeave, true)
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('keydown', onFootprintSketchKeyDown)
+    }
+  }
+
+  function beginSandboxFootprintSketch() {
+    if (!isBlankSandbox || !scene) return false
+    clearSandboxFootprintRegion()
+    sandboxRoadEditor?.detach()
+    sandboxTransform?.detach()
+    const preview = new THREE.Group()
+    preview.name = 'sandbox-footprint-drawing'
+    scene.add(preview)
+    sandboxFootprintDrawingState = {
+      phase: 'drawing',
+      points: [],
+      preview,
+      handles: [],
+      centerHandle: null,
+      fillMesh: null,
+      drag: null,
+      hover: null,
+      lastPointAt: 0,
+      lastBreakpointIndex: null,
+    }
+    const target = footprintEventTarget()
+    target?.addEventListener('pointerdown', onFootprintSketchPointerDown, true)
+    target?.addEventListener('pointermove', onFootprintSketchPointerMove, true)
+    target?.addEventListener('pointerleave', onFootprintSketchPointerLeave, true)
+    if (typeof window !== 'undefined') {
+      window.addEventListener('keydown', onFootprintSketchKeyDown)
+    }
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  // 返回新加的点；与上一个点太近时忽略（双击收尾时第二下不会重复加点）。
+  function addSandboxFootprintSketchPoint(x, z) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing') return null
+    const world = getSandboxPlacementWorldBounds()
+    const nextX = THREE.MathUtils.clamp(Number(x), world.centerX - world.width / 2, world.centerX + world.width / 2)
+    const nextZ = THREE.MathUtils.clamp(Number(z), world.centerZ - world.depth / 2, world.centerZ + world.depth / 2)
+    if (!Number.isFinite(nextX) || !Number.isFinite(nextZ)) return null
+    const last = state.points[state.points.length - 1]
+    if (last && Math.hypot(last.x - nextX, last.z - nextZ) < 0.05) return null
+    const point = { x: nextX, z: nextZ }
+    state.points.push(point)
+    state.lastPointAt = Date.now()
+    updateFootprintPreview()
+    emitFootprintState()
+    return { ...point }
+  }
+
+  function undoSandboxFootprintSketchPoint() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing' || !state.points.length) return false
+    state.points.pop()
+    state.hover = null
+    updateFootprintPreview()
+    emitFootprintState()
+    return true
+  }
+
+  function finishSandboxFootprintSketch() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing') return { ok: false, reason: 'not-drawing' }
+    if (state.points.length < 3) return { ok: false, reason: 'too-few-points', points: state.points.length }
+    if (polygonSelfIntersects(state.points)) {
+      state.selfIntersecting = true
+      updateFootprintPreview()
+      emitFootprintState()
+      return { ok: false, reason: 'self-intersecting', points: state.points.length }
+    }
+    removeFootprintSketchListeners()
+    state.phase = 'editing'
+    state.hover = null
+    attachFootprintEditListeners()
+    updateFootprintPreview()
+    emitFootprintState()
+    return { ok: true, points: state.points.length }
+  }
+
+  function cancelSandboxFootprintSketch() {
+    const state = sandboxFootprintDrawingState
+    if (!state) return false
+    removeFootprintSketchListeners()
+    return clearSandboxFootprintRegion()
+  }
+
+  function onFootprintSketchPointerDown(event) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing' || event.button !== 0) return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    event.preventDefault?.()
+    event.stopImmediatePropagation?.()
+    const last = state.points[state.points.length - 1]
+    // 快速双击最后一个点/附近位置 = 收尾，不重复加点
+    if (state.points.length >= 3 && last
+      && Date.now() - (state.lastPointAt || 0) < 400
+      && Math.hypot(last.x - point.x, last.z - point.z) < 0.75) {
+      finishSandboxFootprintSketch()
+      return
+    }
+    addSandboxFootprintSketchPoint(point.x, point.z)
+  }
+
+  function onFootprintSketchPointerMove(event) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing') return
+    const point = getSandboxGroundPoint(event)
+    if (!point) return
+    if (!state.hover || Math.hypot(state.hover.x - point.x, state.hover.z - point.z) > 0.04) {
+      state.hover = { x: point.x, z: point.z }
+      updateFootprintPreview()
+    }
+  }
+
+  function onFootprintSketchPointerLeave() {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing' || !state.hover) return
+    state.hover = null
+    updateFootprintPreview()
+  }
+
+  function onFootprintSketchKeyDown(event) {
+    const state = sandboxFootprintDrawingState
+    if (!state || state.phase !== 'drawing') return
+    const target = event.target
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) return
+    if (event.key === 'Enter') {
+      event.preventDefault?.()
+      finishSandboxFootprintSketch()
+    } else if (event.key === 'Escape') {
+      event.preventDefault?.()
+      cancelSandboxFootprintSketch()
+    } else if (event.key === 'Backspace' || event.key === 'Delete') {
+      event.preventDefault?.()
+      undoSandboxFootprintSketchPoint()
+    }
+  }
+
   // 占地编辑器：直接给一个矩形区域，拖角点改形状、拖中心整体移动，
   // 「添加断点」在最长边上插一个可拖动的点，做出缺口/凹凸（和道路端点编辑同一套手感）。
   function beginSandboxFootprintDrawing() {
@@ -3138,10 +3319,12 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
 
   function getSandboxFootprintDrawingState() {
     const state = sandboxFootprintDrawingState
-    if (!state) return { active: false, editing: false, points: [] }
+    if (!state) return { active: false, drawing: false, editing: false, points: [] }
     return {
       active: true,
+      drawing: state.phase === 'drawing',
       editing: state.phase === 'editing',
+      selfIntersecting: state.selfIntersecting === true,
       points: state.points.map(point => ({ ...point })),
     }
   }
@@ -5647,5 +5830,5 @@ export function createCampusEngine(container, callbacks = {}, options = {}) {
     initialized = false
   }
 
-  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, captureSandboxThumbnail, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
+  return { init, getPhysicsDiagnostics, getMotionProbeReport: () => motionProbe?.analyze() ?? null, getPlayerWaterState, captureSandboxThumbnail, setMode, setViewMode, setVirtualKey, loadPlayerCharacter, setPlayerCharacterModel, setPlayerCharacterPreset, setPlayerCharacterGender, setPlayerCharacterHeight, getPlayerCharacterPresetState, setPlayerCharacterAnimation, restorePlayerCharacterFallback, serializePlayerCharacter, restorePlayerCharacterFromSnapshot, getPlayerCharacterInfo, refreshSandboxModelSpatial, setSandboxModelTransform, setEnvironment, setSandboxModelEnvironmentOverride, clearSandboxModelEnvironmentOverride, resetView, getSandboxWorldState, setSandboxChunkManagement, setSandboxChunkSelection, expandSandboxWorld, removeSandboxWorldChunk, restoreSandboxWorld, addSandboxModel, replaceSandboxModel, getSandboxModels, getSandboxModel, serializeSandboxModel, getPlayerPosition, getSandboxModelState, setSandboxModelState, applySandboxModelInteraction, selectSandboxModel, setSandboxTransformMode, addSandboxRoadPoint, removeSandboxRoadPoint, beginSandboxRoadBreakpointPick: () => sandboxRoadEditor?.beginBreakpointPick?.() ?? false, cancelSandboxRoadBreakpointPick: () => sandboxRoadEditor?.cancelBreakpointPick?.() ?? false, beginSandboxRoadDrawing, addSandboxRoadDrawingPoint, finishSandboxRoadDrawing, cancelSandboxRoadDrawing, getSandboxRoadDrawingState, beginSandboxFootprintDrawing, beginSandboxFootprintSketch, addSandboxFootprintSketchPoint, undoSandboxFootprintSketchPoint, finishSandboxFootprintSketch, cancelSandboxFootprintSketch, addSandboxFootprintBreakpoint, removeSandboxFootprintBreakpoint, cancelSandboxFootprintDrawing, clearSandboxFootprintRegion, getSandboxFootprintDrawingState, beginSandboxModelPlacement, confirmSandboxModelPlacement, cancelSandboxModelPlacement, unlockSandboxPlacementCandidate, removeSandboxModel, duplicateSandboxModel, enterIndoorPrototype, enterIndoorBuilding, beginGeneratedAssetPlacement, confirmGeneratedAssetPlacement, cancelGeneratedAssetPlacement, moveGeneratedAsset, rotateGeneratedAsset, removeGeneratedAsset, getGeneratedAssets, getIndoorBuildingDefinition, updateIndoorBuildingDefinition, switchIndoorFloor, navigateToIndoorFloor, exitIndoorPrototype, selectObject, clearSelection, updateSceneObject, previewRpgMap, setBuildingTemplates, previewCampusPlan, clearRpgPreview, setWeatherMode, getWeatherModeState, addSandboxWorldChunk, getSandboxExpandMarkerDirections, getSandboxExpandMarkers, dispose, get initialized() { return initialized } }
 }

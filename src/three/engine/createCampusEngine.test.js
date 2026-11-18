@@ -631,6 +631,65 @@ describe('重新选址的占地形状', () => {
   })
 })
 
+describe('勾绘占地轮廓', () => {
+  it('逐点点击地面勾绘，完成后转为可编辑多边形', () => {
+    orientCameraTopDown()
+    expect(engine.beginSandboxFootprintSketch()).toBe(true)
+    expect(engine.getSandboxFootprintDrawingState()).toMatchObject({
+      active: true, drawing: true, editing: false, points: [],
+    })
+
+    dispatchPointer('pointerdown', { x: -6, y: 0, z: -4 })
+    dispatchPointer('pointerdown', { x: 6, y: 0, z: -4 })
+    dispatchPointer('pointerdown', { x: 6, y: 0, z: 4 })
+    dispatchPointer('pointerdown', { x: -6, y: 0, z: 4 })
+
+    let state = engine.getSandboxFootprintDrawingState()
+    expect(state.points).toHaveLength(4)
+    expect(state).toMatchObject({ active: true, drawing: true, editing: false })
+
+    expect(engine.finishSandboxFootprintSketch()).toMatchObject({ ok: true, points: 4 })
+    state = engine.getSandboxFootprintDrawingState()
+    expect(state).toMatchObject({ active: true, drawing: false, editing: true })
+    expect(state.points).toHaveLength(4)
+  })
+
+  it('少于三个点或轮廓自交时不能完成', () => {
+    expect(engine.beginSandboxFootprintSketch()).toBe(true)
+    engine.addSandboxFootprintSketchPoint(0, 0)
+    engine.addSandboxFootprintSketchPoint(6, 0)
+    expect(engine.finishSandboxFootprintSketch()).toMatchObject({ ok: false, reason: 'too-few-points' })
+    expect(engine.getSandboxFootprintDrawingState()).toMatchObject({ drawing: true, editing: false })
+
+    expect(engine.cancelSandboxFootprintSketch()).toBe(true)
+    expect(engine.beginSandboxFootprintSketch()).toBe(true)
+    engine.addSandboxFootprintSketchPoint(0, 0)
+    engine.addSandboxFootprintSketchPoint(6, 6)
+    engine.addSandboxFootprintSketchPoint(6, 0)
+    engine.addSandboxFootprintSketchPoint(0, 6)
+    expect(engine.finishSandboxFootprintSketch()).toMatchObject({ ok: false, reason: 'self-intersecting' })
+    expect(engine.getSandboxFootprintDrawingState()).toMatchObject({ drawing: true, editing: false })
+  })
+
+  it('撤销上一点，取消后清除整块轮廓', () => {
+    expect(engine.beginSandboxFootprintSketch()).toBe(true)
+    engine.addSandboxFootprintSketchPoint(0, 0)
+    engine.addSandboxFootprintSketchPoint(8, 0)
+    engine.addSandboxFootprintSketchPoint(8, 5)
+    expect(engine.getSandboxFootprintDrawingState().points).toHaveLength(3)
+
+    expect(engine.undoSandboxFootprintSketchPoint()).toBe(true)
+    expect(engine.getSandboxFootprintDrawingState().points).toHaveLength(2)
+    expect(engine.undoSandboxFootprintSketchPoint()).toBe(true)
+    expect(engine.undoSandboxFootprintSketchPoint()).toBe(true)
+    expect(engine.undoSandboxFootprintSketchPoint()).toBe(false)
+    expect(engine.getSandboxFootprintDrawingState().points).toHaveLength(0)
+
+    expect(engine.cancelSandboxFootprintSketch()).toBe(true)
+    expect(engine.getSandboxFootprintDrawingState()).toMatchObject({ active: false, points: [] })
+  })
+})
+
 describe('占地区域编辑器', () => {
   it('直接给一个矩形区域，添加/删除断点可控（至少保留三个点）', () => {
     expect(engine.beginSandboxFootprintDrawing()).toBe(true)
