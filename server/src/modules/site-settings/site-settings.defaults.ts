@@ -13,6 +13,7 @@ export interface SiteSettings {
   ogDescription: string;
   themeColor: string;
   logoDataUrl: string | null;
+  notificationEmail: string;
 }
 
 export const DEFAULT_SITE_SETTINGS: SiteSettings = {
@@ -30,6 +31,7 @@ export const DEFAULT_SITE_SETTINGS: SiteSettings = {
   ogDescription: '源码公开的 AI 世界构建器：等距地块编辑、AI 模型生成、发布审核与团队协作。',
   themeColor: '#e8f0ea',
   logoDataUrl: null,
+  notificationEmail: '',
 };
 
 export const SITE_SETTING_TEXT_LIMITS: Record<
@@ -48,6 +50,7 @@ export const SITE_SETTING_TEXT_LIMITS: Record<
   author: 120,
   ogTitle: 120,
   ogDescription: 500,
+  notificationEmail: 254,
 };
 
 export const MAX_LOGO_BYTES = 512 * 1024;

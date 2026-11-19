@@ -10,6 +10,7 @@ export interface AuthUser {
   id: string;
   username: string;
   displayName: string;
+  email: string | null;
   role: 'admin' | 'member';
   status: 'active' | 'disabled';
   mustChangePassword: boolean;
@@ -91,7 +92,7 @@ export class SessionService {
     if (!token) return null;
     const rows = await this.dataSource.query(
       `SELECT s.id AS session_id, s.expires_at,
-              u.id, u.username, u.display_name, u.role, u.status, u.must_change_password
+              u.id, u.username, u.display_name, u.email, u.role, u.status, u.must_change_password
        FROM auth_session s JOIN app_user u ON u.id = s.user_id
        WHERE s.token_hash = $1`,
       [hashToken(token)],
@@ -120,6 +121,7 @@ export class SessionService {
         id: String(row.id),
         username: String(row.username),
         displayName: String(row.display_name || row.username),
+        email: row.email ? String(row.email) : null,
         role: row.role === 'admin' ? 'admin' : 'member',
         status: row.status === 'active' ? 'active' : 'disabled',
         mustChangePassword: Boolean(row.must_change_password),

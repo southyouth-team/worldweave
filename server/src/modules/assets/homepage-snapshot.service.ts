@@ -4,6 +4,7 @@ import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 const MAX_SNAPSHOT_BYTES = 25 * 1024 * 1024;
+export const PUBLISHED_HOMEPAGE_USER = '__published__';
 
 /**
  * 「发布到首页」的服务端持久化：每个用户一份首页快照（沙盒模型 JSON），

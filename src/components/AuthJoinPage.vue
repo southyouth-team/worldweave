@@ -18,15 +18,19 @@
       </template>
       <template v-else>
         <h1>申请加入团队</h1>
-        <p class="auth-intro">提交后由管理员审核；通过后会为你创建团队成员账号。</p>
+        <p class="auth-intro">提交后由管理员审核；通过后账号和临时密码会发送到你填写的邮箱。</p>
         <form @submit.prevent="submit">
           <label class="auth-field">
             <span>姓名</span>
             <input v-model="form.name" maxlength="120" placeholder="真实姓名或常用称呼" />
           </label>
           <label class="auth-field">
-            <span>联系方式</span>
-            <input v-model="form.contact" maxlength="200" placeholder="邮箱 / 手机 / 微信" />
+            <span>通知邮箱</span>
+            <input v-model.trim="form.email" type="email" maxlength="254" autocomplete="email" placeholder="用于接收审核结果和临时密码" />
+          </label>
+          <label class="auth-field">
+            <span>其他联系方式（可选）</span>
+            <input v-model="form.contact" maxlength="200" placeholder="手机 / 微信，方便管理员联系" />
           </label>
           <label class="auth-field">
             <span>期望用户名</span>
@@ -54,15 +58,19 @@ import BrandLogo from './BrandLogo.vue'
 import { siteSettings } from '../site/siteSettings.js'
 import { submitJoinApplication } from '../auth/authStore.js'
 
-const form = reactive({ name: '', contact: '', desiredUsername: '', reason: '' })
+const form = reactive({ name: '', email: '', contact: '', desiredUsername: '', reason: '' })
 const busy = ref(false)
 const error = ref('')
 const submitted = ref(false)
 const resultMessage = ref('')
 
 async function submit() {
-  if (!form.name.trim() || !form.contact.trim() || !form.desiredUsername.trim()) {
-    error.value = '请填写姓名、联系方式和期望用户名'
+  if (!form.name.trim() || !form.email.trim() || !form.desiredUsername.trim()) {
+    error.value = '请填写姓名、通知邮箱和期望用户名'
+    return
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) {
+    error.value = '请输入合法的通知邮箱'
     return
   }
   if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{2,31}$/.test(form.desiredUsername.trim())) {
@@ -74,12 +82,13 @@ async function submit() {
   try {
     await submitJoinApplication({
       name: form.name.trim(),
+      email: form.email.trim().toLowerCase(),
       contact: form.contact.trim(),
       desiredUsername: form.desiredUsername.trim(),
       reason: form.reason.trim(),
     })
     submitted.value = true
-    resultMessage.value = '管理员审核通过后会收到账号和临时密码。'
+    resultMessage.value = '审核结果会发送到 ' + form.email.trim() + '；通过后邮件里会包含账号和临时密码。'
   } catch (err) {
     error.value = err?.message || '提交失败'
   } finally {

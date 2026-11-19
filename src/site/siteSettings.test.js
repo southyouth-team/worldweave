@@ -46,6 +46,28 @@ describe('站点品牌配置', () => {
     expect(settings).not.toHaveProperty('unknown')
   })
 
+  it('规范化可选的通知接收邮箱', () => {
+    const settings = normalizeSiteSettings({
+      notificationEmail: '  notify@example.com  ',
+    })
+    expect(settings.notificationEmail).toBe('notify@example.com')
+    expect(DEFAULT_SITE_SETTINGS.notificationEmail).toBe('')
+
+    const empty = normalizeSiteSettings({ notificationEmail: '   ' })
+    expect(empty.notificationEmail).toBe('')
+  })
+
+  it('拒绝非法通知邮箱，但允许为空', () => {
+    const valid = validateSiteSettings({ ...DEFAULT_SITE_SETTINGS })
+    expect(valid.notificationEmail).toBeUndefined()
+
+    const errors = validateSiteSettings({
+      ...DEFAULT_SITE_SETTINGS,
+      notificationEmail: 'not-an-email',
+    })
+    expect(errors.notificationEmail).toBe('需要合法邮箱地址')
+  })
+
   it('非法颜色、超大 logo 回退到默认值', () => {
     const settings = normalizeSiteSettings({
       themeColor: 'red',

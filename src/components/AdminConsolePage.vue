@@ -21,6 +21,7 @@
           </button>
           <button :class="{ active: view === 'users' }" @click="setView('users')">团队成员</button>
           <button :class="{ active: view === 'settings' }" @click="setView('settings')">站点设置</button>
+          <button :class="{ active: view === 'email' }" @click="setView('email')">邮件通知</button>
           <button :class="{ active: view === 'about' }" @click="setView('about')">关于</button>
         </nav>
         <div class="admin-account">
@@ -39,7 +40,7 @@
             <h1>{{ viewTitle }}</h1>
             <p>{{ viewDescription }}</p>
           </div>
-          <button v-if="view !== 'settings' && view !== 'about'" class="btn" :disabled="loadingView" @click="refreshView">刷新</button>
+          <button v-if="view !== 'settings' && view !== 'email' && view !== 'about'" class="btn" :disabled="loadingView" @click="refreshView">刷新</button>
         </header>
 
         <p v-if="error" class="admin-error" role="alert">{{ error }}</p>
@@ -102,6 +103,7 @@
                 <div class="application-main">
                   <strong>{{ item.name }}</strong>
                   <span>期望用户名：{{ item.desired_username }}</span>
+                  <span>邮箱：{{ item.email || '未填写' }}</span>
                   <span>联系方式：{{ item.contact }}</span>
                   <span v-if="item.reason">申请说明：{{ item.reason }}</span>
                   <span class="application-meta">提交于 {{ formatTime(item.created_at) }}<template v-if="item.status !== 'pending'"> · {{ statusLabel(item.status) }}<template v-if="item.reviewed_by_username"> · 审核人 {{ item.reviewed_by_username }}</template></template></span>
@@ -136,11 +138,12 @@
                 </button>
                 <div class="publish-main">
                   <strong>{{ item.requester?.displayName || item.requester?.username || '成员' }} <small>@{{ item.requester?.username }}</small></strong>
+                  <span v-if="item.requester?.email" class="publish-meta">通知邮箱：{{ item.requester.email }}</span>
                   <span class="publish-meta">提交于 {{ formatTime(item.createdAt) }} · {{ item.modelCount }} 个模型 · {{ item.chunkCount }} 个地块 · {{ formatBytes(item.snapshotBytes) }}</span>
                   <p v-if="item.note">说明：{{ item.note }}</p>
                   <span v-if="item.status === 'approved'" class="publish-state approved">已发布 · {{ formatTime(item.publishedAt) }}</span>
                   <span v-else-if="item.status === 'rejected'" class="publish-state rejected">已驳回<template v-if="item.reviewNote">：{{ item.reviewNote }}</template></span>
-                  <span v-else-if="item.status === 'stale'" class="publish-state stale">已过期<template v-if="item.reviewNote">：{{ item.reviewNote }}</template></span>
+                  <span v-else-if="item.status === 'stale'" class="publish-state stale">未发布：已有更新版本发布<template v-if="item.reviewNote"> · {{ item.reviewNote }}</template></span>
                 </div>
                 <div v-if="item.status === 'pending'" class="publish-actions">
                   <button class="btn primary" :disabled="busyId === item.id" @click="approvePublish(item)">通过并发布</button>
@@ -162,12 +165,23 @@
             <div v-if="loadingUsers" class="admin-empty">加载中…</div>
             <div v-else class="user-table">
               <div class="user-row user-row--head">
-                <span>账号</span><span>角色</span><span>状态</span><span>最近登录</span><span>操作</span>
+                <span>账号</span><span>邮箱</span><span>角色</span><span>状态</span><span>最近登录</span><span>操作</span>
               </div>
               <div v-for="user in users" :key="user.id" class="user-row">
                 <span class="user-identity">
                   <strong>{{ user.displayName }}</strong>
                   <small>@{{ user.username }}<template v-if="user.mustChangePassword"> · 待改密</template></small>
+                </span>
+                <span>
+                  <input
+                    class="user-email-input"
+                    :value="user.email || ''"
+                    type="email"
+                    maxlength="254"
+                    placeholder="用于接收审核通知"
+                    :disabled="busyId === user.id"
+                    @change="updateEmail(user, $event.target.value)"
+                  >
                 </span>
                 <span>
                   <select :value="user.role" :disabled="busyId === user.id" @change="updateRole(user, $event.target.value)">
@@ -194,6 +208,10 @@
           <SiteSettingsPage embedded />
         </template>
 
+        <template v-else-if="view === 'email'">
+          <EmailSettingsPage embedded />
+        </template>
+
         <template v-else-if="view === 'about'">
           <AboutPanel />
         </template>
@@ -216,11 +234,36 @@
             <SnapshotPreview3D
               ref="previewRef"
               :snapshot="previewSnapshot"
+              :highlights="previewHighlights"
               @ready="handlePreviewReady"
               @select="handlePreviewSelect"
             />
             <aside class="preview-models">
-              <span class="preview-models-title">模型与位置</span>
+              <span class="preview-models-title">本次改动 <small>相对当前首页版本</small></span>
+              <div class="preview-change-summary">
+                <span class="is-added">新增 {{ previewDiff.summary.added }}</span>
+                <span class="is-modified">修改 {{ previewDiff.summary.modified }}</span>
+                <span class="is-deleted">删除 {{ previewDiff.summary.deleted }}</span>
+              </div>
+              <p v-if="!previewHasPublished" class="preview-change-hint">当前还没有已发布版本，全部模型视为新增。</p>
+              <p v-else-if="!previewHasChanges" class="preview-no-changes">与当前首页版本相比没有模型变化</p>
+              <div v-else class="preview-change-list">
+                <div
+                  v-for="item in previewChangeItems"
+                  :key="item.kind + ':' + item.id"
+                  class="preview-change-item"
+                  :class="'is-' + item.kind"
+                >
+                  <button type="button" class="preview-change-main" @click="focusPreviewChange(item)">
+                    <span class="preview-change-kind">{{ changeKindLabel(item.kind) }}</span>
+                    <strong>{{ item.name }}</strong>
+                    <small>{{ changeSummary(item) }}</small>
+                  </button>
+                  <button type="button" class="preview-detail-button" @click.stop="openPreviewDetail(item)">详情</button>
+                </div>
+              </div>
+
+              <span class="preview-models-title preview-models-title--secondary">全部模型</span>
               <button
                 v-for="model in previewModels"
                 :key="model.id"
@@ -243,6 +286,45 @@
             <p v-if="previewRequest.reviewNote">审核意见：{{ previewRequest.reviewNote }}</p>
           </div>
         </div>
+        <div v-if="previewDetail" class="preview-detail-overlay" @click.self="closePreviewDetail">
+          <div class="preview-detail-card" role="dialog" aria-modal="true" aria-label="改动详情">
+            <header>
+              <div>
+                <strong>{{ changeKindLabel(previewDetail.item.kind) }} · {{ previewDetail.model.name }}</strong>
+                <span>{{ changeSummary(previewDetail.item) }}</span>
+              </div>
+              <button class="preview-close" aria-label="关闭详情" @click="closePreviewDetail">×</button>
+            </header>
+            <div class="preview-detail-body">
+              <SnapshotPreview3D
+                :key="previewDetail.item.id"
+                :snapshot="previewDetail.snapshot"
+                :highlights="{ [previewDetail.item.id]: previewDetail.item.kind }"
+                :focus-model-id="previewDetail.item.id"
+                :show-labels="false"
+              />
+              <aside class="preview-detail-info">
+                <span class="preview-change-kind" :class="'is-' + previewDetail.item.kind">{{ changeKindLabel(previewDetail.item.kind) }}</span>
+                <h3>{{ previewDetail.model.name }}</h3>
+                <p class="preview-detail-id">模型 ID：{{ previewDetail.item.id }}</p>
+                <dl class="preview-detail-transform">
+                  <div v-for="row in detailTransformRows(previewDetail.item)" :key="row.label">
+                    <dt>{{ row.label }}</dt>
+                    <dd>{{ row.value }}</dd>
+                  </div>
+                </dl>
+                <div v-if="previewDetail.item.changes.length" class="preview-detail-changes">
+                  <h4>变更对比</h4>
+                  <div v-for="change in previewDetail.item.changes" :key="change.field" class="preview-detail-change">
+                    <span>{{ change.field }}</span>
+                    <small>{{ change.before }} → {{ change.after }}</small>
+                  </div>
+                </div>
+                <p v-if="previewDetail.item.kind === 'deleted'" class="preview-detail-note">该模型在提交版本中已被删除，这里展示的是当前首页版本里的原模型。</p>
+              </aside>
+            </div>
+          </div>
+        </div>
         <footer v-if="previewRequest.status === 'pending'">
           <button class="btn danger" :disabled="busyId === previewRequest.id" @click="rejectPublish(previewRequest)">驳回</button>
           <button class="btn primary" :disabled="busyId === previewRequest.id" @click="approvePublish(previewRequest)">通过并发布</button>
@@ -257,6 +339,7 @@ import { computed, onMounted, ref } from 'vue'
 import BrandLogo from './BrandLogo.vue'
 import SnapshotPreview3D from './SnapshotPreview3D.vue'
 import SiteSettingsPage from './SiteSettingsPage.vue'
+import EmailSettingsPage from './EmailSettingsPage.vue'
 import AboutPanel from './AboutPanel.vue'
 import {
   adminApproveApplication,
@@ -276,6 +359,7 @@ import {
   adminRejectPublishRequest,
   fetchPublishedHomepage,
 } from '../publish/publishRequests.js'
+import { diffSnapshotModels, modelTransform, singleModelSnapshot } from '../publish/snapshotDiff.js'
 
 const applicationTabs = [
   { value: 'pending', label: '待审核' },
@@ -287,12 +371,12 @@ const publishTabs = [
   { value: 'pending', label: '待审核' },
   { value: 'approved', label: '已发布' },
   { value: 'rejected', label: '已驳回' },
-  { value: 'stale', label: '已过期' },
+  { value: 'stale', label: '未发布（已过期）' },
   { value: 'all', label: '全部' },
 ]
 
 const initialView = new URLSearchParams(typeof location !== 'undefined' ? location.search : '').get('view')
-const view = ref(['settings', 'about'].includes(initialView) ? initialView : 'overview')
+const view = ref(['settings', 'email', 'about'].includes(initialView) ? initialView : 'overview')
 const applicationTab = ref('pending')
 const publishTab = ref('pending')
 const applications = ref([])
@@ -314,13 +398,30 @@ const previewModels = ref([])
 const previewWorld = ref(null)
 const selectedPreviewModelId = ref('')
 const previewRef = ref(null)
+const previewBaseSnapshot = ref(null)
+const previewDiff = ref({ added: [], modified: [], deleted: [], unchanged: 0, summary: { added: 0, modified: 0, deleted: 0, unchanged: 0 } })
+const previewHasPublished = ref(false)
+const previewDetail = ref(null)
 const overview = ref({ pendingApplications: 0, pendingPublish: 0, users: 0, published: null })
+
+const previewChangeItems = computed(() => [
+  ...previewDiff.value.added,
+  ...previewDiff.value.modified,
+  ...previewDiff.value.deleted,
+])
+const previewHighlights = computed(() => {
+  const result = {}
+  for (const item of previewDiff.value.added) result[item.id] = 'added'
+  for (const item of previewDiff.value.modified) result[item.id] = 'modified'
+  return result
+})
+const previewHasChanges = computed(() => previewChangeItems.value.length > 0)
 
 const loadingView = computed(() => {
   if (view.value === 'applications') return loadingApplications.value
   if (view.value === 'users') return loadingUsers.value
   if (view.value === 'publish') return loadingPublish.value
-  if (view.value === 'settings' || view.value === 'about') return false
+  if (view.value === 'settings' || view.value === 'email' || view.value === 'about') return false
   return loadingOverview.value
 })
 const viewTitle = computed(() => ({
@@ -329,6 +430,7 @@ const viewTitle = computed(() => ({
   publish: '发布审核',
   users: '团队成员',
   settings: '站点设置',
+  email: '邮件通知',
   about: '关于',
 }[view.value] || '概览'))
 const viewDescription = computed(() => ({
@@ -337,6 +439,7 @@ const viewDescription = computed(() => ({
   publish: '审核成员提交的沙盒版本，通过后切换首页内容。',
   users: '管理成员角色、启用状态和密码。',
   settings: '配置首页与沙盒的品牌、标题、图标和 SEO。',
+  email: '配置 SMTP、管理员收件人与审核结果通知。',
   about: '项目信息、仓库地址与开源许可证。',
 }[view.value] || ''))
 
@@ -368,14 +471,14 @@ async function setView(nextView) {
   view.value = nextView
   if (typeof history !== 'undefined' && typeof location !== 'undefined') {
     const url = new URL(location.href)
-    if (nextView === 'settings' || nextView === 'about') url.searchParams.set('view', nextView)
+    if (nextView === 'settings' || nextView === 'email' || nextView === 'about') url.searchParams.set('view', nextView)
     else url.searchParams.delete('view')
     history.replaceState({}, '', url)
   }
   if (nextView === 'applications') await loadApplications()
   else if (nextView === 'users') await loadUsers()
   else if (nextView === 'publish') await loadPublishRequests()
-  else if (nextView === 'settings' || nextView === 'about') return
+  else if (nextView === 'settings' || nextView === 'email' || nextView === 'about') return
   else await loadOverview()
 }
 
@@ -524,6 +627,25 @@ async function updateRole(user, role) {
   }
 }
 
+async function updateEmail(user, email) {
+  const nextEmail = String(email || '').trim().toLowerCase()
+  if (nextEmail === String(user.email || '').toLowerCase()) return
+  if (nextEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(nextEmail)) {
+    setError('请输入合法邮箱地址')
+    return
+  }
+  busyId.value = user.id
+  try {
+    await adminUpdateUser(user.id, { email: nextEmail })
+    setStatus('已更新 @' + user.username + ' 的通知邮箱', 'success')
+    await loadUsers()
+  } catch (err) {
+    setError(err?.message || '邮箱更新失败')
+  } finally {
+    busyId.value = ''
+  }
+}
+
 async function updateStatus(user, statusValue) {
   busyId.value = user.id
   try {
@@ -552,13 +674,24 @@ async function resetPassword(user) {
 async function openPreview(item) {
   previewRequest.value = item
   previewSnapshot.value = null
+  previewBaseSnapshot.value = null
+  previewDiff.value = { added: [], modified: [], deleted: [], unchanged: 0, summary: { added: 0, modified: 0, deleted: 0, unchanged: 0 } }
+  previewHasPublished.value = false
+  previewDetail.value = null
   previewModels.value = []
   previewWorld.value = null
   selectedPreviewModelId.value = ''
   previewError.value = ''
   previewLoading.value = true
   try {
-    previewSnapshot.value = await adminFetchPublishSnapshot(item.id)
+    const [snapshot, published] = await Promise.all([
+      adminFetchPublishSnapshot(item.id),
+      fetchPublishedHomepage().catch(() => null),
+    ])
+    previewSnapshot.value = snapshot
+    previewBaseSnapshot.value = published?.snapshot || null
+    previewHasPublished.value = Boolean(published?.snapshot)
+    previewDiff.value = diffSnapshotModels(previewBaseSnapshot.value, snapshot)
   } catch (err) {
     previewError.value = err?.message || '读取发布快照失败，无法渲染 3D 预览'
   } finally {
@@ -580,9 +713,54 @@ function focusPreviewModel(id) {
   previewRef.value?.focusModel?.(String(id))
 }
 
+function changeKindLabel(kind) {
+  return { added: '新增', modified: '修改', deleted: '删除' }[kind] || kind
+}
+
+function changeSummary(item) {
+  if (item.kind === 'added') return '新增模型'
+  if (item.kind === 'deleted') return '已从提交版本删除'
+  return item.changes.map(change => change.field).join(' / ') || '模型有变化'
+}
+
+function focusPreviewChange(item) {
+  if (item.kind === 'deleted') {
+    openPreviewDetail(item)
+    return
+  }
+  focusPreviewModel(item.id)
+}
+
+function openPreviewDetail(item) {
+  const source = item.kind === 'deleted' ? previewBaseSnapshot.value : previewSnapshot.value
+  const model = item.after || item.before
+  const snapshot = singleModelSnapshot(source, model)
+  if (!snapshot) return
+  previewDetail.value = { item, model, snapshot }
+  selectedPreviewModelId.value = item.id
+}
+
+function closePreviewDetail() {
+  previewDetail.value = null
+}
+
+function detailTransformRows(item) {
+  const model = item.after || item.before
+  const transform = modelTransform(model)
+  return [
+    { label: '位置', value: transform.position.map(value => Number(value).toFixed(2).replace(/\.00$/, '')).join(', ') },
+    { label: '旋转', value: transform.rotation.map(value => Number(value).toFixed(2).replace(/\.00$/, '')).join(', ') },
+    { label: '缩放', value: transform.scale.map(value => Number(value).toFixed(2).replace(/\.00$/, '')).join(', ') },
+  ]
+}
+
 function closePreview() {
   previewRequest.value = null
   previewSnapshot.value = null
+  previewBaseSnapshot.value = null
+  previewDiff.value = { added: [], modified: [], deleted: [], unchanged: 0, summary: { added: 0, modified: 0, deleted: 0, unchanged: 0 } }
+  previewHasPublished.value = false
+  previewDetail.value = null
   previewModels.value = []
   previewWorld.value = null
   selectedPreviewModelId.value = ''
@@ -730,12 +908,14 @@ async function doLogout() {
 .btn.small { padding: 6px 9px; font-size: 10px; }
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .user-table { display: grid; gap: 6px; }
-.user-row { display: grid; grid-template-columns: minmax(180px, 1.4fr) 120px 110px 150px 120px; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid rgba(15, 46, 38, 0.08); border-radius: 12px; background: rgba(255, 255, 255, 0.34); font-size: 11px; }
+.user-row { display: grid; grid-template-columns: minmax(170px, 1.3fr) minmax(180px, 1.4fr) 110px 100px 140px 110px; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid rgba(15, 46, 38, 0.08); border-radius: 12px; background: rgba(255, 255, 255, 0.34); font-size: 11px; }
 .user-row--head { background: transparent; border-color: transparent; color: #5d7a6c; font-weight: 600; }
 .user-identity { display: grid; gap: 2px; min-width: 0; }
 .user-identity strong { font-size: 12px; }
 .user-identity small { color: #5d7a6c; }
-.user-row select { width: 100%; padding: 6px 8px; border: 1px solid rgba(15, 46, 38, 0.14); border-radius: 9px; background: rgba(255, 255, 255, 0.55); color: #0f2e26; font: inherit; font-size: 11px; }
+.user-row select,
+.user-email-input { width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid rgba(15, 46, 38, 0.14); border-radius: 9px; background: rgba(255, 255, 255, 0.55); color: #0f2e26; font: inherit; font-size: 11px; }
+.user-email-input::placeholder { color: #93a79d; }
 .user-time { color: #5d7a6c; font-size: 10px; }
 .preview-overlay { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; padding: 20px; background: rgba(11, 32, 25, 0.42); backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); }
 .preview-modal { width: min(1120px, 96vw); max-height: 94vh; overflow-y: auto; border: 1px solid rgba(255, 255, 255, 0.8); border-radius: 22px; background: linear-gradient(160deg, rgba(255, 255, 255, 0.88), rgba(255, 255, 255, 0.68)); box-shadow: 0 30px 90px rgba(10, 30, 22, 0.3); }
@@ -754,6 +934,48 @@ async function doLogout() {
 .preview-models button small { color: #5d7a6c; font-size: 9px; font-variant-numeric: tabular-nums; }
 .preview-models p { margin: 4px 2px; color: #5d7a6c; font-size: 10px; line-height: 1.5; }
 .preview-world-info { margin-top: auto !important; padding-top: 8px; border-top: 1px solid rgba(15, 46, 38, 0.1); font-size: 9px !important; }
+.preview-models-title small { display: block; margin-top: 2px; color: #8a9b91; font-size: 8.5px; font-weight: 400; }
+.preview-models-title--secondary { margin-top: 8px; padding-top: 8px; border-top: 1px solid rgba(15, 46, 38, 0.1); }
+.preview-change-summary { display: flex; flex-wrap: wrap; gap: 5px; }
+.preview-change-summary span { padding: 3px 6px; border-radius: 999px; font-size: 9px; }
+.preview-change-summary .is-added { color: #0f6b51; background: rgba(143, 211, 154, 0.26); }
+.preview-change-summary .is-modified { color: #8a5a1f; background: rgba(230, 196, 122, 0.3); }
+.preview-change-summary .is-deleted { color: #8f2f25; background: rgba(224, 122, 104, 0.22); }
+.preview-change-hint, .preview-no-changes { margin: 4px 2px; color: #5d7a6c; font-size: 9.5px; line-height: 1.5; }
+.preview-change-list { display: grid; gap: 5px; }
+.preview-change-item { display: flex; align-items: stretch; gap: 4px; border: 1px solid rgba(15, 46, 38, 0.1); border-radius: 10px; background: rgba(255, 255, 255, 0.4); overflow: hidden; }
+.preview-change-item.is-added { border-left: 3px solid #2fbf94; }
+.preview-change-item.is-modified { border-left: 3px solid #e6a35e; }
+.preview-change-item.is-deleted { border-left: 3px solid #d46a5f; }
+.preview-change-main { flex: 1; display: grid; gap: 2px; padding: 7px 8px !important; border: 0 !important; border-radius: 0 !important; background: transparent !important; text-align: left; }
+.preview-change-main:hover { background: rgba(255, 255, 255, 0.5) !important; }
+.preview-change-kind { width: fit-content; padding: 1px 5px; border-radius: 999px; font-size: 8px; font-weight: 700; }
+.preview-change-kind.is-added { color: #0f6b51; background: rgba(143, 211, 154, 0.28); }
+.preview-change-kind.is-modified { color: #8a5a1f; background: rgba(230, 196, 122, 0.32); }
+.preview-change-kind.is-deleted { color: #8f2f25; background: rgba(224, 122, 104, 0.24); }
+.preview-change-main strong { font-size: 10.5px; overflow-wrap: anywhere; }
+.preview-change-main small { color: #5d7a6c; font-size: 9px; overflow-wrap: anywhere; }
+.preview-detail-button { align-self: stretch; padding: 0 7px !important; border: 0 !important; border-left: 1px solid rgba(15, 46, 38, 0.08) !important; border-radius: 0 !important; background: rgba(255, 255, 255, 0.3) !important; color: #0f7a5c !important; font-size: 9px !important; cursor: pointer; }
+.preview-detail-button:hover { background: rgba(127, 240, 200, 0.24) !important; }
+.preview-detail-overlay { position: fixed; inset: 0; z-index: 40; display: grid; place-items: center; padding: 20px; background: rgba(11, 32, 25, 0.5); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+.preview-detail-card { width: min(1000px, 96vw); max-height: 92vh; overflow-y: auto; border: 1px solid rgba(255, 255, 255, 0.8); border-radius: 20px; background: linear-gradient(160deg, rgba(255, 255, 255, 0.94), rgba(255, 255, 255, 0.78)); box-shadow: 0 30px 90px rgba(10, 30, 22, 0.35); }
+.preview-detail-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid rgba(15, 46, 38, 0.1); }
+.preview-detail-card > header strong { display: block; font-size: 14px; }
+.preview-detail-card > header span { display: block; margin-top: 3px; color: #5d7a6c; font-size: 10px; }
+.preview-detail-body { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 12px; padding: 14px 16px 18px; }
+.preview-detail-info { display: flex; flex-direction: column; gap: 8px; min-width: 0; padding: 10px; border: 1px solid rgba(15, 46, 38, 0.09); border-radius: 14px; background: rgba(255, 255, 255, 0.36); }
+.preview-detail-info h3 { margin: 0; font-size: 15px; overflow-wrap: anywhere; }
+.preview-detail-info h4 { margin: 0 0 4px; color: #3f5a4e; font-size: 10px; }
+.preview-detail-id { margin: 0; color: #7e9586; font-size: 9px; overflow-wrap: anywhere; }
+.preview-detail-transform { display: grid; gap: 4px; margin: 0; padding: 8px; border-radius: 10px; background: rgba(15, 46, 38, 0.04); }
+.preview-detail-transform div { display: flex; justify-content: space-between; gap: 8px; font-size: 10px; }
+.preview-detail-transform dt { color: #5d7a6c; }
+.preview-detail-transform dd { margin: 0; color: #0f2e26; font-variant-numeric: tabular-nums; }
+.preview-detail-changes { display: grid; gap: 5px; }
+.preview-detail-change { display: grid; gap: 2px; padding: 6px 7px; border: 1px solid rgba(15, 46, 38, 0.08); border-radius: 8px; background: rgba(255, 255, 255, 0.38); }
+.preview-detail-change span { color: #3f5a4e; font-size: 9px; font-weight: 600; }
+.preview-detail-change small { color: #5d7a6c; font-size: 9px; overflow-wrap: anywhere; }
+.preview-detail-note { margin: 0; padding: 7px 8px; border-radius: 8px; color: #8a5a1f; background: rgba(230, 196, 122, 0.18); font-size: 9px; line-height: 1.5; }
 .preview-placeholder { display: grid; place-items: center; min-height: 300px; border-radius: 14px; background: rgba(15, 46, 38, 0.06); color: #5d7a6c; font-size: 11px; }
 .preview-error { color: #9b3b31; }
 .preview-meta { margin-top: 12px; color: #3f5a4e; font-size: 11px; line-height: 1.6; }
@@ -773,6 +995,8 @@ async function doLogout() {
   .user-row--head { display: none; }
   .application-item { flex-direction: column; }
   .preview-stage { grid-template-columns: 1fr; }
-  .preview-models { max-height: 180px; min-height: 0; }
+  .preview-models { max-height: 240px; min-height: 0; }
+  .preview-detail-body { grid-template-columns: 1fr; }
+  .preview-detail-card { border-radius: 16px; }
 }
 </style>

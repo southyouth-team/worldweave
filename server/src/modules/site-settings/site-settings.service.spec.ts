@@ -45,6 +45,16 @@ describe('SiteSettingsService', () => {
     expect(loaded.updatedAt).toBe(saved.updatedAt);
   });
 
+  it('保存可选的通知接收邮箱并拒绝非法格式', async () => {
+    const saved = await service.save({ notificationEmail: '  notify@example.com  ' })
+    expect(saved.settings.notificationEmail).toBe('notify@example.com')
+
+    const empty = await service.save({ notificationEmail: '' })
+    expect(empty.settings.notificationEmail).toBe('')
+
+    await expect(service.save({ notificationEmail: 'not-an-email' })).rejects.toBeInstanceOf(BadRequestException)
+  })
+
   it('拒绝非法颜色、空标题和过大的 logo', async () => {
     await expect(service.save({ themeColor: 'red' })).rejects.toBeInstanceOf(BadRequestException);
     await expect(service.save({ brandName: '   ' })).rejects.toBeInstanceOf(BadRequestException);

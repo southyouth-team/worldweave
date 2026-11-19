@@ -89,15 +89,24 @@ Worldweave 把「搭建、生成、拥有时间、发布与协作」放在同一
 
 ### 发布与协作
 
+- 服务端共享工作区：沙盒快照保存在后端，按地块记录版本，不再依赖某个成员的浏览器。
+- 地块租约锁 + 心跳续租：同一地块被占用时第二名成员会收到明确提示；断线后锁自动过期，管理员可强制解锁。
+- 在线成员列表：显示当前在线成员与正在查看的地块；编辑器内可打开「协作」面板查看锁和最近同步状态。
+- 按地块保存：不同地块可以同时编辑，服务端只合并本次改动的地块；同一地块用 `expectedVersions` 拦截覆盖，冲突返回 409 并提示刷新。
+- 已发布模型可以继续修改：编辑先进入共享工作区，首页仍显示已发布版本；只有重新提交发布申请并通过审核后才会上线。
+- 邮件通知：独立配置 SMTP、管理员收件人与通知开关；新加入申请、新发布申请通知管理员，审核通过/驳回/过期通知提交人。
 - 成员提交发布申请：冻结快照 + 说明 + 720px 缩略图。
-- 管理员在后台用 **3D 视图** 查看提交快照的模型、位置和地块范围。
-- 通过后切换全局首页版本；旧的待审申请自动标记为过期。
+- 发布快照按内容哈希去重：与当前首页版本相同、或与上次提交内容相同会直接拒绝，避免重复待审。
+- 管理员在后台用 **3D 视图** 查看提交快照；右侧列出相对当前首页版本的新增/修改/删除模型。
+- 改动模型在预览中高亮，点击可定位；每项支持单独打开 3D 详情和前后字段对比。
+- 通过后切换全局首页版本；旧的待审申请自动标记为未发布（已过期），不会被一起发布。
 - 驳回可填写原因，成员在沙盒中能看到审核意见。
 
 ### 账号与管理
 
 - 管理员 / 团队成员两种角色；未登录只能浏览首页。
-- 加入申请 → 管理员审核 → 自动创建账号 + 一次性临时密码。
+- 加入申请（含通知邮箱）→ 管理员审核 → 自动创建账号 + 一次性临时密码。
+- 审核结果通过邮件发送给申请人；管理员可在团队成员页维护成员邮箱。
 - 首次登录强制改密；成员可自行改密。
 - 成员启停用、角色调整、重置密码、登录失败限流。
 - 管理员不进入模型编辑器，专注成员、发布审核与站点管理。
@@ -233,6 +242,7 @@ src/
     ProceduralModelEditor.vue  AI 模型工作台
     AdminConsolePage.vue  管理后台（侧边菜单）
     SiteSettingsPage.vue  站点设置（可嵌入后台）
+    EmailSettingsPage.vue 邮件通知配置（可嵌入后台）
     SnapshotPreview3D.vue 发布快照 3D 预览
     Auth*.vue             登录 / 申请 / 改密
   three/                  场景引擎、相机、物理、程序化资产
@@ -243,6 +253,7 @@ server/
   src/modules/auth/       账号、会话、申请、成员
   src/modules/publish-requests/ 发布申请与审核
   src/modules/site-settings/    站点品牌配置
+  src/modules/email-notifications/ SMTP 配置与审核通知
   src/modules/assets/     资产、底图、AI 生成
   src/database/migrations/
 docs/                     架构、数据契约、历史规划与截图
@@ -268,6 +279,19 @@ public/                   favicon、manifest、静态数据
 | `POST` | `/api/v1/auth/join-applications` | 提交加入申请（公开） |
 | `GET` | `/api/v1/site-settings` | 读取全局站点配置（公开） |
 | `PUT` / `DELETE` | `/api/v1/site-settings` | 保存 / 重置站点配置（管理员） |
+| `GET` | `/api/v1/collab/workspace` | 读取共享世界快照、地块版本、锁与在线成员 |
+| `GET` | `/api/v1/collab/status` | 轮询协作状态（不含完整快照） |
+| `POST` | `/api/v1/collab/presence` | 上报在线状态与当前地块 |
+| `POST` | `/api/v1/collab/locks` | 获取地块租约锁（冲突返回 409） |
+| `POST` | `/api/v1/collab/locks/heartbeat` | 续租地块锁 |
+| `POST` | `/api/v1/collab/locks/release` | 主动释放地块锁 |
+| `POST` | `/api/v1/collab/workspace` | 按改动地块保存共享世界（版本冲突返回 409） |
+| `POST` | `/api/v1/admin/collab/force-unlock` | 管理员强制解锁并写审计日志 |
+| `GET` / `PUT` | `/api/v1/admin/email-settings` | 读取 / 保存邮件通知配置（密码不回传） |
+| `POST` | `/api/v1/admin/email-settings/test` | 发送测试邮件 |
+| `GET` | `/api/v1/admin/email-settings/log` | 最近邮件发送记录 |
+
+邮件通知的字段、事件、测试流程和常见 SMTP 问题见 [docs/EMAIL_NOTIFICATIONS.md](docs/EMAIL_NOTIFICATIONS.md)。
 | `POST` | `/api/v1/publish-requests` | 成员提交发布申请 |
 | `GET` | `/api/v1/publish-requests/mine` | 自己的发布申请记录 |
 | `GET` | `/api/v1/admin/publish-requests` | 管理员查看发布申请 |
@@ -293,7 +317,7 @@ npm test
 npm run build
 ```
 
-后端测试使用 Jest，前端使用 Vitest；当前既有基线失败集中在 CharacterMotor / InputController / PhysicsRuntime / PlayerCharacterRuntime。
+后端测试使用 Jest，前端使用 Vitest；当前前端 1167 项、后端 146 项测试通过。
 
 ## 安全部署
 
@@ -310,9 +334,9 @@ npm run build
 
 ## 当前协作边界
 
-已经具备：账号/角色、加入申请审批、成员管理、发布申请与 3D 审核、站点设置。
+已经具备：账号/角色、加入申请审批、成员管理、发布申请与 3D 审核、站点设置、服务端共享世界、地块版本与租约锁、在线成员、409 冲突处理、已发布模型只读保护与审计日志。
 
-仍在路线图中：**共享世界 + 区块锁/在线状态**、已发布模型对普通成员的服务端只读强制、审计日志、WebSocket 实时协作。当前成员的编辑保存在各自浏览器，发布审核提交的是提交时冻结的快照。
+仍在路线图中：WebSocket 实时推送（当前在线状态与锁通过轮询刷新）、更完整的历史版本回滚、邮件模板可视化编辑。发布审核仍然提交提交时冻结的快照，审核期间的新修改不会自动进入待审版本。
 
 ## 路线图
 

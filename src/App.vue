@@ -542,7 +542,9 @@ function restorePublishedSandboxModels(snapshot) {
 }
 
 onMounted(async () => {
-  if (isSandboxRoute || isAssetWorkshopRoute || isAssetTemplateLabRoute) return
+  // 登录 / 申请 / 改密 / 管理后台不渲染首页视口，不能初始化首页 3D 引擎。
+  if (isSandboxRoute || isAssetWorkshopRoute || isAssetTemplateLabRoute || isAuthPageRoute || isAdminRoute) return
+  if (!viewport.value) return
   updateViewportState()
   window.addEventListener('resize', updateViewportState)
   window.addEventListener('orientationchange', updateViewportState)

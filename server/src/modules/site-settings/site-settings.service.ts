@@ -11,6 +11,7 @@ import {
 
 const LOGO_DATA_URL_PATTERN = /^data:image\/(svg\+xml|png|jpeg|webp);base64,[a-z0-9+/=\s]+$/i;
 const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const REQUIRED_TEXT_FIELDS = new Set(['brandName', 'homepageTitle', 'sandboxTitle']);
 
 /**
@@ -86,6 +87,13 @@ export class SiteSettingsService {
       }
       if (trimmed.length > limit) throw new BadRequestException(field + ' 超过 ' + limit + ' 个字符');
       result[field] = trimmed;
+    }
+    if (source.notificationEmail !== undefined) {
+      const email = String(source.notificationEmail ?? '').trim()
+      if (email && !EMAIL_PATTERN.test(email)) {
+        throw new BadRequestException('notificationEmail 需要合法邮箱地址')
+      }
+      result.notificationEmail = email
     }
     if (source.themeColor !== undefined) {
       if (typeof source.themeColor !== 'string' || !HEX_COLOR_PATTERN.test(source.themeColor)) {

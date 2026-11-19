@@ -20,6 +20,7 @@ export const DEFAULT_SITE_SETTINGS = Object.freeze({
   ogDescription: '源码公开的 AI 世界构建器：等距地块编辑、AI 模型生成、发布审核与团队协作。',
   themeColor: '#e8f0ea',
   logoDataUrl: null,
+  notificationEmail: '',
 })
 
 export const SITE_SETTING_TEXT_LIMITS = Object.freeze({
@@ -35,12 +36,14 @@ export const SITE_SETTING_TEXT_LIMITS = Object.freeze({
   author: 120,
   ogTitle: 120,
   ogDescription: 500,
+  notificationEmail: 254,
 })
 
 const TEXT_FIELDS = Object.keys(SITE_SETTING_TEXT_LIMITS)
 const REQUIRED_FIELDS = ['brandName', 'homepageTitle', 'sandboxTitle']
 const LOGO_PATTERN = /^data:image\/(svg\+xml|png|jpeg|webp);base64,/i
 const HEX_COLOR_PATTERN = /^#[0-9a-fA-F]{6}$/
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
 export const siteSettings = reactive({ ...DEFAULT_SITE_SETTINGS })
 
@@ -90,6 +93,10 @@ export function validateSiteSettings(input) {
   }
   if (input?.logoDataUrl && !isValidLogoDataUrl(input.logoDataUrl)) {
     errors.logoDataUrl = 'logo 必须是 512 KB 以内的 SVG/PNG/JPEG/WebP'
+  }
+  const notificationEmail = String(input?.notificationEmail || '').trim()
+  if (notificationEmail && !EMAIL_PATTERN.test(notificationEmail)) {
+    errors.notificationEmail = '需要合法邮箱地址'
   }
   return errors
 }

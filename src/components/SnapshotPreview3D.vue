@@ -18,6 +18,12 @@ import { applyTextPlates } from '../three/sandbox/textPlateRuntime.js'
 
 const props = defineProps({
   snapshot: { type: Object, default: null },
+  // id -> 'added' | 'modified'，用于在预览里标出本次改动
+  highlights: { type: Object, default: () => ({}) },
+  // 单模型详情：直接以这个模型为取景主体
+  focusModelId: { type: String, default: '' },
+  // 详情里标题已经写明模型名，不再在模型上方重复浮动名字
+  showLabels: { type: Boolean, default: true },
 })
 const emit = defineEmits(['ready', 'select'])
 
@@ -30,6 +36,7 @@ let controls = null
 let raycaster = null
 let contentGroup = null
 let selectionHelper = null
+let highlightHelpers = []
 let resizeObserver = null
 let frameId = 0
 let modelRecords = []
@@ -99,6 +106,36 @@ function computeWorldBounds(snapshot) {
   }
 }
 
+function clearHighlights() {
+  for (const helper of highlightHelpers) {
+    helper.parent?.remove(helper)
+    disposeObject(helper)
+  }
+  highlightHelpers = []
+}
+
+function applyHighlights() {
+  if (!contentGroup) return
+  clearHighlights()
+  for (const record of modelRecords) {
+    const kind = props.highlights?.[record.id]
+    if (kind !== 'added' && kind !== 'modified' && kind !== 'deleted') continue
+    const color = kind === 'added' ? 0x2fbf94 : kind === 'deleted' ? 0xd46a5f : 0xe6a35e
+    const helper = new THREE.BoxHelper(record.object, color)
+    helper.name = 'snapshot-highlight-' + record.id
+    contentGroup.add(helper)
+    highlightHelpers.push(helper)
+    const box = new THREE.Box3().setFromObject(record.object)
+    const badge = createLabel(kind === 'added' ? '新增' : kind === 'deleted' ? '已删除' : '修改')
+    if (badge) {
+      badge.scale.set(3.4, 0.85, 1)
+      badge.position.set((box.min.x + box.max.x) / 2, Math.max(3.4, box.max.y + 2.7), (box.min.z + box.max.z) / 2)
+      contentGroup.add(badge)
+      highlightHelpers.push(badge)
+    }
+  }
+}
+
 function clearContent() {
   if (selectionHelper && scene) {
     scene.remove(selectionHelper)
@@ -106,6 +143,7 @@ function clearContent() {
     selectionHelper.material?.dispose?.()
     selectionHelper = null
   }
+  clearHighlights()
   if (!contentGroup) return
   scene.remove(contentGroup)
   disposeObject(contentGroup)
@@ -164,12 +202,14 @@ function loadSnapshot(snapshot) {
         }
       })
       contentGroup.add(model)
-      const box = new THREE.Box3().setFromObject(model)
-      const label = createLabel(model.name)
-      if (label) {
-        label.scale.set(labelWidth, labelWidth * 0.25, 1)
-        label.position.set((box.min.x + box.max.x) / 2, Math.max(2, box.max.y + 1.6), (box.min.z + box.max.z) / 2)
-        contentGroup.add(label)
+      if (props.showLabels) {
+        const box = new THREE.Box3().setFromObject(model)
+        const label = createLabel(model.name)
+        if (label) {
+          label.scale.set(labelWidth, labelWidth * 0.25, 1)
+          label.position.set((box.min.x + box.max.x) / 2, Math.max(2, box.max.y + 1.6), (box.min.z + box.max.z) / 2)
+          contentGroup.add(label)
+        }
       }
       modelRecords.push({
         id: String(item.id),
@@ -183,6 +223,10 @@ function loadSnapshot(snapshot) {
   }
 
   empty.value = modelRecords.length === 0
+  applyHighlights()
+  const focusRecord = props.focusModelId
+    ? modelRecords.find(record => record.id === String(props.focusModelId))
+    : null
   emit('ready', {
     models: modelRecords.map(record => ({
       id: record.id,
@@ -196,7 +240,11 @@ function loadSnapshot(snapshot) {
       bounds: computeWorldBounds(snapshot),
     },
   })
-  fitCurrentView()
+  if (focusRecord) {
+    frameBox(new THREE.Box3().setFromObject(focusRecord.object), 'iso', 4)
+  } else {
+    fitCurrentView()
+  }
 }
 
 function boundsForView() {
@@ -211,11 +259,11 @@ function boundsForView() {
   return box
 }
 
-function frameBox(box, mode = 'iso') {
+function frameBox(box, mode = 'iso', minSize = 18) {
   if (!camera || !controls) return
   const center = new THREE.Vector3()
   box.getCenter(center)
-  const size = Math.max(box.getSize(new THREE.Vector3()).x, box.getSize(new THREE.Vector3()).z, 18)
+  const size = Math.max(box.getSize(new THREE.Vector3()).x, box.getSize(new THREE.Vector3()).z, minSize)
   const distance = size * 0.82
   if (mode === 'top') {
     camera.position.set(center.x, size * 1.65, center.z + 0.01)
@@ -251,7 +299,11 @@ function selectRecord(record) {
     selectionHelper = null
   }
   if (!record) return
-  selectionHelper = new THREE.BoxHelper(record.object, 0x2fbf94)
+  const kind = props.highlights?.[record.id]
+  selectionHelper = new THREE.BoxHelper(
+    record.object,
+    kind === 'modified' ? 0xe6a35e : kind === 'deleted' ? 0xd46a5f : 0x2fbf94,
+  )
   scene.add(selectionHelper)
   emit('select', {
     id: record.id,
@@ -265,7 +317,7 @@ function focusModel(id) {
   if (!record) return
   selectRecord(record)
   const box = new THREE.Box3().setFromObject(record.object)
-  frameBox(box, 'iso')
+  frameBox(box, 'iso', 4)
 }
 
 defineExpose({ focusModel, setView, fitCurrentView })
@@ -353,6 +405,17 @@ onMounted(() => {
 
 watch(() => props.snapshot, snapshot => {
   loadSnapshot(snapshot)
+})
+
+watch(() => props.highlights, () => {
+  applyHighlights()
+}, { deep: true })
+
+watch(() => props.focusModelId, id => {
+  if (!id) return
+  const record = modelRecords.find(item => item.id === String(id))
+  if (!record) return
+  frameBox(new THREE.Box3().setFromObject(record.object), 'iso', 4)
 })
 
 onBeforeUnmount(() => {

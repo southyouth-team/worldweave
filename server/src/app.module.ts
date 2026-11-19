@@ -12,6 +12,8 @@ import { ScenesModule } from './modules/scenes/scenes.module';
 import { SiteSettingsModule } from './modules/site-settings/site-settings.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { PublishRequestsModule } from './modules/publish-requests/publish-requests.module';
+import { CollabModule } from './modules/collab/collab.module';
+import { EmailNotificationsModule } from './modules/email-notifications/email-notifications.module';
 
 @Module({
   imports: [
@@ -54,6 +56,8 @@ import { PublishRequestsModule } from './modules/publish-requests/publish-reques
     SiteSettingsModule,
     AuthModule,
     PublishRequestsModule,
+    CollabModule,
+    EmailNotificationsModule,
   ],
 })
 export class AppModule {}

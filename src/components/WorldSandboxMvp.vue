@@ -32,6 +32,10 @@ import { isAnyStretchableRoadModel, isPolylineRoadModel } from '../three/sandbox
 import { localizePolygon, polygonArea, polygonBounds } from '../three/sandbox/footprintPolygon.js'
 import { fitModelToFootprint } from '../three/sandbox/footprintFit.js'
 import { buildFootprintPromptSuffix } from './sandbox/footprintPrompt.js'
+import {
+  collabClient,
+  diffSnapshotChunks,
+} from '../collab/sharedWorkspace.js'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:3001/api/v1'
 const DEV_USER_ID = import.meta.env.VITE_DEV_USER_ID || 'map-editor-local'
@@ -132,6 +136,55 @@ let selected = null
 let disposed = false
 const objectsById = new Map()
 
+// ---- 共享世界协作：服务端快照 + 地块租约锁 + 在线状态 ----
+const collabRevision = ref(0)
+const collabVersions = ref({})
+const collabLocks = ref([])
+const collabOnline = ref([])
+const collabActivity = ref([])
+const collabProtectedModelIds = ref([])
+const collabSnapshot = ref(null)
+const collabStatus = ref('offline')
+const collabError = ref('')
+const collabPanelOpen = ref(false)
+const collabLastSyncedAt = ref('')
+const collabPresenceChunk = ref('')
+const collabSyncInFlight = ref(false)
+const collabHasServerSnapshot = ref(false)
+let collabHeartbeatTimer = null
+let collabStatusTimer = null
+let collabSyncTimer = null
+let collabSharedReady = false
+
+const myCollabLocks = computed(() => {
+  const userId = currentUser.value?.id
+  return (collabLocks.value || []).filter(lock => !userId || lock.userId === userId)
+})
+const collabStatusText = computed(() => ({
+  offline: '共享世界未连接',
+  connecting: '正在连接共享世界',
+  synced: collabLastSyncedAt.value ? '已同步 · ' + collabLastSyncedAt.value : '共享世界已连接',
+  syncing: '正在同步共享世界',
+  locked: '当前地块被占用',
+  conflict: '共享世界有冲突',
+  error: '共享世界同步失败',
+}[collabStatus.value] || collabStatus.value))
+const collabProtectedSet = computed(() => new Set(collabProtectedModelIds.value.map(String)))
+const selectedModelProtected = computed(() => {
+  // selected 是普通变量；依赖 selectedName 让模型切换时重新计算。
+  selectedName.value
+  const id = selected?.userData?.sandboxModelId
+  return Boolean(id && collabProtectedSet.value.has(String(id)))
+})
+const collabOtherLocks = computed(() => {
+  const userId = currentUser.value?.id
+  return (collabLocks.value || []).filter(lock => !userId || lock.userId !== userId)
+})
+const collabOnlineOthers = computed(() => {
+  const userId = currentUser.value?.id
+  return (collabOnline.value || []).filter(member => member.userId !== userId)
+})
+
 // 资产库：服务端持久化的「我的模型」+ 前端程序化生成的内置素材
 const assetClient = createProceduralAssetClient({ baseUrl: API_BASE, devUserId: DEV_USER_ID })
 let builtinAssetRegistry = null
@@ -166,6 +219,7 @@ function handleModelSelected(payload) {
   selectedIsRoad.value = isAnyStretchableRoadModel(selected)
   selectedIsPolylineRoad.value = isPolylineRoadModel(selected)
   precisionModeActive.value = false
+  void focusSharedChunk()
 }
 function registerModel(root, name, position = null) {
   root.name = name || root.name || '模型'
@@ -302,6 +356,7 @@ function handleSandboxModelInteract(payload) {
 function selectModel(item) {
   const id = item?.id || item?.userData?.sandboxModelId
   if (id) engine?.selectSandboxModel(id)
+  void focusSharedChunk()
 }
 function setMode(mode) {
   const accepted = engine?.setSandboxTransformMode?.(mode)
@@ -2024,6 +2079,7 @@ function setManagementMode(mode) {
   }
   managementMode.value = nextMode
   if (nextMode === 'chunks') engine?.setSandboxChunkManagement?.(true)
+  void focusSharedChunk()
 }
 
 function toggleChunkManagement() {
@@ -2036,6 +2092,7 @@ function handleSandboxChunkSelectionChange(payload) {
   if (payload?.primary) selectedChunkKey.value = payload.primary.x + ':' + payload.primary.z
   else selectedChunkKey.value = selectedChunkKeys.value[selectedChunkKeys.value.length - 1] || ''
   reclaimFeedback.value = null
+  void focusSharedChunk()
 }
 
 function removeSelectedWorldChunks() {
@@ -2087,6 +2144,310 @@ function removeSelectedWorldChunks() {
   return failures.length === 0
 }
 
+function applyCollabState(state) {
+  collabRevision.value = Number(state?.workspace?.revision) || 0
+  collabVersions.value = { ...(state?.chunkVersions || {}) }
+  collabLocks.value = Array.isArray(state?.locks) ? state.locks : []
+  collabOnline.value = Array.isArray(state?.online) ? state.online : []
+  collabActivity.value = Array.isArray(state?.activity) ? state.activity : []
+  collabProtectedModelIds.value = Array.isArray(state?.protectedModelIds) ? state.protectedModelIds : []
+}
+
+function chunkForWorldPosition(x, z) {
+  const size = worldState.value?.chunkSize || {}
+  const width = Math.max(1, Number(size.width) || 54)
+  const depth = Math.max(1, Number(size.depth) || 42)
+  return Math.floor((Number(x) + width / 2) / width) + ':' + Math.floor((Number(z) + depth / 2) / depth)
+}
+
+function currentSharedChunk() {
+  if (managementMode.value === 'chunks' && selectedChunkKey.value) return selectedChunkKey.value
+  if (selected?.position) return chunkForWorldPosition(selected.position.x, selected.position.z)
+  return selectedChunkKey.value || '0:0'
+}
+
+function collabTimeLabel(value = new Date()) {
+  return value instanceof Date ? value.toLocaleTimeString() : new Date(value).toLocaleTimeString()
+}
+
+async function refreshCollabStatus() {
+  if (!currentUser.value || disposed) return null
+  try {
+    const state = await collabClient.fetchStatus()
+    if (disposed) return null
+    applyCollabState(state)
+    collabSharedReady = true
+    const currentChunk = currentSharedChunk()
+    const otherLock = (state.locks || []).find(
+      lock => lock.chunkKey === currentChunk && lock.userId !== currentUser.value?.id,
+    )
+    if (otherLock) {
+      collabStatus.value = 'locked'
+      collabError.value = '地块 ' + currentChunk + ' 正由 ' + (otherLock.displayName || otherLock.username) + ' 编辑'
+    } else if (['offline', 'connecting', 'locked', 'synced'].includes(collabStatus.value)) {
+      collabStatus.value = 'synced'
+      collabError.value = ''
+    }
+    return state
+  } catch (error) {
+    if (error?.status === 401) {
+      collabStatus.value = 'offline'
+      return null
+    }
+    collabStatus.value = 'error'
+    collabError.value = error?.message || '无法连接共享世界'
+    return null
+  }
+}
+
+async function releaseStaleCollabLocks(nextChunk) {
+  if (!collabSnapshot.value || !myCollabLocks.value.length) return
+  const diff = diffSnapshotChunks(collabSnapshot.value, buildSandboxSnapshot())
+  const pending = new Set(diff.chunks)
+  const stale = myCollabLocks.value
+    .map(lock => lock.chunkKey)
+    .filter(key => key !== nextChunk && !pending.has(key))
+  if (!stale.length) return
+  try {
+    await collabClient.releaseLocks({ chunkKeys: stale, currentChunk: nextChunk })
+    await refreshCollabStatus()
+  } catch {
+    // 释放失败时交给租约自动过期，不阻塞当前编辑。
+  }
+}
+
+async function focusSharedChunk() {
+  if (!currentUser.value || disposed) return
+  const chunk = currentSharedChunk()
+  collabPresenceChunk.value = chunk
+  try {
+    await collabClient.touchPresence({ currentChunk: chunk })
+  } catch {
+    // 在线状态失败不影响编辑；保存时会再次校验身份与锁。
+  }
+  if (isAdmin.value || !collabSharedReady) return
+  await releaseStaleCollabLocks(chunk)
+  if (myCollabLocks.value.some(lock => lock.chunkKey === chunk)) return
+  try {
+    await collabClient.acquireLocks({ chunkKeys: [chunk], currentChunk: chunk, leaseSeconds: 120 })
+    await refreshCollabStatus()
+  } catch (error) {
+    if (error?.code === 'CHUNK_LOCKED') {
+      collabStatus.value = 'locked'
+      collabError.value = error.message
+      message.value = '共享世界：' + error.message
+    } else if (error?.status !== 401) {
+      collabStatus.value = 'error'
+      collabError.value = error?.message || '无法锁定当前地块'
+    }
+  }
+}
+
+async function loadSharedWorkspace() {
+  collabStatus.value = 'connecting'
+  try {
+    const state = await collabClient.fetchWorkspace()
+    applyCollabState(state)
+    collabSharedReady = true
+    const snapshot = state?.workspace?.snapshot
+    collabHasServerSnapshot.value = Boolean(snapshot)
+    if (!snapshot) {
+      collabStatus.value = 'synced'
+      return false
+    }
+    await applySandboxSnapshot(snapshot, { sourceLabel: '共享世界' })
+    collabSnapshot.value = buildSandboxSnapshot()
+    collabStatus.value = 'synced'
+    collabLastSyncedAt.value = state.workspace.updatedAt ? collabTimeLabel(state.workspace.updatedAt) : collabTimeLabel()
+    return true
+  } catch (error) {
+    collabSharedReady = false
+    collabStatus.value = error?.status === 401 ? 'offline' : 'error'
+    collabError.value = error?.status === 401 ? '' : (error?.message || '共享世界载入失败')
+    return false
+  }
+}
+
+async function refreshSharedWorkspace({ reload = true } = {}) {
+  collabStatus.value = 'syncing'
+  collabError.value = ''
+  try {
+    const state = await collabClient.fetchWorkspace()
+    applyCollabState(state)
+    collabSharedReady = true
+    collabHasServerSnapshot.value = Boolean(state?.workspace?.snapshot)
+    if (!state?.workspace?.snapshot) {
+      collabStatus.value = 'synced'
+      message.value = '共享世界还没有保存过内容'
+      return false
+    }
+    if (reload && engine) {
+      message.value = '正在刷新共享世界…'
+      window.location.reload()
+      return true
+    }
+    await applySandboxSnapshot(state.workspace.snapshot, { sourceLabel: '共享世界' })
+    collabSnapshot.value = buildSandboxSnapshot()
+    collabStatus.value = 'synced'
+    collabLastSyncedAt.value = state.workspace.updatedAt ? collabTimeLabel(state.workspace.updatedAt) : collabTimeLabel()
+    return true
+  } catch (error) {
+    collabStatus.value = 'error'
+    collabError.value = error?.message || '共享世界刷新失败'
+    message.value = '共享世界刷新失败：' + collabError.value
+    return false
+  }
+}
+
+async function syncSandboxToShared() {
+  if (!currentUser.value || !engine || collabSyncInFlight.value || disposed) return false
+  if (!collabSharedReady || collabStatus.value === 'offline') {
+    collabStatus.value = 'error'
+    collabError.value = '共享世界尚未连接，改动只保存在本地浏览器'
+    saveStatus.value = '共享世界未连接'
+    message.value = '共享世界尚未连接：改动已保存在本地，请刷新页面重新连接后再保存到共享世界'
+    return false
+  }
+  if (collabHasServerSnapshot.value && !collabSnapshot.value) {
+    collabStatus.value = 'error'
+    collabError.value = '共享世界基线未载入'
+    saveStatus.value = '共享世界未同步'
+    message.value = '共享世界基线未载入，请点击「刷新共享世界」后再保存，避免覆盖其他成员的内容'
+    return false
+  }
+  let snapshot
+  let diff
+  try {
+    snapshot = buildSandboxSnapshot()
+    if (!snapshot) return false
+    diff = diffSnapshotChunks(collabSnapshot.value, snapshot)
+  } catch (error) {
+    collabStatus.value = 'error'
+    collabError.value = error?.message || '无法生成共享快照'
+    saveStatus.value = '共享世界未同步'
+    message.value = '共享世界同步失败：' + collabError.value
+    return false
+  }
+  if (!diff.chunks.length) {
+    collabStatus.value = 'synced'
+    saveStatus.value = '已保存 · 无需同步'
+    message.value = '沙盒已保存在本地，没有检测到需要同步到共享世界的改动'
+    return true
+  }
+  collabSyncInFlight.value = true
+  collabStatus.value = 'syncing'
+  collabError.value = ''
+  try {
+    await collabClient.acquireLocks({
+      chunkKeys: diff.chunks,
+      currentChunk: currentSharedChunk(),
+      leaseSeconds: 120,
+    })
+    const expectedVersions = {}
+    for (const key of diff.chunks) expectedVersions[key] = Number(collabVersions.value[key]) || 0
+    const result = await collabClient.saveWorkspace({
+      snapshot,
+      changedChunks: diff.chunks,
+      expectedVersions,
+    })
+    collabRevision.value = Number(result?.revision) || collabRevision.value
+    collabVersions.value = { ...collabVersions.value, ...(result?.chunkVersions || {}) }
+    collabSnapshot.value = snapshot
+    collabHasServerSnapshot.value = true
+    collabLastSyncedAt.value = collabTimeLabel()
+    collabStatus.value = 'synced'
+    collabError.value = ''
+    saveStatus.value = '已同步共享世界 · ' + collabLastSyncedAt.value
+    message.value = '共享世界已同步：' + diff.chunks.length + ' 个地块版本已更新'
+    void refreshCollabStatus()
+    return true
+  } catch (error) {
+    if (error?.code === 'VERSION_CONFLICT') {
+      collabStatus.value = 'conflict'
+      collabError.value = '共享世界已被其他成员更新，请先刷新共享世界再重做'
+    } else if (error?.code === 'CHUNK_LOCKED') {
+      collabStatus.value = 'locked'
+      collabError.value = error.message
+    } else if (error?.code === 'CHUNK_NOT_LOCKED') {
+      collabStatus.value = 'locked'
+      collabError.value = '地块锁已失效，请稍后重试'
+    } else if (error?.code === 'MODEL_ID_CONFLICT') {
+      collabStatus.value = 'conflict'
+      collabError.value = '模型 ID 在合并后重复，请刷新共享世界后重做'
+    } else {
+      collabStatus.value = 'error'
+      collabError.value = error?.message || '共享世界同步失败'
+    }
+    saveStatus.value = '共享世界未同步'
+    message.value = '共享世界同步失败：' + collabError.value
+    return false
+  } finally {
+    collabSyncInFlight.value = false
+  }
+}
+
+function scheduleSharedSync() {
+  if (!currentUser.value || disposed) return
+  if (collabSyncTimer !== null) window.clearTimeout(collabSyncTimer)
+  collabSyncTimer = window.setTimeout(() => {
+    collabSyncTimer = null
+    void syncSandboxToShared()
+  }, 900)
+}
+
+async function heartbeatSharedLocks() {
+  if (!currentUser.value || disposed) return
+  const keys = myCollabLocks.value.map(lock => lock.chunkKey)
+  const currentChunk = currentSharedChunk()
+  try {
+    if (keys.length) {
+      await collabClient.heartbeatLocks({ chunkKeys: keys, currentChunk, leaseSeconds: 120 })
+    } else {
+      await collabClient.touchPresence({ currentChunk })
+    }
+    void refreshCollabStatus()
+  } catch {
+    void refreshCollabStatus()
+  }
+}
+
+async function forceUnlockSharedChunk(chunkKey) {
+  if (!isAdmin.value || !chunkKey) return
+  try {
+    await collabClient.forceUnlock({ chunkKeys: [chunkKey] })
+    collabError.value = ''
+    message.value = '已强制释放地块 ' + chunkKey + ' 的编辑锁'
+    await refreshCollabStatus()
+    await focusSharedChunk()
+  } catch (error) {
+    collabError.value = error?.message || '强制解锁失败'
+    message.value = '强制解锁失败：' + collabError.value
+  }
+}
+
+function handleCollabBeforeUnload() {
+  const keys = myCollabLocks.value.map(lock => lock.chunkKey)
+  if (!keys.length) return
+  void collabClient.releaseLocks({ chunkKeys: keys }, { keepalive: true }).catch(() => {})
+}
+
+function startCollabTimers() {
+  stopCollabTimers()
+  collabStatusTimer = window.setInterval(() => { void refreshCollabStatus() }, 12000)
+  collabHeartbeatTimer = window.setInterval(() => { void heartbeatSharedLocks() }, 20000)
+  window.addEventListener('beforeunload', handleCollabBeforeUnload)
+}
+
+function stopCollabTimers() {
+  if (collabStatusTimer !== null) window.clearInterval(collabStatusTimer)
+  if (collabHeartbeatTimer !== null) window.clearInterval(collabHeartbeatTimer)
+  if (collabSyncTimer !== null) window.clearTimeout(collabSyncTimer)
+  collabStatusTimer = null
+  collabHeartbeatTimer = null
+  collabSyncTimer = null
+  window.removeEventListener('beforeunload', handleCollabBeforeUnload)
+}
+
 function buildSandboxSnapshot() {
   if (!engine) return null
   const models = engine.getSandboxModels().flatMap(({ id, name }) => {
@@ -2118,20 +2479,58 @@ function buildSandboxSnapshot() {
 
 function saveSandbox() {
   if (!engine) return false
+  let snapshot
+  let serialized
   try {
-    const snapshot = buildSandboxSnapshot()
+    snapshot = buildSandboxSnapshot()
     if (!snapshot) return false
-    const serialized = JSON.stringify(snapshot)
-    localStorage.setItem(STORAGE_KEY, serialized)
-    saveStatus.value = '已保存 · ' + new Date(snapshot.savedAt).toLocaleTimeString()
-    message.value = '沙盒已保存，刷新页面后会自动恢复'
-    return true
+    serialized = JSON.stringify(snapshot)
   } catch (error) {
-    const reason = error?.name === 'QuotaExceededError' ? '浏览器本地存储空间不足' : (error?.message || '未知错误')
     saveStatus.value = '保存失败'
-    message.value = '沙盒保存失败：' + reason
+    message.value = '沙盒保存失败：' + (error?.message || '无法生成快照')
     return false
   }
+
+  let localSaved = false
+  let localError = null
+  try {
+    localStorage.setItem(STORAGE_KEY, serialized)
+    localSaved = true
+  } catch (error) {
+    localError = error
+    // 旧版本地快照可能正是占满配额的原因；先删掉同一个 key 再试一次。
+    try {
+      localStorage.removeItem(STORAGE_KEY)
+      localStorage.setItem(STORAGE_KEY, serialized)
+      localSaved = true
+      localError = null
+    } catch (retryError) {
+      localError = retryError
+    }
+  }
+
+  const timeLabel = new Date(snapshot.savedAt).toLocaleTimeString()
+  if (localSaved) {
+    saveStatus.value = '已保存 · ' + timeLabel
+    message.value = currentUser.value
+      ? '沙盒已保存，正在同步到共享世界…'
+      : '沙盒已保存到本地浏览器'
+  } else {
+    const reason = localError?.name === 'QuotaExceededError'
+      ? '浏览器本地存储空间不足'
+      : (localError?.message || '浏览器本地缓存不可用')
+    if (!currentUser.value) {
+      saveStatus.value = '保存失败'
+      message.value = '沙盒保存失败：' + reason
+      return false
+    }
+    // 本地缓存失败不能阻止共享世界保存；服务端快照才是协作的权威数据。
+    saveStatus.value = '本地缓存失败 · 正在同步共享世界'
+    message.value = '浏览器本地缓存失败（' + reason + '），正在直接同步到共享世界…'
+  }
+
+  if (currentUser.value) scheduleSharedSync()
+  return true
 }
 
 // 发布申请：成员只能提交冻结快照，管理员审核通过后才会写入首页。
@@ -2304,80 +2703,86 @@ function handleSandboxRoadEditChange(payload) {
     : '道路端点已调整，但存档失败，请检查存储空间后重试。'
 }
 
+async function applySandboxSnapshot(snapshot, { sourceLabel = '本地' } = {}) {
+  if (!snapshot || ![1, 2, 3, 4].includes(snapshot.version) || !Array.isArray(snapshot.models)) {
+    throw new Error('保存文件版本不兼容')
+  }
+  if (snapshot.world) {
+    const restoredWorld = engine.restoreSandboxWorld(snapshot.world)
+    if (!restoredWorld) throw new Error('世界区块存档无效或与当前区块规格不兼容')
+    worldState.value = engine.getSandboxWorldState()
+  } else {
+    worldState.value = engine.getSandboxWorldState()
+  }
+  const loader = new THREE.ObjectLoader()
+  const restoredModels = snapshot.models
+    .filter(item => item?.object && item?.id)
+    .map(item => {
+      const model = loader.parse(item.object)
+      model.name = item.name || model.name || '已保存模型'
+      applyTextPlates(THREE, model)
+      model.userData = {
+        ...(model.userData || {}),
+        proceduralModelCapabilityControlDocument: model.userData?.proceduralModelCapabilityControlDocument
+          || createCapabilityControlDocument({ manifest: model.userData?.proceduralModelCapabilityManifest }),
+      }
+      return { id: String(item.id), model }
+    })
+  const registeredIds = []
+  try {
+    for (const { id, model } of restoredModels) {
+      // ObjectLoader 已从存档恢复完整 Transform；显式传回原位置，避免 addSandboxModel 的新模型默认落点覆盖存档坐标。
+      const registeredId = engine.addSandboxModel(model, {
+        name: model.name,
+        id,
+        position: { x: model.position.x, y: model.position.y, z: model.position.z },
+      })
+      registeredIds.push(registeredId)
+      objectsById.set(registeredId, model)
+    }
+  } catch (error) {
+    for (const id of registeredIds) {
+      engine.removeSandboxModel(id)
+      objectsById.delete(id)
+    }
+    throw error
+  }
+  if (snapshot.environment) {
+    time.value = Number.isFinite(Number(snapshot.environment.time)) ? Number(snapshot.environment.time) : 14
+    timeEnabled.value = snapshot.environment.timeEnabled !== false
+    // 老存档只有 clear/rain；新模式（多云/阴/雪/雾）按已注册模式恢复，未知回退晴天
+    const storedWeather = String(snapshot.environment.weather || 'clear')
+    weather.value = Object.prototype.hasOwnProperty.call(WEATHER_MODES, storedWeather) ? storedWeather : 'clear'
+    weatherEnabled.value = snapshot.environment.weatherEnabled !== false
+    weatherIntensity.value = Number.isFinite(Number(snapshot.environment.weatherIntensity))
+      ? Math.min(100, Math.max(0, Number(snapshot.environment.weatherIntensity)))
+      : 50
+    wind.value = Number.isFinite(Number(snapshot.environment.wind)) ? Number(snapshot.environment.wind) : 20
+    windEnabled.value = snapshot.environment.windEnabled !== false
+    sandboxWindDirection = {
+      x: Number(snapshot.environment.windDirection?.x),
+      z: Number(snapshot.environment.windDirection?.z),
+    }
+    artificialLightingEnabled.value = snapshot.environment.artificialLightingEnabled !== false
+    updateEnvironment()
+    engine?.setWeatherMode?.(weather.value, Number(weatherIntensity.value) / 100)
+  }
+  if (snapshot.selectedModelId && objectsById.has(snapshot.selectedModelId)) {
+    selected = objectsById.get(snapshot.selectedModelId)
+    engine.selectSandboxModel(snapshot.selectedModelId)
+  }
+  syncObjects()
+  saveStatus.value = snapshot.savedAt
+    ? sourceLabel + '版本 · ' + new Date(snapshot.savedAt).toLocaleString()
+    : '已载入' + sourceLabel + '场景'
+  message.value = '已载入' + sourceLabel + '场景，共 ' + objectsById.size + ' 个模型'
+}
+
 async function restoreSandbox() {
-  let snapshot
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
     if (!raw) return false
-    snapshot = JSON.parse(raw)
-    if (![1, 2, 3, 4].includes(snapshot?.version) || !Array.isArray(snapshot.models)) throw new Error('保存文件版本不兼容')
-    if (snapshot.world) {
-      const restoredWorld = engine.restoreSandboxWorld(snapshot.world)
-      if (!restoredWorld) throw new Error('世界区块存档无效或与当前区块规格不兼容')
-      worldState.value = engine.getSandboxWorldState()
-    } else {
-      worldState.value = engine.getSandboxWorldState()
-    }
-    const loader = new THREE.ObjectLoader()
-    const restoredModels = snapshot.models
-      .filter(item => item?.object && item?.id)
-      .map(item => {
-        const model = loader.parse(item.object)
-        model.name = item.name || model.name || '已保存模型'
-        applyTextPlates(THREE, model)
-        model.userData = {
-          ...(model.userData || {}),
-          proceduralModelCapabilityControlDocument: model.userData?.proceduralModelCapabilityControlDocument
-            || createCapabilityControlDocument({ manifest: model.userData?.proceduralModelCapabilityManifest }),
-        }
-        return { id: String(item.id), model }
-      })
-    const registeredIds = []
-    try {
-      for (const { id, model } of restoredModels) {
-        // ObjectLoader 已从存档恢复完整 Transform；显式传回原位置，避免 addSandboxModel 的新模型默认落点覆盖存档坐标。
-        const registeredId = engine.addSandboxModel(model, {
-          name: model.name,
-          id,
-          position: { x: model.position.x, y: model.position.y, z: model.position.z },
-        })
-        registeredIds.push(registeredId)
-        objectsById.set(registeredId, model)
-      }
-    } catch (error) {
-      for (const id of registeredIds) {
-        engine.removeSandboxModel(id)
-        objectsById.delete(id)
-      }
-      throw error
-    }
-    if (snapshot.environment) {
-      time.value = Number.isFinite(Number(snapshot.environment.time)) ? Number(snapshot.environment.time) : 14
-      timeEnabled.value = snapshot.environment.timeEnabled !== false
-      // 老存档只有 clear/rain；新模式（多云/阴/雪/雾）按已注册模式恢复，未知回退晴天
-      const storedWeather = String(snapshot.environment.weather || 'clear')
-      weather.value = Object.prototype.hasOwnProperty.call(WEATHER_MODES, storedWeather) ? storedWeather : 'clear'
-      weatherEnabled.value = snapshot.environment.weatherEnabled !== false
-      weatherIntensity.value = Number.isFinite(Number(snapshot.environment.weatherIntensity))
-        ? Math.min(100, Math.max(0, Number(snapshot.environment.weatherIntensity)))
-        : 50
-      wind.value = Number.isFinite(Number(snapshot.environment.wind)) ? Number(snapshot.environment.wind) : 20
-      windEnabled.value = snapshot.environment.windEnabled !== false
-      sandboxWindDirection = {
-        x: Number(snapshot.environment.windDirection?.x),
-        z: Number(snapshot.environment.windDirection?.z),
-      }
-      artificialLightingEnabled.value = snapshot.environment.artificialLightingEnabled !== false
-      updateEnvironment()
-      engine?.setWeatherMode?.(weather.value, Number(weatherIntensity.value) / 100)
-    }
-    if (snapshot.selectedModelId && objectsById.has(snapshot.selectedModelId)) {
-      selected = objectsById.get(snapshot.selectedModelId)
-      engine.selectSandboxModel(snapshot.selectedModelId)
-    }
-    syncObjects()
-    saveStatus.value = snapshot.savedAt ? '上次保存 · ' + new Date(snapshot.savedAt).toLocaleString() : '已恢复本地场景'
-    message.value = '已恢复上次保存的沙盒场景，共 ' + objectsById.size + ' 个模型'
+    await applySandboxSnapshot(JSON.parse(raw), { sourceLabel: '本地' })
     return true
   } catch (error) {
     saveStatus.value = '恢复失败'
@@ -2496,11 +2901,20 @@ onMounted(async () => {
     engine.setMode('overview')
     engine.setViewMode('free')
     engine.setSandboxTransformMode(transformMode.value)
-    const restored = await restoreSandbox()
+    const sharedRestored = await loadSharedWorkspace()
+    const restored = sharedRestored || await restoreSandbox()
     if (!restored) {
       updateEnvironment()
       syncObjects()
     }
+    // 共享世界为空时保留本地快照作为首次上传的基线；已有服务端快照时以载入结果为准。
+    if (sharedRestored) {
+      collabSnapshot.value = buildSandboxSnapshot()
+    } else if (!collabHasServerSnapshot.value) {
+      collabSnapshot.value = null
+    }
+    startCollabTimers()
+    void focusSharedChunk()
     // 人物模型独立存档：无论沙盒是否恢复成功都尝试还原上次保存的角色。
     refreshSavedCharacterFlag()
     const restoredCharacter = restorePlayerCharacterFromStorage({ silent: true })
@@ -2517,6 +2931,8 @@ onMounted(async () => {
 })
 onBeforeUnmount(() => {
   disposed = true
+  handleCollabBeforeUnload()
+  stopCollabTimers()
   if (physicsDiagnosticsTimer !== null) window.clearInterval(physicsDiagnosticsTimer)
   physicsDiagnosticsTimer = null
   engine?.dispose()
@@ -2550,8 +2966,40 @@ onBeforeUnmount(() => {
         <BrandLogo class="world-mvp__mark" />
         <div><strong>{{ siteSettings.sandboxBrandName }}</strong><span>{{ siteSettings.sandboxBrandSubtitle }}</span></div>
       </div>
-      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">世界空间</button><button :class="{ active: managementMode === 'environment' }" @click="setManagementMode('environment')">环境管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a v-if="isAdmin" href="/admin?view=settings">站点设置</a><a v-if="isAdmin" href="/admin">成员管理</a><a v-if="currentUser" href="/">返回首页</a><a v-if="currentUser" href="/change-password">{{ currentUser.displayName || currentUser.username }}</a><a href="/" @click.prevent="handleLogout">退出登录</a></div>
+      <div class="world-mvp__header-actions"><div class="world-mvp__view-switch" role="group" aria-label="沙盒视角"><button :class="{ active: sandboxViewMode === 'free' }" @click="selectSandboxViewMode('free')">自由视角</button><button :class="{ active: sandboxViewMode === '2.5d' }" @click="selectSandboxViewMode('2.5d')">2.5D</button><button :class="{ active: sandboxViewMode === '3d' }" @click="selectSandboxViewMode('3d')">3D</button></div><button :class="{ active: managementMode === 'sandbox' }" @click="setManagementMode('sandbox')">世界空间</button><button :class="{ active: managementMode === 'environment' }" @click="setManagementMode('environment')">环境管理</button><button :class="{ active: managementMode === 'chunks' }" @click="toggleChunkManagement">{{ managementMode === 'chunks' ? '退出地块管理' : '地块管理' }}</button><button :class="{ active: managementMode === 'model' }" @click="setManagementMode('model')">模型管理</button><button :class="{ active: collabPanelOpen }" @click="collabPanelOpen = !collabPanelOpen">协作 <b v-if="collabOnline.length">{{ collabOnline.length }}</b></button><span class="world-mvp__collab-indicator" :class="'is-' + collabStatus" :title="collabStatusText" :aria-label="collabStatusText"></span><span class="world-mvp__save-status">{{ saveStatus }}</span><button class="world-mvp__save-button" :disabled="placement.active" @click="saveSandbox">保存沙盒</button><a v-if="isAdmin" href="/admin?view=settings">站点设置</a><a v-if="isAdmin" href="/admin">成员管理</a><a v-if="currentUser" href="/">返回首页</a><a v-if="currentUser" href="/change-password">{{ currentUser.displayName || currentUser.username }}</a><a href="/" @click.prevent="handleLogout">退出登录</a></div>
     </header>
+
+    <section v-if="collabPanelOpen" class="world-mvp__collab-panel" aria-live="polite">
+      <header>
+        <div>
+          <b>共享世界</b>
+          <span class="world-mvp__collab-state" :class="'is-' + collabStatus">{{ collabStatusText }}</span>
+        </div>
+        <button class="world-mvp__collab-close" aria-label="关闭协作面板" @click="collabPanelOpen = false">×</button>
+      </header>
+      <p v-if="collabError" class="world-mvp__collab-error">{{ collabError }}</p>
+      <div class="world-mvp__collab-meta">版本 R{{ collabRevision }} · 在线 {{ collabOnline.length }} 人 · 我的锁 {{ myCollabLocks.length }}</div>
+      <div class="world-mvp__collab-section">
+        <strong>在线成员</strong>
+        <div v-if="!collabOnline.length" class="world-mvp__collab-empty">暂无在线成员</div>
+        <div v-for="member in collabOnline" :key="member.userId" class="world-mvp__collab-member">
+          <span>{{ member.displayName || member.username }}<small v-if="member.userId === currentUser?.id">（我）</small></span>
+          <em>{{ member.currentChunk || '浏览中' }}</em>
+        </div>
+      </div>
+      <div v-if="collabLocks.length" class="world-mvp__collab-section">
+        <strong>地块编辑锁</strong>
+        <div v-for="lock in collabLocks" :key="lock.chunkKey" class="world-mvp__collab-lock">
+          <span><b>{{ lock.chunkKey }}</b> {{ lock.displayName || lock.username }}<small v-if="lock.userId === currentUser?.id">（我）</small></span>
+          <button v-if="isAdmin" @click="forceUnlockSharedChunk(lock.chunkKey)">强制解锁</button>
+        </div>
+      </div>
+      <div class="world-mvp__collab-actions">
+        <button @click="refreshSharedWorkspace({ reload: true })">刷新共享世界</button>
+        <button :disabled="collabSyncInFlight" @click="syncSandboxToShared()">{{ collabSyncInFlight ? '同步中…' : '立即同步' }}</button>
+      </div>
+      <p class="world-mvp__collab-hint">不同地块可同时编辑；同一地块按版本号拦截覆盖。已发布模型普通成员不可删除或修改。</p>
+    </section>
 
     <section v-if="managementMode === 'chunks' && !placement.active" class="world-mvp__chunk-manager">
       <div class="world-mvp__chunk-manager-head">
@@ -2618,6 +3066,7 @@ onBeforeUnmount(() => {
           <h2>{{ precisionModeActive ? '精细调整' : '模型管理' }}</h2>
           <div class="world-mvp__list"><button v-for="item in objects" :key="item.id" :class="{ active: selectedName === item.name }" @click="selectModel(item)">{{ item.name }}</button></div>
           <strong class="world-mvp__operation-name">{{ selectedName }}</strong>
+          <p v-if="selectedModelProtected" class="world-mvp__protected-note">该模型已发布到首页。这里的修改会保存在共享工作区，首页仍显示已发布版本，需要重新提交发布审核后才会更新。</p>
           <template v-if="precisionModeActive && transformMode === 'road-endpoints'">
             <p class="world-mvp__message">蓝色中心手柄拖动整段截面（两侧路缘一起走，宽度不变）适合拐弯/挪段；黄色角手柄只调这一侧路缘的宽度。「添加断点」后点击道路上要加点的位置，一次只加一个断点，拖它就能拉出弧度。</p>
             <div class="world-mvp__tools world-mvp__transform-actions">
@@ -2962,6 +3411,36 @@ onBeforeUnmount(() => {
 .world-mvp__reclaim-feedback p { margin: 5px 0; }
 .world-mvp__reclaim-feedback ul { margin: 5px 0 0; padding-left: 17px; color: #f4c4bb; }
 .world-mvp__save-status { color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__collab-indicator { width: 8px; height: 8px; flex: none; border-radius: 50%; background: var(--ws-sage-dim); box-shadow: 0 0 0 3px rgba(126, 149, 134, 0.12); }
+.world-mvp__collab-indicator.is-synced { background: #8fd39a; box-shadow: 0 0 0 3px rgba(143, 211, 154, 0.15); }
+.world-mvp__collab-indicator.is-connecting, .world-mvp__collab-indicator.is-syncing { background: #e6c47a; animation: world-mvp-collab-pulse 1.4s ease-in-out infinite; }
+.world-mvp__collab-indicator.is-locked { background: #e6a35e; }
+.world-mvp__collab-indicator.is-conflict, .world-mvp__collab-indicator.is-error { background: #e07a68; }
+@keyframes world-mvp-collab-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.world-mvp__collab-panel { position: absolute; z-index: 5; top: 79px; right: 14px; width: min(360px, calc(100vw - 28px)); max-height: min(68vh, 560px); overflow: auto; padding: 13px; border: 1px solid var(--ws-line); border-radius: 2px; background: var(--ws-pine-900); box-shadow: 0 18px 48px rgba(4, 18, 13, 0.42); backdrop-filter: blur(20px) saturate(1.4); }
+.world-mvp__collab-panel > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding-bottom: 9px; border-bottom: 1px solid var(--ws-line); }
+.world-mvp__collab-panel > header div { display: grid; gap: 4px; }
+.world-mvp__collab-panel > header b { color: var(--ws-chalk); font-family: 'Noto Serif SC', 'Songti SC', serif; font-size: 14px; letter-spacing: 0.4px; }
+.world-mvp__collab-state { color: var(--ws-sage); font-size: 10px; }
+.world-mvp__collab-state.is-synced { color: #a9d6b2; }
+.world-mvp__collab-state.is-locked { color: #efc28c; }
+.world-mvp__collab-state.is-conflict, .world-mvp__collab-state.is-error { color: #f1a79b; }
+.world-mvp__collab-close { width: 24px; height: 24px; padding: 0 !important; border-color: transparent !important; color: var(--ws-sage) !important; font-size: 16px !important; line-height: 1; }
+.world-mvp__collab-error { margin: 9px 0 0; padding: 8px 9px; border: 1px solid rgba(224, 122, 104, 0.4); border-radius: 2px; color: #ffc9c0; background: rgba(130, 47, 42, 0.16); font-size: 10px; line-height: 1.5; }
+.world-mvp__collab-meta { padding: 9px 0; border-bottom: 1px solid var(--ws-line); color: var(--ws-sage); font-size: 10px; font-variant-numeric: tabular-nums; }
+.world-mvp__collab-section { display: grid; gap: 6px; padding: 10px 0; border-bottom: 1px solid var(--ws-line); }
+.world-mvp__collab-section > strong { color: var(--ws-cream); font-size: 10.5px; letter-spacing: 0.3px; }
+.world-mvp__collab-empty { color: var(--ws-sage-dim); font-size: 10px; }
+.world-mvp__collab-member, .world-mvp__collab-lock { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 8px; border: 1px solid var(--ws-line); border-radius: 2px; background: rgba(242, 239, 227, 0.04); font-size: 10px; }
+.world-mvp__collab-member span, .world-mvp__collab-lock span { display: flex; align-items: baseline; gap: 4px; color: var(--ws-chalk); }
+.world-mvp__collab-member small, .world-mvp__collab-lock small { color: var(--ws-sage-dim); font-size: 9px; }
+.world-mvp__collab-member em { color: var(--ws-sage); font-style: normal; font-variant-numeric: tabular-nums; }
+.world-mvp__collab-lock b { color: var(--ws-cream); font-variant-numeric: tabular-nums; }
+.world-mvp__collab-lock button { padding: 4px 7px !important; border-color: rgba(230, 139, 126, 0.35) !important; color: #efb0a6 !important; font-size: 9.5px !important; }
+.world-mvp__collab-actions { display: flex; flex-wrap: wrap; gap: 7px; padding-top: 10px; }
+.world-mvp__collab-actions button { flex: 1; min-width: 110px; border-color: var(--ws-line); }
+.world-mvp__collab-hint { margin: 9px 0 0; color: var(--ws-sage-dim); font-size: 9.5px; line-height: 1.55; }
+.world-mvp__protected-note { margin: 8px 0 0; padding: 8px 9px; border: 1px solid rgba(230, 196, 122, 0.4); border-radius: 2px; color: #f0d7a3; background: rgba(130, 101, 42, 0.15); font-size: 10px; line-height: 1.5; }
 .world-mvp .world-mvp__save-button { border-color: var(--ws-brick); color: #fff7ee; background: var(--ws-brick); font-weight: 600; }
 .world-mvp a, .world-mvp button { border: 1px solid var(--ws-line); border-radius: 2px; padding: 8px 10px; color: var(--ws-chalk); background: transparent; text-decoration: none; cursor: pointer; font: inherit; font-size: 11px; transition: background 0.16s ease, border-color 0.16s ease; }
 .world-mvp button:hover, .world-mvp a:hover { border-color: rgba(242, 239, 227, 0.34); background: rgba(242, 239, 227, 0.07); }
@@ -3041,6 +3520,7 @@ onBeforeUnmount(() => {
   .world-mvp__panel { top: auto; left: 8px; right: 8px; bottom: 8px; width: auto; max-height: 52vh; padding: 0 12px 10px; }
   .world-mvp__help { display: none; }
   .world-mvp__chunk-manager { top: 65px; right: 8px; width: calc(100vw - 16px); max-height: 45vh; padding: 10px; }
+  .world-mvp__collab-panel { top: 72px; right: 8px; width: calc(100vw - 16px); max-height: 55vh; }
   .world-mvp__chunk-manager-actions { gap: 5px; }
   .world-mvp__chunk-manager-actions button { padding: 7px 8px; font-size: 10px; }
 }

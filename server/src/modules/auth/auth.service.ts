@@ -19,6 +19,7 @@ import {
   UpdateUserDto,
 } from './dto/auth.dto';
 import { requestIp, SessionService } from './session.service';
+import { EmailNotificationsService } from '../email-notifications/email-notifications.service';
 
 const MAX_LOGIN_FAILURES = 5;
 const LOGIN_WINDOW_MS = 10 * 60 * 1000;
@@ -27,6 +28,7 @@ export interface PublicUser {
   id: string;
   username: string;
   displayName: string;
+  email: string | null;
   role: 'admin' | 'member';
   status: 'active' | 'disabled';
   mustChangePassword: boolean;
@@ -39,6 +41,7 @@ function toPublicUser(row: Record<string, any>): PublicUser {
     id: String(row.id),
     username: String(row.username),
     displayName: String(row.display_name || row.username),
+    email: row.email ? String(row.email) : null,
     role: row.role === 'admin' ? 'admin' : 'member',
     status: row.status === 'active' ? 'active' : 'disabled',
     mustChangePassword: Boolean(row.must_change_password),
@@ -55,6 +58,7 @@ export class AuthService {
   constructor(
     private readonly dataSource: DataSource,
     private readonly sessions: SessionService,
+    private readonly notifications: EmailNotificationsService,
   ) {}
 
   async login(usernameInput: string, password: string, request: Request): Promise<{ user: PublicUser; token: string }> {
@@ -62,7 +66,7 @@ export class AuthService {
     const rateKey = (requestIp(request) || 'unknown') + '|' + username.toLowerCase();
     this.assertLoginAllowed(rateKey);
     const rows = await this.dataSource.query(
-      `SELECT id, username, display_name, password_hash, role, status, must_change_password
+      `SELECT id, username, display_name, email, password_hash, role, status, must_change_password
        FROM app_user WHERE lower(username) = lower($1) LIMIT 1`,
       [username],
     );
@@ -119,13 +123,24 @@ export class AuthService {
       [desiredUsername],
     );
     if (pending.length) throw new ConflictException('该用户名已有待审核的申请');
+    const email = dto.email.trim().toLowerCase();
     const rows = await this.dataSource.query(
-      `INSERT INTO join_application (name, contact, desired_username, reason)
-       VALUES ($1,$2,$3,$4)
-       RETURNING id, name, contact, desired_username, reason, status, created_at`,
-      [dto.name.trim(), dto.contact.trim(), desiredUsername, String(dto.reason || '').trim()],
+      `INSERT INTO join_application (name, email, contact, desired_username, reason)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, name, email, contact, desired_username, reason, status, created_at`,
+      [dto.name.trim(), email, dto.contact.trim(), desiredUsername, String(dto.reason || '').trim()],
     );
-    return { ok: true, application: rows[0] };
+    const application = rows[0];
+    void this.notifications
+      .notifyJoinApplication({
+        name: application.name,
+        desiredUsername: application.desired_username,
+        email: application.email,
+        contact: application.contact,
+        reason: application.reason,
+      })
+      .catch((error) => this.logger.warn('发送加入申请通知失败：' + (error?.message || error)));
+    return { ok: true, application };
   }
 
   async listApplications(statusInput = 'pending'): Promise<Record<string, any>[]> {
@@ -133,7 +148,7 @@ export class AuthService {
     const where = status === 'all' ? '' : 'WHERE a.status = $1';
     const params = status === 'all' ? [] : [status];
     return this.dataSource.query(
-      `SELECT a.id, a.name, a.contact, a.desired_username, a.reason, a.status,
+      `SELECT a.id, a.name, a.email, a.contact, a.desired_username, a.reason, a.status,
               a.review_note, a.reviewed_at, a.created_at,
               u.username AS reviewed_by_username
        FROM join_application a
@@ -168,11 +183,12 @@ export class AuthService {
       if (existing.length) throw new ConflictException('该用户名已被占用，请先修改申请');
       const temporaryPassword = String(dto.password || '').trim() || generateTemporaryPassword();
       const displayName = String(dto.displayName || '').trim() || String(application.name);
+      const email = String(dto.email || application.email || '').trim().toLowerCase() || null;
       const users = await runner.query(
-        `INSERT INTO app_user (username, display_name, password_hash, role, status, must_change_password)
-         VALUES ($1,$2,$3,'member','active',true)
-         RETURNING id, username, display_name, role, status, must_change_password, created_at, last_login_at`,
-        [application.desired_username, displayName, hashPassword(temporaryPassword)],
+        `INSERT INTO app_user (username, display_name, email, password_hash, role, status, must_change_password)
+         VALUES ($1,$2,$3,$4,'member','active',true)
+         RETURNING id, username, display_name, email, role, status, must_change_password, created_at, last_login_at`,
+        [application.desired_username, displayName, email, hashPassword(temporaryPassword)],
       );
       await runner.query(
         `UPDATE join_application
@@ -181,6 +197,21 @@ export class AuthService {
         [id, adminId, String(dto.note || '').trim() || null],
       );
       await runner.commitTransaction();
+      void this.notifications
+        .notifyJoinReview(
+          {
+            name: String(application.name || ''),
+            desiredUsername: String(application.desired_username || ''),
+            email: email || '',
+          },
+          {
+            status: 'approved',
+            note: dto.note || '',
+            temporaryPassword,
+            username: String(application.desired_username || ''),
+          },
+        )
+        .catch((error) => this.logger.warn('发送加入申请通过通知失败：' + (error?.message || error)));
       return { ok: true, user: toPublicUser(users[0]), temporaryPassword };
     } catch (error: any) {
       await runner.rollbackTransaction();
@@ -197,23 +228,35 @@ export class AuthService {
     adminId: string,
   ): Promise<{ ok: true }> {
     const rows = await this.dataSource.query(
-      'SELECT id, status FROM join_application WHERE id = $1 LIMIT 1',
+      'SELECT id, name, email, desired_username, status FROM join_application WHERE id = $1 LIMIT 1',
       [id],
     );
     if (!rows.length) throw new NotFoundException('申请不存在');
     if (rows[0].status !== 'pending') throw new ConflictException('该申请已经处理过');
+    const application = rows[0];
+    const note = String(dto.note || '').trim();
     await this.dataSource.query(
       `UPDATE join_application
        SET status = 'rejected', reviewed_by = $2, reviewed_at = now(), review_note = $3
        WHERE id = $1`,
-      [id, adminId, String(dto.note || '').trim() || null],
+      [id, adminId, note || null],
     );
+    void this.notifications
+      .notifyJoinReview(
+        {
+          name: String(application.name || ''),
+          desiredUsername: String(application.desired_username || ''),
+          email: application.email ? String(application.email) : '',
+        },
+        { status: 'rejected', note },
+      )
+      .catch((error) => this.logger.warn('发送加入申请驳回通知失败：' + (error?.message || error)));
     return { ok: true };
   }
 
   async listUsers(): Promise<PublicUser[]> {
     const rows = await this.dataSource.query(
-      `SELECT id, username, display_name, role, status, must_change_password, created_at, last_login_at
+      `SELECT id, username, display_name, email, role, status, must_change_password, created_at, last_login_at
        FROM app_user
        ORDER BY CASE WHEN role = 'admin' THEN 0 ELSE 1 END, created_at`,
     );
@@ -222,7 +265,7 @@ export class AuthService {
 
   async updateUser(id: string, dto: UpdateUserDto): Promise<PublicUser> {
     const rows = await this.dataSource.query(
-      'SELECT id, username, display_name, role, status, must_change_password, created_at, last_login_at FROM app_user WHERE id = $1 LIMIT 1',
+      'SELECT id, username, display_name, email, role, status, must_change_password, created_at, last_login_at FROM app_user WHERE id = $1 LIMIT 1',
       [id],
     );
     const user = rows[0];
@@ -240,14 +283,16 @@ export class AuthService {
     const updated = await this.dataSource.query(
       `UPDATE app_user
        SET display_name = COALESCE($2, display_name),
-           role = COALESCE($3, role),
-           status = COALESCE($4, status),
+           email = COALESCE($3, email),
+           role = COALESCE($4, role),
+           status = COALESCE($5, status),
            updated_at = now()
        WHERE id = $1
-       RETURNING id, username, display_name, role, status, must_change_password, created_at, last_login_at`,
+       RETURNING id, username, display_name, email, role, status, must_change_password, created_at, last_login_at`,
       [
         id,
         dto.displayName !== undefined ? String(dto.displayName).trim() : null,
+        dto.email !== undefined ? String(dto.email).trim().toLowerCase() || null : null,
         dto.role || null,
         dto.status || null,
       ],
@@ -257,7 +302,7 @@ export class AuthService {
 
   async resetPassword(id: string): Promise<{ ok: true; user: PublicUser; temporaryPassword: string }> {
     const rows = await this.dataSource.query(
-      `SELECT id, username, display_name, role, status, must_change_password, created_at, last_login_at
+      `SELECT id, username, display_name, email, role, status, must_change_password, created_at, last_login_at
        FROM app_user WHERE id = $1 LIMIT 1`,
       [id],
     );
