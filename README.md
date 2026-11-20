@@ -57,6 +57,7 @@ Worldweave 把「搭建、生成、拥有时间、发布与协作」放在同一
 - [架构](#架构)
 - [技术栈](#技术栈)
 - [快速开始](#快速开始)
+- [生产部署](docs/PRODUCTION_DEPLOYMENT.md)
 - [环境变量](#环境变量)
 - [项目结构](#项目结构)
 - [数据与存储](#数据与存储)
@@ -202,6 +203,19 @@ docker compose up --build
 打开 <http://localhost:8080/>，默认管理员 `admin / Admin@12345`（可通过 `ADMIN_PASSWORD` 覆盖）。数据库和上传目录使用 Compose volumes 持久化。
 
 > Compose 默认使用 `NODE_ENV=development` 以自动执行 migration 和创建初始管理员；正式部署请改为 production，并显式执行迁移、设置强密码和 `AUTH_ALLOW_DEV_HEADER=false`。
+
+### 生产部署
+
+仓库包含一套云主机 Docker 生产部署：
+
+- `docker-compose.prod.yml`：Caddy + web + server + PostGIS
+- `Caddyfile`：自动 HTTPS、`/api` 反向代理、30MB 请求体上限
+- `.env.production.example`：域名、数据库、管理员和 AI Key 模板
+- `scripts/setup-prod-env.sh`：只询问域名，其余自动推断并生成强密码
+- `scripts/backup-prod.sh`：备份数据库和上传目录，默认保留 14 天
+- `.github/workflows/deploy.yml`：测试、构建 GHCR 镜像并通过 SSH 部署
+
+完整步骤、GHCR 权限、备份和回滚见 [docs/PRODUCTION_DEPLOYMENT.md](docs/PRODUCTION_DEPLOYMENT.md)。
 
 ### 主要入口
 

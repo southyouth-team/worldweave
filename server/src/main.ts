@@ -6,11 +6,11 @@ import { ConfigService } from '@nestjs/config';
 import { json, urlencoded } from 'express';
 
 async function bootstrap() {
-  // Nest 默认 Express JSON parser 上限为 100 KiB；空间编辑文档包含完整 FeatureCollection，
-  // 必须将请求体上限与 ScenesService 的 15 MiB 文档校验上限对齐。
-  // 关闭 Nest 默认 parser 后显式注册，避免默认 parser 先行拦截请求。
+  // Nest 默认 Express JSON parser 上限为 100 KiB；空间编辑文档和发布快照都可能较大。
+  // 发布快照上限 25 MiB，再加上 base64 缩略图与 JSON 包装，统一放宽到 30 MiB；
+  // ScenesService 仍会按自己的 15 MiB 业务上限做二次校验。
   const app = await NestFactory.create(AppModule, { bodyParser: false });
-  app.use(json({ limit: '16mb' }));
+  app.use(json({ limit: '30mb' }));
   app.use(urlencoded({ extended: true, limit: '1mb' }));
   const config = app.get(ConfigService);
 

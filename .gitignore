@@ -5,3 +5,7 @@ dist
 .idea
 *.log
 public/__recovery__/
+.env
+.env.*
+!.env.example
+!.env.production.example

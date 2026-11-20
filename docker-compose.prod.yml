@@ -1,0 +1,122 @@
+name: worldweave
+
+# 生产部署：Caddy 负责 HTTPS 和反向代理，server/db 不直接暴露公网。
+# 使用方式：
+#   cp .env.production.example .env.production
+#   docker compose --env-file .env.production -f docker-compose.prod.yml pull
+#   docker compose --env-file .env.production -f docker-compose.prod.yml up -d
+
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-worldweave}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.production 设置 POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-worldweave}
+    volumes:
+      - worldweave-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-worldweave} -d ${POSTGRES_DB:-worldweave}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  server:
+    image: ${IMAGE_PREFIX:-ghcr.io/southyouth-team}/worldweave-server:${IMAGE_TAG:-latest}
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      API_PREFIX: /api/v1
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${POSTGRES_USER:-worldweave}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env.production 设置 POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:-worldweave}
+      DB_SSL: "false"
+      DB_MIGRATIONS_RUN: ${DB_MIGRATIONS_RUN:-true}
+      AUTH_ALLOW_DEV_HEADER: "false"
+      CORS_ORIGIN: ${PUBLIC_ORIGIN:?请在 .env.production 设置 PUBLIC_ORIGIN}
+      ASSET_STORAGE_DIR: /data/uploads
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-管理员}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?请在 .env.production 设置 ADMIN_PASSWORD}
+      IMAGE_API_KEY: ${IMAGE_API_KEY:-}
+      IMAGE_API_BASE_URL: ${IMAGE_API_BASE_URL:-}
+      IMAGE_MODEL: ${IMAGE_MODEL:-}
+      VISION_API_KEY: ${VISION_API_KEY:-}
+      VISION_API_BASE_URL: ${VISION_API_BASE_URL:-}
+    volumes:
+      - worldweave-uploads:/data/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3001/api/v1/published-homepage"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  web:
+    image: ${IMAGE_PREFIX:-ghcr.io/southyouth-team}/worldweave-web:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api/v1
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2.8.4-alpine
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    environment:
+      DOMAIN: ${DOMAIN:?请在 .env.production 设置 DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - worldweave-caddy-data:/data
+      - worldweave-caddy-config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  worldweave-db:
+  worldweave-uploads:
+  worldweave-caddy-data:
+  worldweave-caddy-config:

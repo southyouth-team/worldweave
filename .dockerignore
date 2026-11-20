@@ -8,6 +8,7 @@ public/__recovery__
 docs
 *.log
 .env
+.env*
 .superpowers
 .claude
 **/.DS_Store
