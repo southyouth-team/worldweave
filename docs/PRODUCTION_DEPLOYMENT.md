@@ -138,7 +138,22 @@ ssh-keygen -t ed25519 -C "worldweave-deploy" -f ~/.ssh/worldweave_deploy
 
 ## 6. 首次部署
 
-方式一：等 GitHub Actions 构建完成后，在服务器执行：
+### 最省事：GHCR 一键安装
+
+前提：
+
+- GitHub Actions 已成功构建 GHCR 镜像
+- GHCR 两个镜像已设为 public，或服务器已 `docker login ghcr.io`
+- 已安装 Docker / Docker Compose
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/southyouth-team/worldweave/main/scripts/install-prod.sh \
+  | sudo bash -s -- world.example.com
+```
+
+脚本会下载生产 Compose/Caddyfile 到 `/opt/worldweave`，生成 `.env.production`，拉取镜像并启动。
+
+### 已经 clone 仓库：手动 pull 方式
 
 ```bash
 cd /opt/worldweave
@@ -146,7 +161,7 @@ docker compose --env-file .env.production -f docker-compose.prod.yml pull
 docker compose --env-file .env.production -f docker-compose.prod.yml up -d
 ```
 
-方式二：直接在服务器构建（不依赖 GHCR）：
+### 不依赖 GHCR：服务器本地构建
 
 ```bash
 cd /opt/worldweave
